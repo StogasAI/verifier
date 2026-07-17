@@ -1,0 +1,22 @@
+[package]
+name = "stogas-offline-sigstore"
+description = "Networkless verification of the GitHub/Sigstore in-toto profile"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+base64.workspace = true
+hex.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+sigstore-trust-root = { version = "=0.8.0", default-features = false }
+sigstore-types = "=0.8.0"
+sigstore-verify = { version = "=0.8.0", default-features = false }
+thiserror.workspace = true
+
+[lints]
+workspace = true

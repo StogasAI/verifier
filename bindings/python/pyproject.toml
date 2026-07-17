@@ -1,0 +1,15 @@
+[build-system]
+requires = ["maturin>=1.9,<2"]
+build-backend = "maturin"
+
+[project]
+name = "stogas-verifier"
+requires-python = ">=3.10"
+dynamic = ["version"]
+license = "Apache-2.0"
+
+[tool.maturin]
+features = ["pyo3/extension-module"]
+module-name = "stogas_verifier._stogas_verifier"
+python-source = "python"
+
