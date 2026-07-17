@@ -1,5 +1,10 @@
 //! Offline verification of the narrow GitHub Actions Sigstore profile used by Stogas.
 
+#[cfg(target_arch = "wasm32")]
+compile_error!(
+    "browser release blocked: stogas-offline-sigstore requires a complete WASM-compatible Fulcio, SCT, Rekor, checkpoint, timestamp, and DSSE cryptographic backend"
+);
+
 mod strict_json;
 
 use serde::{Deserialize, Serialize};
@@ -162,6 +167,7 @@ fn parse_bundle_documents(bundle_bytes: &[u8]) -> Result<Vec<Value>, Error> {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn verify_with_sigstore_rust(
     value: &Value,
     subjects: &[Subject<'_>],
@@ -200,6 +206,17 @@ fn verify_with_sigstore_rust(
     }
     authenticated_time
         .ok_or_else(|| Error::Policy("at least one artifact subject is required".into()))
+}
+
+#[cfg(target_arch = "wasm32")]
+fn verify_with_sigstore_rust(
+    _value: &Value,
+    _subjects: &[Subject<'_>],
+    _github_policy: &GithubPolicy,
+) -> Result<i64, Error> {
+    Err(Error::Cryptographic(
+        "WASM Sigstore backend is unavailable".into(),
+    ))
 }
 
 fn decode_dsse_payload(value: &Value) -> Result<Vec<u8>, Error> {

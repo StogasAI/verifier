@@ -31,7 +31,8 @@ The native verifier currently validates the live staging bundle. `serve` does no
 yet: release is gated on integration tests proving that WebPKI and Stogas pin checks apply to the
 same upstream TLS connection. Browser WASM publication is likewise gated on full Sigstore
 cryptographic parity; the current community Rust Sigstore backend hard-depends on `aws-lc-rs`,
-which does not target `wasm32-unknown-unknown`.
+which does not target `wasm32-unknown-unknown`. The browser package also remains gated until the
+complete AMD SNP certificate, CRL, and report-signature path passes on that target.
 
 The standard bundle endpoints are deliberately independent from the confidential API:
 
