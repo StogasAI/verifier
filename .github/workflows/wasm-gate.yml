@@ -17,4 +17,4 @@ jobs:
         with:
           toolchain: 1.97.1
           targets: wasm32-unknown-unknown
-      - run: cargo check --package stogas-verifier-wasm --target wasm32-unknown-unknown
+      - run: cargo check --locked --package stogas-verifier-wasm --target wasm32-unknown-unknown
