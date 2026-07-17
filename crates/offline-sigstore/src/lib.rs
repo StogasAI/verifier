@@ -110,8 +110,8 @@ fn verify_github_attestation_value(
     expected_subjects: &[Subject<'_>],
     policy: &GithubPolicy,
 ) -> Result<VerifiedAttestation, Error> {
-    check_bundle_shape(&value)?;
-    let payload = decode_dsse_payload(&value)?;
+    check_bundle_shape(value)?;
+    let payload = decode_dsse_payload(value)?;
     let statement_value = strict_json::from_slice(&payload)
         .map_err(|error| Error::InvalidBundle(format!("invalid DSSE statement: {error}")))?;
     let statement: Statement = serde_json::from_value(statement_value)
@@ -120,7 +120,7 @@ fn verify_github_attestation_value(
 
     // Keep all Sigstore parsing and cryptography in the community verifier. The concrete API is
     // isolated here so SDKs never duplicate or weaken its policy.
-    verify_with_sigstore_rust(&value, expected_subjects, policy)?;
+    verify_with_sigstore_rust(value, expected_subjects, policy)?;
 
     let integrated_time = value
         .pointer("/verificationMaterial/tlogEntries/0/integratedTime")
