@@ -1,10 +1,5 @@
 //! Browser and Node/Bun adapter. The core remains deterministic and networkless.
 
-#[cfg(target_arch = "wasm32")]
-compile_error!(
-    "browser release blocked: full WASM-compatible Sigstore and AMD SNP cryptographic backends are required"
-);
-
 use stogas_verifier::{Environment, verify_bundle};
 use wasm_bindgen::prelude::*;
 

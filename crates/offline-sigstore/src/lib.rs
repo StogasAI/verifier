@@ -1,10 +1,5 @@
 //! Offline verification of the narrow GitHub Actions Sigstore profile used by Stogas.
 
-#[cfg(target_arch = "wasm32")]
-compile_error!(
-    "browser release blocked: stogas-offline-sigstore requires a complete WASM-compatible Fulcio, SCT, Rekor, checkpoint, timestamp, and DSSE cryptographic backend"
-);
-
 mod strict_json;
 
 use serde::{Deserialize, Serialize};

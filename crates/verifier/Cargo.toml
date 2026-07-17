@@ -9,7 +9,7 @@ repository.workspace = true
 
 [features]
 default = ["snp"]
-snp = ["dep:sev", "dep:x509-parser"]
+snp = ["dep:rsa", "dep:sev", "dep:signature", "dep:x509-parser"]
 
 [dependencies]
 base64.workspace = true
@@ -21,9 +21,11 @@ serde.workspace = true
 serde_json.workspace = true
 sev = { version = "8.0.0", default-features = false, features = ["crypto_nossl", "snp"], optional = true }
 sha2.workspace = true
+signature = { version = "2.2.0", optional = true }
+rsa = { version = "0.9.10", default-features = false, features = ["sha2", "std"], optional = true }
 stogas-offline-sigstore = { path = "../offline-sigstore" }
 thiserror.workspace = true
-x509-parser = { version = "0.18.0", features = ["verify"], optional = true }
+x509-parser = { version = "0.18.0", optional = true }
 
 [dev-dependencies]
 pretty_assertions = "1.4.1"

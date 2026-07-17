@@ -970,15 +970,39 @@ fn validate_amd_x509(
         ));
     }
     let crl_signer = if crl.tbs_cert_list.issuer == *ask.subject() {
-        ask.public_key()
+        &ask
     } else if crl.tbs_cert_list.issuer == *ark.subject() {
-        ark.public_key()
+        &ark
     } else {
         return Err(Error::Node("AMD CRL issuer differs".into()));
     };
-    crl.verify_signature(crl_signer)
-        .map_err(|error| Error::Node(format!("AMD CRL signature: {error}")))?;
+    verify_amd_crl_signature(&crl, crl_signer)?;
     validate_vcek_extensions(&vek, node)
+}
+
+#[cfg(feature = "snp")]
+fn verify_amd_crl_signature(
+    crl: &x509_parser::revocation_list::CertificateRevocationList<'_>,
+    signer: &x509_parser::certificate::X509Certificate<'_>,
+) -> Result<(), Error> {
+    use rsa::{RsaPublicKey, pkcs8::DecodePublicKey as _, pss};
+    use signature::Verifier as _;
+
+    const RSA_PSS_OID: &str = "1.2.840.113549.1.1.10";
+    if crl.signature_algorithm.algorithm.to_id_string() != RSA_PSS_OID
+        || crl.tbs_cert_list.signature.algorithm.to_id_string() != RSA_PSS_OID
+    {
+        return Err(Error::Node(
+            "AMD CRL must use RSA-PSS for both signature identifiers".into(),
+        ));
+    }
+    let public_key = RsaPublicKey::from_public_key_der(signer.public_key().raw)
+        .map_err(|error| Error::Node(format!("AMD CRL signer key: {error}")))?;
+    let signature = pss::Signature::try_from(crl.signature_value.data.as_ref())
+        .map_err(|error| Error::Node(format!("AMD CRL signature encoding: {error}")))?;
+    pss::VerifyingKey::<sha2::Sha384>::new(public_key)
+        .verify(crl.tbs_cert_list.as_ref(), &signature)
+        .map_err(|error| Error::Node(format!("AMD CRL signature: {error}")))
 }
 
 #[cfg(feature = "snp")]
@@ -1217,10 +1241,89 @@ fn canonical_report_data(report: &ReportData) -> Result<String, Error> {
 mod tests {
     use super::*;
 
+    fn release_fixture() -> AllowedIgvm {
+        AllowedIgvm {
+            github_in_toto: vec![
+                serde_json::from_str(
+                    include_str!("../../../tests/fixtures/gateway-v0.0.1-attestation.jsonl").trim(),
+                )
+                .unwrap(),
+            ],
+            launch_policy: serde_json::from_str(include_str!(
+                "../../../tests/fixtures/gateway-v0.0.1-launch-policy.json"
+            ))
+            .unwrap(),
+            stogas_signature: serde_json::from_str(include_str!(
+                "../../../tests/fixtures/gateway-v0.0.1-signature.json"
+            ))
+            .unwrap(),
+        }
+    }
+
+    fn resign_release(release: &mut AllowedIgvm) -> Environment {
+        use ed25519_dalek::{Signer as _, SigningKey, pkcs8::EncodePublicKey as _};
+
+        let signing_key = SigningKey::from_bytes(&[0x42; 32]);
+        let canonical =
+            canonical_json(&serde_json::to_value(&release.launch_policy).unwrap()).unwrap();
+        let mut payload = b"stogas gateway launch policy v1\n".to_vec();
+        payload.extend_from_slice(canonical.as_bytes());
+        release.stogas_signature.key_id = "test-release-key".into();
+        release.stogas_signature.signature =
+            URL_SAFE_NO_PAD.encode(signing_key.sign(&payload).to_bytes());
+        Environment {
+            name: "test".into(),
+            fleet_keys: BTreeMap::new(),
+            release_keys: BTreeMap::from([(
+                "test-release-key".into(),
+                STANDARD.encode(
+                    signing_key
+                        .verifying_key()
+                        .to_public_key_der()
+                        .unwrap()
+                        .as_bytes(),
+                ),
+            )]),
+            require_nodes: false,
+        }
+    }
+
     #[test]
     fn rejects_duplicate_keys() {
         let error = strict_json::from_slice(br#"{"body":1,"body":2}"#).unwrap_err();
         assert!(error.to_string().contains("duplicate JSON key"));
+    }
+
+    #[test]
+    fn verifies_real_release_only_when_stogas_and_github_bind_the_same_policy() {
+        let release = release_fixture();
+        let verified = verify_release(&release, &Environment::staging_legacy()).unwrap();
+        assert_eq!(verified.igvm_sha256, release.launch_policy.igvm_sha256);
+        assert_eq!(verified.measurement, release.launch_policy.measurement);
+    }
+
+    #[test]
+    fn rejects_invalid_stogas_release_signature_before_accepting_github_evidence() {
+        let mut release = release_fixture();
+        release.stogas_signature.signature = URL_SAFE_NO_PAD.encode([0_u8; 64]);
+        let error = verify_release(&release, &Environment::staging_legacy()).unwrap_err();
+        assert!(error.to_string().contains("release verification failed"));
+    }
+
+    #[test]
+    fn rejects_resigned_policy_when_github_did_not_attest_exact_bytes_and_igvm() {
+        let mutations: [fn(&mut AllowedIgvm); 3] = [
+            |release: &mut AllowedIgvm| release.launch_policy.measurement.replace_range(..2, "aa"),
+            |release: &mut AllowedIgvm| release.launch_policy.igvm_sha256.replace_range(..2, "aa"),
+            |release: &mut AllowedIgvm| release.launch_policy.source.tree.replace_range(..2, "aa"),
+        ];
+        for mutate in mutations {
+            let mut release = release_fixture();
+            mutate(&mut release);
+            let environment = resign_release(&mut release);
+            let error = verify_release(&release, &environment).unwrap_err();
+            assert!(error.to_string().contains("Sigstore"));
+        }
     }
 
     #[test]

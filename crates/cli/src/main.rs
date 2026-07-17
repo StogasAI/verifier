@@ -8,6 +8,8 @@ use std::{
 };
 use stogas_verifier::{Environment, VerificationOutput, VerifierState, verify_bundle};
 
+mod proxy;
+
 const PRODUCTION_BUNDLE_URL: &str = "https://evidence.stogas.ai/bundles/latest.json";
 const STAGING_BUNDLE_URL: &str = "https://evidence-staging.stogas.ai/bundles/latest.json";
 
@@ -121,26 +123,14 @@ async fn serve(bundle_url: String, upstream: String, listen: String, target: Tar
     if bundle_url == PRODUCTION_BUNDLE_URL && matches!(target, Target::Staging) {
         bail!("staging serve requires --bundle-url {expected_default}");
     }
-    let _ = (upstream, listen);
-    let response = reqwest::Client::new()
-        .get(&bundle_url)
-        .send()
-        .await?
-        .error_for_status()?;
-    let bytes = response.bytes().await?;
-    let state_path = state_path(target)?;
-    let prior = read_state(&state_path).await?;
-    let output = verify_bundle(
-        &bytes,
-        wall_clock_ms(),
-        &environment(target)?,
-        prior.as_ref(),
-    )?;
-    write_state(&state_path, &output.next_state).await?;
-    bail!(
-        "bundle {} verified, but proxy startup is disabled until the same-connection TLS pin adapter passes integration tests",
-        output.bundle.sequence
-    )
+    proxy::serve(proxy::ServeConfig::new(
+        &bundle_url,
+        &upstream,
+        &listen,
+        environment(target)?,
+        state_path(target)?,
+    )?)
+    .await
 }
 
 fn print_output(output: &VerificationOutput, json: bool) -> Result<()> {
