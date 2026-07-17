@@ -120,20 +120,9 @@ fn verify_github_attestation_value(
 
     // Keep all Sigstore parsing and cryptography in the community verifier. The concrete API is
     // isolated here so SDKs never duplicate or weaken its policy.
-    verify_with_sigstore_rust(value, expected_subjects, policy)?;
-
-    let integrated_time = value
-        .pointer("/verificationMaterial/tlogEntries/0/integratedTime")
-        .and_then(Value::as_str)
-        .and_then(|value| value.parse::<i64>().ok())
-        .or_else(|| {
-            value
-                .pointer("/verificationMaterial/tlogEntries/0/integratedTime")
-                .and_then(Value::as_i64)
-        })
-        .ok_or_else(|| Error::InvalidBundle("missing Rekor integrated time".into()))?;
+    let integrated_time = verify_with_sigstore_rust(value, expected_subjects, policy)?;
     if integrated_time <= 0 {
-        return Err(Error::InvalidBundle(
+        return Err(Error::Cryptographic(
             "Rekor integrated time must be positive".into(),
         ));
     }
@@ -177,7 +166,7 @@ fn verify_with_sigstore_rust(
     value: &Value,
     subjects: &[Subject<'_>],
     github_policy: &GithubPolicy,
-) -> Result<(), Error> {
+) -> Result<i64, Error> {
     use sigstore_trust_root::{SIGSTORE_PRODUCTION_TRUSTED_ROOT, TrustedRoot};
     use sigstore_types::{Bundle, Sha256Hash};
     use sigstore_verify::{VerificationPolicy, Verifier};
@@ -192,14 +181,25 @@ fn verify_with_sigstore_rust(
     let policy = VerificationPolicy::default()
         .require_identity(&github_policy.workflow_identity)
         .require_issuer("https://token.actions.githubusercontent.com");
+    let mut authenticated_time = None;
     for subject in subjects {
         let digest = Sha256Hash::from_hex(subject.sha256)
             .map_err(|error| Error::Policy(error.to_string()))?;
-        verifier
+        let result = verifier
             .verify(digest, &bundle, &policy)
             .map_err(|error| Error::Cryptographic(error.to_string()))?;
+        let integrated_time = result.integrated_time.ok_or_else(|| {
+            Error::Cryptographic("verified Rekor integrated time is absent".into())
+        })?;
+        if authenticated_time.is_some_and(|existing| existing != integrated_time) {
+            return Err(Error::Cryptographic(
+                "artifact subjects produced different authenticated times".into(),
+            ));
+        }
+        authenticated_time = Some(integrated_time);
     }
-    Ok(())
+    authenticated_time
+        .ok_or_else(|| Error::Policy("at least one artifact subject is required".into()))
 }
 
 fn decode_dsse_payload(value: &Value) -> Result<Vec<u8>, Error> {
