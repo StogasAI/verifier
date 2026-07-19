@@ -193,15 +193,14 @@ test('verifies a real full staging bundle with networking disabled', async ({ pa
 	const fixture = await readFile(STAGING_BUNDLE_FIXTURE, 'utf8');
 	const result = await page.evaluate(
 		({ fixture, now }) => {
+			const platformNow = Date.now;
+			Date.now = () => now;
 			const api = (
 				globalThis as typeof globalThis & {
 					stogasVerifierBindings: {
 						Verifier: new (maxNodeAgeMs?: number) => {
 							free(): void;
-							verify_bundle_at(
-								bundle: Uint8Array,
-								now: number
-							): {
+							verify_bundle(bundle: Uint8Array): {
 								bundle: { nodes: unknown[]; releases: unknown[]; sequence: number };
 							};
 						};
@@ -210,7 +209,7 @@ test('verifies a real full staging bundle with networking disabled', async ({ pa
 			).stogasVerifierBindings;
 			const verifier = new api.Verifier(180_000);
 			try {
-				const output = verifier.verify_bundle_at(new TextEncoder().encode(fixture), now);
+				const output = verifier.verify_bundle(new TextEncoder().encode(fixture));
 				return {
 					jsonCompatibleMaps: !(
 						(
@@ -227,6 +226,7 @@ test('verifies a real full staging bundle with networking disabled', async ({ pa
 				};
 			} finally {
 				verifier.free();
+				Date.now = platformNow;
 			}
 		},
 		{ fixture, now: STAGING_BUNDLE_NOW_UNIX_MS }
@@ -245,12 +245,14 @@ test('rejects deterministic mutations across the WASM bundle boundary', async ({
 	const fixture = await readFile(STAGING_BUNDLE_FIXTURE, 'utf8');
 	const result = await page.evaluate(
 		({ fixture, now }) => {
+			const platformNow = Date.now;
+			Date.now = () => now;
 			const api = (
 				globalThis as typeof globalThis & {
 					stogasVerifierBindings: {
 						Verifier: new () => {
 							free(): void;
-							verify_bundle_at(bundle: Uint8Array, now: number): unknown;
+							verify_bundle(bundle: Uint8Array): unknown;
 						};
 					};
 				}
@@ -264,7 +266,7 @@ test('rejects deterministic mutations across the WASM bundle boundary', async ({
 					const position = (index * 421 + 17) % mutation.length;
 					mutation[position] ^= 1;
 					try {
-						verifier.verify_bundle_at(mutation, now);
+						verifier.verify_bundle(mutation);
 					} catch {
 						rejected += 1;
 					}
@@ -272,6 +274,7 @@ test('rejects deterministic mutations across the WASM bundle boundary', async ({
 				return { rejected };
 			} finally {
 				verifier.free();
+				Date.now = platformNow;
 			}
 		},
 		{ fixture, now: STAGING_BUNDLE_NOW_UNIX_MS }

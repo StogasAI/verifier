@@ -56,21 +56,9 @@ impl WasmVerifier {
     /// # Errors
     ///
     /// Returns a JavaScript error for an untrusted bundle.
-    pub fn verify_bundle(&mut self, bundle: &[u8]) -> Result<JsValue, JsError> {
-        self.verify_bundle_at(bundle, js_sys::Date::now())
-    }
-
-    /// Verify at an injected time for deterministic tests and audits.
-    ///
-    /// # Errors
-    ///
-    /// Returns a JavaScript error for invalid time or an untrusted bundle.
     #[allow(clippy::cast_possible_truncation)]
-    pub fn verify_bundle_at(
-        &mut self,
-        bundle: &[u8],
-        now_unix_ms: f64,
-    ) -> Result<JsValue, JsError> {
+    pub fn verify_bundle(&mut self, bundle: &[u8]) -> Result<JsValue, JsError> {
+        let now_unix_ms = js_sys::Date::now();
         validate_time(now_unix_ms)?;
         let output = self
             .core
@@ -115,8 +103,13 @@ fn verifier_environment(max_node_age_ms: f64) -> Result<Environment, JsError> {
 ///
 /// Returns a JavaScript error when the platform time or bundle is invalid.
 #[wasm_bindgen]
+#[allow(clippy::cast_possible_truncation)]
 pub fn verify_bundle(bundle: &[u8]) -> Result<JsValue, JsError> {
-    verify_bundle_at(bundle, js_sys::Date::now())
+    let now_unix_ms = js_sys::Date::now();
+    validate_time(now_unix_ms)?;
+    let output = verify_core_bundle(bundle, now_unix_ms as i64, &Environment::stogas())
+        .map_err(|error| JsError::new(&error.to_string()))?;
+    to_js_value(&output)
 }
 
 /// Verify one release approval with the same Stogas and GitHub policy used for bundle verification.
@@ -148,20 +141,6 @@ pub fn verify_amd_collateral_admission(
     validate_time(now_unix_ms)?;
     validate_time(required_until_unix_ms)?;
     let output = verify_amd_collateral(request, now_unix_ms as i64, required_until_unix_ms as i64)
-        .map_err(|error| JsError::new(&error.to_string()))?;
-    to_js_value(&output)
-}
-
-/// Verify a bundle at an injected time for deterministic tests and audits.
-///
-/// # Errors
-///
-/// Returns a JavaScript error when the captured time or bundle is invalid.
-#[wasm_bindgen]
-#[allow(clippy::cast_possible_truncation)]
-pub fn verify_bundle_at(bundle: &[u8], now_unix_ms: f64) -> Result<JsValue, JsError> {
-    validate_time(now_unix_ms)?;
-    let output = verify_core_bundle(bundle, now_unix_ms as i64, &Environment::stogas())
         .map_err(|error| JsError::new(&error.to_string()))?;
     to_js_value(&output)
 }
