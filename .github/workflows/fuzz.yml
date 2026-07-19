@@ -13,6 +13,8 @@ jobs:
     name: ${{ matrix.target }}
     runs-on: ubuntu-24.04
     timeout-minutes: 20
+    env:
+      RUSTUP_TOOLCHAIN: nightly-2026-07-01
     concurrency:
       group: verifier-fuzz-${{ github.ref }}-${{ matrix.target }}
       cancel-in-progress: false
