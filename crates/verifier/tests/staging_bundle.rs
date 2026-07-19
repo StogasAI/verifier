@@ -8,7 +8,20 @@ const BUNDLE: &[u8] = include_bytes!("fixtures/staging-bundle-sequence-1927.json
 const VERIFIED_AT_UNIX_MS: i64 = 1_784_414_117_082;
 
 fn fixture() -> Value {
-    serde_json::from_slice(BUNDLE).expect("real bundle fixture")
+    let mut value: Value = serde_json::from_slice(BUNDLE).expect("real bundle fixture");
+    let round = value["body"]["nodes"][0]["report_data"]["drand"]["round"]
+        .as_u64()
+        .unwrap();
+    let round = i64::try_from(round).unwrap();
+    let drand_deadline = (1_692_803_367_i64 + (round - 1) * 3) * 1_000 + 180_000;
+    let created_at = unix_ms(&value, "/body/created_at");
+    value["body"]["expires_at"] = Value::String(
+        DateTime::from_timestamp_millis(drand_deadline)
+            .unwrap()
+            .to_rfc3339(),
+    );
+    value["body"]["ttl_ms"] = Value::from(drand_deadline - created_at);
+    value
 }
 
 fn checksummed_fixture(value: Value) -> (Vec<u8>, Environment) {
@@ -88,7 +101,7 @@ fn corrupt_quote_byte(value: &mut Value, offset: usize, mask: u8) {
 }
 
 #[test]
-fn verifies_an_immutable_real_staging_bundle_end_to_end() {
+fn verifies_real_staging_evidence_under_the_bundle_wide_freshness_invariant() {
     let (bundle, environment) = checksummed_fixture(fixture());
     let mut verifier = Verifier::default();
     let output = verifier
@@ -296,7 +309,7 @@ fn enforces_bundle_time_and_resource_policy() {
 }
 
 #[test]
-fn partitions_cryptographically_valid_nodes_by_current_caller_freshness() {
+fn stricter_callers_exclude_nodes_that_would_age_out_before_bundle_expiry() {
     let (bundle, mut environment) = checksummed_fixture(fixture());
     let baseline = Verifier::default()
         .verify_bundle(&bundle, VERIFIED_AT_UNIX_MS, &environment)
@@ -311,38 +324,37 @@ fn partitions_cryptographically_valid_nodes_by_current_caller_freshness() {
     assert!(
         output.bundle.excluded_nodes[0]
             .reason
-            .contains("caller freshness policy")
+            .contains("bundle expiry")
     );
 }
 
 #[test]
-fn node_trust_ends_at_its_drand_deadline_before_bundle_expiry() {
+fn nodes_must_remain_fresh_through_bundle_expiry() {
     let (bundle, environment) = checksummed_fixture(fixture());
-    let value: Value = serde_json::from_slice(&bundle).unwrap();
-    let expires_at = unix_ms(&value, "/body/expires_at");
     let baseline = Verifier::default()
         .verify_bundle(&bundle, VERIFIED_AT_UNIX_MS, &environment)
         .unwrap();
-    let trust_expires_at = baseline.bundle.trust_expires_at_unix_ms.unwrap();
-    assert!(trust_expires_at < expires_at);
-    let accepted = Verifier::default()
-        .verify_bundle(&bundle, trust_expires_at - 1, &environment)
-        .unwrap();
-    assert_eq!(accepted.bundle.nodes.len(), 1);
-    assert_eq!(
-        accepted.bundle.trust_expires_at_unix_ms,
-        Some(trust_expires_at)
+    assert_eq!(baseline.bundle.nodes.len(), 1);
+
+    let mut extended: Value = serde_json::from_slice(&bundle).unwrap();
+    let expires_at = unix_ms(&extended, "/body/expires_at");
+    extended["body"]["expires_at"] = Value::String(
+        DateTime::from_timestamp_millis(expires_at + 1)
+            .unwrap()
+            .to_rfc3339(),
     );
-
-    let stale = Verifier::default()
-        .verify_bundle(&bundle, trust_expires_at, &environment)
+    extended["body"]["ttl_ms"] = Value::from(
+        unix_ms(&extended, "/body/expires_at") - unix_ms(&extended, "/body/created_at"),
+    );
+    let (extended, environment) = checksummed_fixture(extended);
+    let excluded = Verifier::default()
+        .verify_bundle(&extended, VERIFIED_AT_UNIX_MS, &environment)
         .unwrap();
-    assert!(stale.bundle.nodes.is_empty());
-    assert_eq!(stale.bundle.excluded_nodes.len(), 1);
-
+    assert!(excluded.bundle.nodes.is_empty());
+    assert_eq!(excluded.bundle.excluded_nodes.len(), 1);
     assert!(
-        Verifier::default()
-            .verify_bundle(&bundle, expires_at, &environment)
-            .is_err()
+        excluded.bundle.excluded_nodes[0]
+            .reason
+            .contains("bundle expiry")
     );
 }

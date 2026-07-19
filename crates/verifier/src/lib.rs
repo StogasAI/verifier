@@ -27,7 +27,7 @@ const DRAND_CHAIN_HASH: &str = "52db9ba70e0cc0f6eaf7803dd07447a1f5477735fd3f6617
 const DRAND_GENESIS_SECONDS: i64 = 1_692_803_367;
 const DRAND_PERIOD_SECONDS: i64 = 3;
 const DRAND_MAX_AGE_AT_QUOTE_VERIFICATION_MS: i64 = 2 * 60 * 1000;
-/// Maximum node-proof age at the caller's captured verification time.
+/// Maximum node-proof age permitted through the signed bundle expiry.
 pub const DEFAULT_NODE_EVIDENCE_AGE_MS: i64 = 3 * 60 * 1000;
 /// Strictest supported nonzero node-evidence policy exposed by packaged adapters.
 pub const MIN_NODE_EVIDENCE_AGE_MS: i64 = 60 * 1000;
@@ -43,7 +43,7 @@ const STOGAS_RELEASE_PUBLIC_KEY_DER_BASE64: &str =
 pub struct Environment {
     /// Trusted Stogas release signing keys, keyed by key id, as base64 SPKI DER.
     pub release_keys: BTreeMap<String, String>,
-    /// Maximum age of a valid node drand proof admitted to the returned trust set.
+    /// Maximum node drand age permitted through the signed bundle expiry.
     pub max_node_evidence_age_ms: i64,
 }
 
@@ -754,15 +754,12 @@ fn verify_bundle_inner(
         &launch_policies,
         &amd_stacks,
     )?;
-    let trust_expires_at_unix_ms =
-        node_trust_expiry(&nodes, expires_at, environment.max_node_evidence_age_ms);
     Ok((
         VerificationOutput {
             bundle: VerifiedBundle {
                 sequence: envelope.body.sequence,
                 created_at_unix_ms: created_at,
                 expires_at_unix_ms: expires_at,
-                trust_expires_at_unix_ms,
                 excluded_nodes,
                 releases,
                 nodes,
@@ -771,21 +768,6 @@ fn verify_bundle_inner(
         },
         next_release_cache,
     ))
-}
-
-fn node_trust_expiry(
-    nodes: &[VerifiedNode],
-    bundle_expires_at: i64,
-    max_node_evidence_age_ms: i64,
-) -> Option<i64> {
-    nodes
-        .iter()
-        .map(|node| {
-            node.drand_round_time_unix_ms
-                .saturating_add(max_node_evidence_age_ms)
-                .min(bundle_expires_at)
-        })
-        .min()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -809,17 +791,17 @@ fn verify_and_partition_nodes(
             launch_policies,
             amd_stacks,
         )?;
-        if now_unix_ms
-            >= verified
-                .drand_round_time_unix_ms
-                .saturating_add(max_node_evidence_age_ms)
+        if verified
+            .drand_round_time_unix_ms
+            .saturating_add(max_node_evidence_age_ms)
+            < expires_at
         {
             excluded.push(ExcludedNode {
                 drand_round: verified.drand_round,
                 drand_round_time_unix_ms: verified.drand_round_time_unix_ms,
                 evidence_age_ms: verified.evidence_age_ms,
                 node_id: verified.node_id,
-                reason: "attested node evidence exceeds the caller freshness policy".into(),
+                reason: "attested node evidence does not remain fresh through bundle expiry".into(),
             });
         } else {
             nodes.push(verified);

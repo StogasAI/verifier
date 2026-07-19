@@ -34,7 +34,7 @@ enum Command {
         /// Exact Unix time in milliseconds, for tests and auditing only.
         #[arg(long, hide = true)]
         now_unix_ms: Option<i64>,
-        /// Maximum age of attested node evidence admitted to the trust set.
+        /// Maximum age node evidence may reach by bundle expiry.
         #[arg(long, default_value_t = 3, value_parser = clap::value_parser!(u16).range(1..=3))]
         max_node_age_minutes: u16,
     },
@@ -48,7 +48,7 @@ enum Command {
         listen: String,
         #[arg(long, value_enum, default_value_t = Target::Production)]
         target: Target,
-        /// Maximum age of attested node evidence admitted to the trust set.
+        /// Maximum age node evidence may reach by bundle expiry.
         #[arg(long, default_value_t = 3, value_parser = clap::value_parser!(u16).range(1..=3))]
         max_node_age_minutes: u16,
     },
@@ -139,13 +139,6 @@ fn print_output(output: &VerificationOutput, json: bool) -> Result<()> {
     println!("  releases: {}", output.bundle.releases.len());
     println!("  nodes: {}", output.bundle.nodes.len());
     println!("  excluded nodes: {}", output.bundle.excluded_nodes.len());
-    println!(
-        "  node trust expires: {}",
-        output
-            .bundle
-            .trust_expires_at_unix_ms
-            .map_or_else(|| "no usable nodes".into(), |value| value.to_string())
-    );
     println!("  bundle expires: {}", output.bundle.expires_at_unix_ms);
     Ok(())
 }

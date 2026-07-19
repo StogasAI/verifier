@@ -263,9 +263,6 @@ pub struct VerifiedBundle {
     pub sequence: u64,
     pub created_at_unix_ms: i64,
     pub expires_at_unix_ms: i64,
-    /// Earliest deadline at which any currently returned node becomes stale.
-    /// `None` means the bundle contains no node currently usable by this verifier policy.
-    pub trust_expires_at_unix_ms: Option<i64>,
     pub excluded_nodes: Vec<ExcludedNode>,
     pub releases: Vec<VerifiedRelease>,
     pub nodes: Vec<VerifiedNode>,

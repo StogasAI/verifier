@@ -36,7 +36,7 @@ var ErrClosed = errors.New("stogas verifier is closed")
 
 // Options configures a verifier without moving security policy into Go.
 type Options struct {
-	// MaxNodeAge selects the maximum proof age at verification from one through three minutes. Zero uses three minutes.
+	// MaxNodeAge selects how old a proof may become by bundle expiry. Zero uses three minutes.
 	MaxNodeAge time.Duration
 }
 

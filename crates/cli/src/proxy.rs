@@ -32,8 +32,6 @@ const MIN_REFRESH_RETRY_SECONDS: u64 = 4;
 const MAX_REFRESH_RETRY_SECONDS: u64 = 8;
 const MIN_BUNDLE_REFRESH_LEAD_SECONDS: i64 = 30;
 const MAX_BUNDLE_REFRESH_LEAD_SECONDS: i64 = 60;
-const MIN_NODE_REFRESH_LEAD_SECONDS: i64 = 15;
-const MAX_NODE_REFRESH_LEAD_SECONDS: i64 = 30;
 const SHARED_CACHE_MAX_AGE_SECONDS: i64 = 10;
 
 pub struct ServeConfig {
@@ -134,10 +132,10 @@ async fn shutdown_signal() {
 
 async fn refresh_loop(state: Arc<ProxyState>) {
     loop {
-        let (trust_expires_at, refresh_at) = {
+        let (bundle_expires_at, refresh_at) = {
             let active = state.active.read().await;
             (
-                active_trust_deadline(active.as_ref()),
+                active.output.bundle.expires_at_unix_ms,
                 replacement_refresh_at(&active.output),
             )
         };
@@ -145,11 +143,11 @@ async fn refresh_loop(state: Arc<ProxyState>) {
 
         loop {
             if refresh_once(&state).await.is_ok() {
-                let new_trust_expiry = {
+                let new_bundle_expiry = {
                     let active = state.active.read().await;
-                    active_trust_deadline(active.as_ref())
+                    active.output.bundle.expires_at_unix_ms
                 };
-                if new_trust_expiry > trust_expires_at {
+                if new_bundle_expiry > bundle_expires_at {
                     break;
                 }
             }
@@ -161,37 +159,17 @@ async fn refresh_loop(state: Arc<ProxyState>) {
 fn replacement_refresh_at(output: &VerificationOutput) -> i64 {
     let bundle_lead_seconds =
         rand::rng().random_range(MIN_BUNDLE_REFRESH_LEAD_SECONDS..=MAX_BUNDLE_REFRESH_LEAD_SECONDS);
-    let node_lead_seconds =
-        rand::rng().random_range(MIN_NODE_REFRESH_LEAD_SECONDS..=MAX_NODE_REFRESH_LEAD_SECONDS);
-    replacement_refresh_at_with_leads(output, bundle_lead_seconds, node_lead_seconds)
+    replacement_refresh_at_with_lead(output, bundle_lead_seconds)
 }
 
-fn replacement_refresh_at_with_leads(
+const fn replacement_refresh_at_with_lead(
     output: &VerificationOutput,
     bundle_lead_seconds: i64,
-    node_lead_seconds: i64,
 ) -> i64 {
-    let bundle_refresh_at = output
-        .bundle
-        .expires_at_unix_ms
-        .saturating_sub((bundle_lead_seconds + SHARED_CACHE_MAX_AGE_SECONDS) * 1000);
     output
         .bundle
-        .trust_expires_at_unix_ms
-        .map_or(bundle_refresh_at, |trust_expires_at| {
-            bundle_refresh_at.min(
-                trust_expires_at
-                    .saturating_sub((node_lead_seconds + SHARED_CACHE_MAX_AGE_SECONDS) * 1000),
-            )
-        })
-}
-
-fn active_trust_deadline(active: &ActiveBundle) -> i64 {
-    active
-        .output
-        .bundle
-        .trust_expires_at_unix_ms
-        .unwrap_or(i64::MIN)
+        .expires_at_unix_ms
+        .saturating_sub((bundle_lead_seconds + SHARED_CACHE_MAX_AGE_SECONDS) * 1000)
 }
 
 fn refresh_retry_delay() -> Duration {
@@ -286,36 +264,23 @@ async fn proxy_request_inner(
         return Err((StatusCode::NOT_FOUND, "only /v1/* is available"));
     }
     let active = state.active.read().await.clone();
-    if wall_clock_ms() >= active_trust_deadline(&active) {
-        return Err((
-            StatusCode::SERVICE_UNAVAILABLE,
-            "verified node trust expired",
-        ));
+    if wall_clock_ms() >= active.output.bundle.expires_at_unix_ms {
+        return Err((StatusCode::SERVICE_UNAVAILABLE, "verified bundle expired"));
     }
 
     let (parts, body) = request.into_parts();
     let body = to_bytes(body, MAX_REQUEST_BYTES)
         .await
         .map_err(|_| (StatusCode::PAYLOAD_TOO_LARGE, "request body is too large"))?;
-    match send_upstream(state, &active, &parts, body.clone()).await {
-        Ok(response) => Ok(response),
-        Err(error) if error.is_connect() => {
-            refresh_once(state)
-                .await
-                .map_err(|_| (StatusCode::BAD_GATEWAY, "upstream TLS verification failed"))?;
-            let refreshed = state.active.read().await.clone();
-            if wall_clock_ms() >= active_trust_deadline(&refreshed) {
-                return Err((
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "verified node trust expired",
-                ));
+    send_upstream(state, &active, &parts, body)
+        .await
+        .map_err(|error| {
+            if error.is_connect() {
+                (StatusCode::BAD_GATEWAY, "upstream TLS verification failed")
+            } else {
+                (StatusCode::BAD_GATEWAY, "upstream request failed")
             }
-            send_upstream(state, &refreshed, &parts, body)
-                .await
-                .map_err(|_| (StatusCode::BAD_GATEWAY, "upstream connection failed"))
-        }
-        Err(_) => Err((StatusCode::BAD_GATEWAY, "upstream request failed")),
-    }
+        })
 }
 
 async fn send_upstream(
@@ -692,7 +657,6 @@ mod tests {
             .verify_bundle(&bundle, STAGING_BUNDLE_VERIFIED_AT_MS, &environment)
             .unwrap();
         output.bundle.expires_at_unix_ms = expires_at_unix_ms;
-        output.bundle.trust_expires_at_unix_ms = Some(expires_at_unix_ms);
         ProxyState {
             active: RwLock::new(Arc::new(ActiveBundle { output, client })),
             config: Arc::new(
@@ -907,16 +871,12 @@ mod tests {
     }
 
     #[test]
-    fn replacement_fetch_uses_the_earliest_signed_or_node_trust_deadline() {
+    fn replacement_fetch_is_jittered_before_signed_bundle_expiry() {
         let (bundle, environment) = staging_bundle();
         let mut output = Verifier::default()
             .verify_bundle(&bundle, STAGING_BUNDLE_VERIFIED_AT_MS, &environment)
             .unwrap();
         output.bundle.expires_at_unix_ms = 1_000_000;
-        output.bundle.trust_expires_at_unix_ms = Some(800_000);
-        assert_eq!(replacement_refresh_at_with_leads(&output, 60, 30), 760_000);
-
-        output.bundle.trust_expires_at_unix_ms = Some(1_000_000);
-        assert_eq!(replacement_refresh_at_with_leads(&output, 60, 30), 930_000);
+        assert_eq!(replacement_refresh_at_with_lead(&output, 60), 930_000);
     }
 }

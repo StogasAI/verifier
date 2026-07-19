@@ -1,155 +1,95 @@
 # Stogas Verifier
 
-Offline verification for the Stogas confidential-gateway evidence bundle.
+Offline verification for Stogas confidential-gateway evidence.
 
-One deterministic Rust engine powers the native CLI, Rust, browser WebAssembly, Node, Bun,
-Python, Go, and C interfaces. Each adapter captures the platform clock once and delegates every
-trust decision to the same core. Verification performs no network requests and writes no
-persistent state.
+One Rust implementation powers the CLI, Rust, browser WebAssembly, Node, Bun, Python, Go, and C packages. Verification performs no network requests and writes no persistent state.
 
-## Packages
+## Quick start
 
-- `stogas-offline-sigstore`: networkless verification of the supported GitHub/Sigstore in-toto
-  profile.
-- `stogas-verifier`: complete verification of `stogas.confidential-bundle.v1`.
-- `stogas-verify`: offline verification and an optional loopback OpenAI-compatible proxy.
-- `@stogas/offline-sigstore`: generic Sigstore WASM for browsers, Workers, Node, and Bun.
-- `@stogas/verifier`: complete Stogas bundle WASM for browsers, Workers, Node, and Bun.
-- Python `stogas-verifier`: native PyO3 `abi3-py310` wheels for CPython 3.10 and newer.
-- `github.com/StogasAI/verifier/go`: a thin cgo adapter around the Rust library.
-- `stogas_verifier.h`: a bounded C ABI for native and enterprise integrations.
-
-The standalone Sigstore package excludes SNP, drand, and Stogas policy. AMD/SNP verification
-remains an implementation detail of the complete verifier rather than a separately branded quote
-library.
-
-Stogas does not require a separate inference SDK. Existing OpenAI-compatible clients can use the
-Stogas API by changing their base URL. Applications that want verification and TLS pinning without
-embedding a language binding can use `stogas-verify serve`.
-
-## Verification Model
-
-The bundle is a collection of independently authenticated evidence:
-
-- every release must have an official GitHub/Sigstore attestation and a Stogas release signature
-  over the same launch policy and IGVM digest;
-- every node must have a valid AMD SEV-SNP certificate chain, revocation material, report
-  signature, approved launch measurement, report-data binding, certificate stack, and drand proof;
-- the verifier uses its captured wall clock to enforce bundle, certificate, collateral, Sigstore,
-  and node-evidence deadlines.
-
-The envelope SHA-256 detects accidental corruption and provides a stable content identifier. It is
-not an authority: changing it cannot make invalid release or node evidence pass. A separate fleet
-signing key is therefore unnecessary. Node Ed25519 keys are generated inside each guest and bound
-by its SNP report data; they authenticate node-produced application evidence after admission, not
-the bundle itself.
-
-Malformed evidence, unsupported algorithms, invalid releases, or invalid node proofs reject the
-bundle. A cryptographically valid node outside the caller's freshness policy is returned under
-`excluded_nodes` and never enters the current trust set.
-
-## CLI
+Verify a downloaded bundle:
 
 ```console
 stogas-verify verify bundle.json
-stogas-verify verify - --json
+```
+
+Or run a verified loopback OpenAI-compatible endpoint:
+
+```console
 stogas-verify serve
 ```
 
-`verify` reads a file or standard input and never accesses the network. `serve` fetches and verifies
-a bundle before listening on loopback, refreshes against the earliest trust deadline with jitter,
-and stops starting requests when no fresh trust remains.
+`serve` fetches a bundle before listening on `127.0.0.1:8787`, refreshes with jitter before signed bundle expiry, and atomically activates only a completely verified replacement. The upstream connection must pass normal WebPKI and hostname verification. Its certificate hash and SPKI must then match the same attested node.
 
-The proxy accepts `/v1/*` and preserves OpenAI-compatible requests, authorization headers,
-responses, and streaming bytes. The actual upstream connection must pass normal WebPKI and
-hostname verification. Its leaf-certificate hash and DER SubjectPublicKeyInfo SHA-256 must then
-match the same verified node. Either certificate in that node's attested two-slot rotation stack
-may be presented. The proxy installs no local CA and does not log API keys, request bodies, or model
-output.
+## Packages
 
-Standard evidence endpoints:
+- `stogas-verifier`: complete Rust bundle verifier.
+- `stogas-verify`: native CLI and loopback proxy.
+- `@stogas/verifier`: browser, Worker, Node, and Bun WebAssembly package.
+- `stogas-verifier` for Python: PyO3 `abi3-py310` native wheels.
+- `github.com/StogasAI/verifier/go`: thin cgo binding.
+- `stogas_verifier.h`: bounded C ABI.
+- `stogas-offline-sigstore` and `@stogas/offline-sigstore`: generic verification for the supported GitHub/Sigstore profile.
 
-- production: `https://evidence.stogas.ai/bundles/latest.json`
-- staging: `https://evidence-staging.stogas.ai/bundles/latest.json`
+The CLI is a native Rust application. WebAssembly is used by JavaScript environments and by the Stogas Control Worker, not by the native CLI.
 
-The endpoints are public, read-only R2 custom domains with wildcard read-only CORS. Independent
-browser applications can therefore fetch and verify evidence without credentials.
+## Verification result
 
-## SDK Boundary
+The complete verifier checks:
 
-Rust, WASM, Python, Go, and C expose a reusable `Verifier` and a stateless convenience call. The
-reusable verifier caches only immutable release verification in memory. Normal calls capture the
-host clock once; explicit `*_at` calls accept an exact time for deterministic audits and tests.
+- GitHub/Sigstore provenance and the Stogas signature over the same gateway launch policy;
+- AMD SEV-SNP certificate paths, revocation data, report signatures, chip/TCB values, and launch measurement;
+- report-data bindings for TLS, certificate rotation, HPKE, and Ed25519 keys;
+- drand Quicknet identity, BLS signature, randomness, round time, and freshness;
+- bundle, certificate, collateral, and evidence deadlines.
 
-SDKs do not fetch bundles, schedule refreshes, persist state, proxy requests, or choose a network
-route. Those concerns remain with the host application. `stogas-verify serve` provides the
-maintained background-fetch and connection-pinning implementation.
+Nodes enter the returned trust set only when their evidence remains within the caller's freshness policy through signed bundle expiry. Older valid records are returned under `excluded_nodes`.
 
-The WASM package also exposes the release, AMD-collateral, and heartbeat admission boundaries used
-by the Stogas Control service. They use the same Rust policy and are not alternative client
-verification paths.
+## SDK boundary
 
-## Sigstore Profile
+SDKs verify caller-provided bytes and return verified releases, nodes, exclusions, and bundle timestamps. A reusable verifier caches immutable release verification in memory. Explicit-time methods support deterministic tests and audits.
 
-`stogas-offline-sigstore` verifies the production GitHub `actions/attest` v0.3 DSSE/in-toto profile
-used by gateway releases. It validates exact artifact subjects, Fulcio certificate paths and GitHub
-identity, SCTs, Rekor signed-entry timestamps and inclusion proofs, signed checkpoints, RFC 3161
-timestamps, and SLSA provenance.
+SDKs do not fetch bundles, schedule background work, persist state, or replace an application's HTTP stack. Use `stogas-verify serve` when managed refresh and TLS pinning should be handled out of process. Browser APIs do not expose the peer certificate needed for connection pinning.
 
-The package embeds a versioned public Sigstore trusted-root snapshot. It never contacts TUF,
-Fulcio, Rekor, GitHub, a registry, or an OIDC service. Unsupported bundle versions, roots, signing
-styles, or required fields are rejected.
+## Sigstore profile
 
-The browser implementation uses `rustls-webpki` path construction with narrow RustCrypto signature
-adapters. Its dependency graph excludes OpenSSL, `ring`, and AWS-LC so the same policy compiles to
-`wasm32-unknown-unknown` without native C dependencies.
+`stogas-offline-sigstore` supports the GitHub `actions/attest` v0.3 DSSE/in-toto SLSA profile used by gateway releases. It verifies Fulcio paths and identity, SCTs, Rekor signed entry timestamps and inclusion proofs, checkpoints, RFC 3161 timestamps, exact subjects, and GitHub workflow provenance from embedded versioned public roots.
 
-## Freshness And Caching
+The implementation is tested against every applicable case in the pinned official Sigstore conformance suite for this claimed profile, including negative proof cases. The real gateway fixture is also verified differentially with `gh attestation verify`, `sigstore-go`, the native `sigstore-rust` backend, and the RustCrypto/WASM backend.
 
-Host wall time is required because drand proves that evidence could not predate a round; it does not
-prove that the caller's current clock is recent. The verifier checks bundle creation and expiry,
-future timestamps, certificate and collateral validity, and authenticated Sigstore time against one
-captured wall-clock value.
+Unsupported Sigstore profiles fail closed.
 
-Control accepts a node proof only when its verified Quicknet round was at most two minutes old at
-admission and did not regress. Clients admit a node for at most three minutes from that verified
-round and may choose a stricter one-to-three-minute policy. The node deadline is capped by bundle
-expiry; bundle lifetime is never added to the drand allowance.
+## Freshness
 
-`expires_at` is the hard bundle deadline. The mutable latest object uses
-`max-age=0, s-maxage=10, must-revalidate` so Cloudflare may share it for at most ten seconds without
-instructing clients to extend trust. Source sequence objects remain available for 31 days. Clients
-and independent mirrors may retain their already fetched copies for longer.
+Host time is required because drand proves that evidence could not predate a round; it cannot prove the caller's current time. The default node-evidence policy is three minutes and can be tightened to one minute.
 
-Verification returns both bundle expiry and the earliest node-trust expiry. `serve` refreshes at
-the earlier deadline with randomized lead time and retry delay, which prevents synchronized client
-fetches.
+`expires_at` is the only refresh deadline. `serve` fetches a replacement 30–60 seconds before expiry, includes the public endpoint's ten-second shared-cache allowance, and retries in the background with jitter. It does not synchronously refresh after a connection or pin failure. If no valid replacement exists at expiry, new requests fail closed.
 
-## Language Support
+## Test suite
 
-- Rust, browser/Web Worker, Node, Bun, Python, and Go have maintained language APIs.
-- Linux x86-64/ARM64, macOS x86-64/ARM64, and Windows x86-64 receive native CLI and C artifacts.
-- Java 22+ can bind the C ABI through the Foreign Function and Memory API.
-- .NET can bind the same ABI with P/Invoke.
-- Swift and Kotlin do not currently have maintained Stogas packages; the core remains compatible
-  with generated UniFFI bindings without adding a second verification implementation.
+Run the native core, CLI, and binding tests:
 
-The C boundary accepts bounded byte buffers and returns bounded JSON. It does not expose
-cryptographic primitives.
+```console
+cargo test --locked --workspace --all-targets
+```
 
-## Historical Evidence
+The browser, Node, Go, conformance, and packaged-artifact commands are kept executable in [the CI workflow](.github/workflows/ci.yml), including their required build steps. GitHub CI runs:
 
-Clients never search Rekor or an archive to accept a current node. Each current bundle is
-self-contained. Rekor records the GitHub release provenance for which it was designed; it is not a
-fleet database.
+- Rust format, Clippy, and native tests on Linux x86-64/ARM64, macOS x86-64/ARM64, and Windows x86-64;
+- Go and C ABI tests;
+- browser and Node package tests;
+- Playwright with all browser networking blocked;
+- official Sigstore conformance and differential verification;
+- malformed-proof mutations and sanitized fuzz-target smoke tests.
 
-Stogas retains each admitted node's quote, report-data preimage, bound keys, collateral, drand round,
-and linked immutable release provenance. Public sequence objects provide a 31-day audit and mirror
-window. These records support historical verification without placing an external transparency log
-in the runtime trust path.
+The scheduled fuzz workflow exercises JSON, Sigstore, X.509, SNP, drand, WebAssembly, and C ABI boundaries.
 
-See [SECURITY.md](SECURITY.md) to report vulnerabilities.
+## Evidence endpoints
+
+- Production: `https://evidence.stogas.ai/bundles/latest.json`
+- Staging: `https://evidence-staging.stogas.ai/bundles/latest.json`
+
+See [SECURITY.md](SECURITY.md) to report a vulnerability.
 
 ## License
 
-Copyright 2026 Stogas LLC. Licensed under the Apache License, Version 2.0; see [LICENSE](LICENSE).
+Copyright 2026 Stogas LLC. Licensed under Apache-2.0; see [LICENSE](LICENSE).
