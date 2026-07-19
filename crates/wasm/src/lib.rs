@@ -9,6 +9,7 @@ use stogas_verifier::{
     verify_heartbeat_admission as verify_admission,
     verify_local_heartbeat_admission as verify_local_admission,
     verify_release_approval as verify_release,
+    verify_staging_release_approval as verify_staging_release,
 };
 use wasm_bindgen::prelude::*;
 
@@ -42,11 +43,12 @@ impl WasmVerifier {
     /// Returns a JavaScript error when the freshness policy is invalid.
     #[wasm_bindgen(constructor)]
     #[allow(clippy::needless_pass_by_value)]
-    pub fn new(max_node_age_ms: Option<f64>) -> Result<Self, JsError> {
+    pub fn new(max_node_age_ms: Option<f64>, staging: Option<bool>) -> Result<Self, JsError> {
         Ok(Self {
             core: CoreVerifier::default(),
             environment: verifier_environment(
                 max_node_age_ms.unwrap_or(DEFAULT_NODE_EVIDENCE_AGE_MS_F64),
+                staging.unwrap_or(false),
             )?,
         })
     }
@@ -81,7 +83,7 @@ fn to_js_value<T: Serialize>(value: &T) -> Result<JsValue, JsError> {
         .map_err(|error| JsError::new(&error.to_string()))
 }
 
-fn verifier_environment(max_node_age_ms: f64) -> Result<Environment, JsError> {
+fn verifier_environment(max_node_age_ms: f64, staging: bool) -> Result<Environment, JsError> {
     if !max_node_age_ms.is_finite()
         || max_node_age_ms.fract() != 0.0
         || !(MIN_NODE_EVIDENCE_AGE_MS_F64..=MAX_NODE_EVIDENCE_AGE_MS_F64).contains(&max_node_age_ms)
@@ -90,7 +92,11 @@ fn verifier_environment(max_node_age_ms: f64) -> Result<Environment, JsError> {
             "max_node_age_ms must be an integer between 60000 and 180000",
         ));
     }
-    let mut environment = Environment::stogas();
+    let mut environment = if staging {
+        Environment::staging()
+    } else {
+        Environment::stogas()
+    };
     #[allow(clippy::cast_possible_truncation)]
     let milliseconds = max_node_age_ms as i64;
     environment.max_node_evidence_age_ms = milliseconds;
@@ -122,6 +128,23 @@ pub fn verify_bundle(bundle: &[u8]) -> Result<JsValue, JsError> {
 pub fn verify_release_approval(release: &[u8], now_unix_ms: f64) -> Result<JsValue, JsError> {
     validate_time(now_unix_ms)?;
     let output = verify_release(release, now_unix_ms as i64)
+        .map_err(|error| JsError::new(&error.to_string()))?;
+    to_js_value(&output)
+}
+
+/// Verify one release approval using the staging-only development provenance policy.
+///
+/// # Errors
+///
+/// Returns a JavaScript error when the captured time or release authorization is invalid.
+#[wasm_bindgen]
+#[allow(clippy::cast_possible_truncation)]
+pub fn verify_staging_release_approval(
+    release: &[u8],
+    now_unix_ms: f64,
+) -> Result<JsValue, JsError> {
+    validate_time(now_unix_ms)?;
+    let output = verify_staging_release(release, now_unix_ms as i64)
         .map_err(|error| JsError::new(&error.to_string()))?;
     to_js_value(&output)
 }

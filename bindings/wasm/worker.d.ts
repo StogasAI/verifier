@@ -5,6 +5,7 @@ export {
 	verify_heartbeat_admission,
 	verify_local_heartbeat_admission,
 	verify_release_approval,
+	verify_staging_release_approval,
 	verify_sigstore_github_attestation,
 	verify_bundle
 } from '../../pkg/browser/stogas_verifier.js';

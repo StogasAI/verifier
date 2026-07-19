@@ -101,7 +101,8 @@ async fn main() -> Result<()> {
 
 fn environment(target: Target, max_node_age_minutes: u16) -> Environment {
     let mut environment = match target {
-        Target::Staging | Target::Production => Environment::stogas(),
+        Target::Staging => Environment::staging(),
+        Target::Production => Environment::stogas(),
     };
     environment.max_node_evidence_age_ms = i64::from(max_node_age_minutes) * 60 * 1000;
     environment

@@ -11,6 +11,7 @@ use base64::{
 };
 use chrono::{DateTime, Utc};
 use ed25519_dalek::{Signature as Ed25519Signature, VerifyingKey, pkcs8::DecodePublicKey};
+use serde::Deserialize;
 use serde_json::Value;
 use sha2::{Digest, Sha256, Sha512};
 use std::collections::{BTreeMap, BTreeSet};
@@ -37,6 +38,31 @@ const AMD_COLLATERAL_VALIDITY_MS: i64 = 24 * 60 * 60 * 1000;
 const STOGAS_RELEASE_KEY_ID: &str = "stogas-ed25519-stamp-v1";
 const STOGAS_RELEASE_PUBLIC_KEY_DER_BASE64: &str =
     "MCowBQYDK2VwAyEAByVn3LvWVbf3YkokMZPvir70vcDu0nNflgXoM0Y8aQU=";
+const STAGING_PROVENANCE_TYPE: &str = "https://stogas.ai/attestations/staging-development/v1";
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StagingDevelopmentProvenance {
+    #[serde(rename = "_type")]
+    statement_type: String,
+    #[serde(rename = "predicateType")]
+    predicate_type: String,
+    predicate: StagingDevelopmentPredicate,
+    subject: Vec<StagingDevelopmentSubject>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StagingDevelopmentPredicate {
+    environment: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StagingDevelopmentSubject {
+    digest: BTreeMap<String, String>,
+    name: String,
+}
 
 /// Runtime-independent trust configuration.
 #[derive(Clone, Debug)]
@@ -45,6 +71,7 @@ pub struct Environment {
     pub release_keys: BTreeMap<String, String>,
     /// Maximum node drand age permitted through the verified bundle expiry.
     pub max_node_evidence_age_ms: i64,
+    allow_staging_development_provenance: bool,
 }
 
 impl Environment {
@@ -58,6 +85,17 @@ impl Environment {
         Self {
             release_keys,
             max_node_evidence_age_ms: DEFAULT_NODE_EVIDENCE_AGE_MS,
+            allow_staging_development_provenance: false,
+        }
+    }
+
+    /// Staging trust policy. This accepts the explicit Stogas development-provenance statement in
+    /// place of GitHub provenance while retaining the signed launch-policy requirement.
+    #[must_use]
+    pub fn staging() -> Self {
+        Self {
+            allow_staging_development_provenance: true,
+            ..Self::stogas()
         }
     }
 }
@@ -147,6 +185,26 @@ pub fn verify_release_approval(
     let release: AllowedIgvm =
         serde_json::from_value(value).map_err(|error| Error::InvalidBundle(error.to_string()))?;
     verify_release(&release, &Environment::stogas(), now_unix_ms)
+}
+
+/// Verify one release authorization using the staging trust policy.
+///
+/// # Errors
+///
+/// Returns an error unless the release has a valid Stogas signature and either strict GitHub
+/// provenance or the exact staging-only development-provenance statement.
+pub fn verify_staging_release_approval(
+    release_bytes: &[u8],
+    now_unix_ms: i64,
+) -> Result<VerifiedRelease, Error> {
+    if release_bytes.len() > MAX_INPUT_BYTES {
+        return Err(Error::TooLarge);
+    }
+    let value = strict_json::from_slice(release_bytes)
+        .map_err(|error| Error::InvalidJson(error.to_string()))?;
+    let release: AllowedIgvm =
+        serde_json::from_value(value).map_err(|error| Error::InvalidBundle(error.to_string()))?;
+    verify_release(&release, &Environment::staging(), now_unix_ms)
 }
 
 /// Verify one exact AMD collateral stack before Control makes it active.
@@ -1009,37 +1067,47 @@ fn verify_release(
     let attestation_bytes =
         serde_json::to_vec(attestation_value).map_err(|error| Error::Release(error.to_string()))?;
     let policy_digest = hex::encode(Sha256::digest(canonical.as_bytes()));
-    let workflow_identity = format!(
-        "https://github.com/StogasAI/gateway/.github/workflows/gateway-igvm-release.yml@refs/tags/{}",
-        policy.release_tag
-    );
-    let verified_attestation = verify_github_attestation(
-        &attestation_bytes,
-        &[
-            Subject {
-                name: "gateway.igvm",
-                sha256: &policy.igvm_sha256,
+    let staging_development_provenance = environment.allow_staging_development_provenance
+        && is_staging_development_provenance(
+            &attestation_bytes,
+            &policy.igvm_sha256,
+            &policy_digest,
+        )?;
+    let github_integrated_time_unix_ms = if staging_development_provenance {
+        0
+    } else {
+        let workflow_identity = format!(
+            "https://github.com/StogasAI/gateway/.github/workflows/gateway-igvm-release.yml@refs/tags/{}",
+            policy.release_tag
+        );
+        let verified_attestation = verify_github_attestation(
+            &attestation_bytes,
+            &[
+                Subject {
+                    name: "gateway.igvm",
+                    sha256: &policy.igvm_sha256,
+                },
+                Subject {
+                    name: "gateway-launch-policy.json",
+                    sha256: &policy_digest,
+                },
+            ],
+            &GithubPolicy {
+                repository: policy.source.repository.clone(),
+                workflow_identity,
+                source_ref: format!("refs/tags/{}", policy.release_tag),
+                source_commit: policy.source.commit.clone(),
+                predicate_type: "https://slsa.dev/provenance/v1".into(),
+                require_github_hosted: true,
             },
-            Subject {
-                name: "gateway-launch-policy.json",
-                sha256: &policy_digest,
-            },
-        ],
-        &GithubPolicy {
-            repository: policy.source.repository.clone(),
-            workflow_identity,
-            source_ref: format!("refs/tags/{}", policy.release_tag),
-            source_commit: policy.source.commit.clone(),
-            predicate_type: "https://slsa.dev/provenance/v1".into(),
-            require_github_hosted: true,
-        },
-        now_unix_ms,
-    )
-    .map_err(|error| Error::Release(error.to_string()))?;
-    let github_integrated_time_unix_ms = verified_attestation
-        .integrated_time
-        .checked_mul(1000)
-        .ok_or_else(|| Error::Release("GitHub integration time overflows".into()))?;
+            now_unix_ms,
+        )
+        .map_err(|error| Error::Release(error.to_string()))?;
+        verified_attestation
+            .integrated_time
+            .checked_mul(1000)
+            .ok_or_else(|| Error::Release("GitHub integration time overflows".into()))?
+    };
 
     Ok(VerifiedRelease {
         github_integrated_time_unix_ms,
@@ -1055,6 +1123,64 @@ fn verify_release(
         stogas_signing_key_id: signature.key_id.clone(),
         vcpu_count: policy.vcpu_count,
     })
+}
+
+fn is_staging_development_provenance(
+    bytes: &[u8],
+    igvm_sha256: &str,
+    launch_policy_sha256: &str,
+) -> Result<bool, Error> {
+    let value: Value = serde_json::from_slice(bytes)
+        .map_err(|error| Error::Release(format!("invalid provenance JSON: {error}")))?;
+    if value.get("predicateType").and_then(Value::as_str) != Some(STAGING_PROVENANCE_TYPE) {
+        return Ok(false);
+    }
+    let statement: StagingDevelopmentProvenance =
+        serde_json::from_value(value).map_err(|error| {
+            Error::Release(format!("invalid staging development provenance: {error}"))
+        })?;
+    if statement.statement_type != "https://in-toto.io/Statement/v1"
+        || statement.predicate_type != STAGING_PROVENANCE_TYPE
+        || statement.predicate.environment != "staging"
+        || statement.subject.len() != 2
+    {
+        return Err(Error::Release(
+            "invalid staging development provenance policy".into(),
+        ));
+    }
+    let expected = BTreeMap::from([
+        ("gateway-launch-policy.json", launch_policy_sha256),
+        ("gateway.igvm", igvm_sha256),
+    ]);
+    let mut actual = BTreeMap::new();
+    for subject in statement.subject {
+        if subject.digest.len() != 1 {
+            return Err(Error::Release(
+                "staging development provenance subject digest is invalid".into(),
+            ));
+        }
+        let Some(digest) = subject.digest.get("sha256") else {
+            return Err(Error::Release(
+                "staging development provenance requires SHA-256 subjects".into(),
+            ));
+        };
+        if actual.insert(subject.name, digest.clone()).is_some() {
+            return Err(Error::Release(
+                "staging development provenance has duplicate subjects".into(),
+            ));
+        }
+    }
+    if actual
+        != expected
+            .into_iter()
+            .map(|(name, digest)| (name.to_owned(), digest.to_owned()))
+            .collect()
+    {
+        return Err(Error::Release(
+            "staging development provenance subjects differ".into(),
+        ));
+    }
+    Ok(true)
 }
 
 fn verify_node(
@@ -2177,6 +2303,7 @@ mod tests {
                 ),
             )]),
             max_node_evidence_age_ms: DEFAULT_NODE_EVIDENCE_AGE_MS,
+            allow_staging_development_provenance: false,
         }
     }
 
@@ -2202,6 +2329,36 @@ mod tests {
 
         let duplicate = br#"{"github_in_toto":[],"github_in_toto":[]}"#;
         assert!(verify_release_approval(duplicate, 1_784_246_400_000).is_err());
+    }
+
+    #[test]
+    fn staging_development_provenance_is_exact_and_never_accepted_by_production() {
+        let mut release = release_fixture();
+        let mut environment = resign_release(&mut release);
+        environment.allow_staging_development_provenance = true;
+        let canonical =
+            canonical_json(&serde_json::to_value(&release.launch_policy).unwrap()).unwrap();
+        let policy_digest = hex::encode(Sha256::digest(canonical.as_bytes()));
+        release.github_in_toto = vec![serde_json::json!({
+            "_type": "https://in-toto.io/Statement/v1",
+            "predicateType": STAGING_PROVENANCE_TYPE,
+            "predicate": { "environment": "staging" },
+            "subject": [
+                { "name": "gateway.igvm", "digest": { "sha256": release.launch_policy.igvm_sha256 } },
+                { "name": "gateway-launch-policy.json", "digest": { "sha256": policy_digest } }
+            ]
+        })];
+
+        let verified = verify_release(&release, &environment, 1_784_246_400_000).unwrap();
+        assert_eq!(verified.github_integrated_time_unix_ms, 0);
+
+        environment.allow_staging_development_provenance = false;
+        assert!(verify_release(&release, &environment, 1_784_246_400_000).is_err());
+
+        environment.allow_staging_development_provenance = true;
+        release.github_in_toto[0]["subject"][0]["digest"]["sha256"] =
+            Value::String("00".repeat(32));
+        assert!(verify_release(&release, &environment, 1_784_246_400_000).is_err());
     }
 
     #[test]
