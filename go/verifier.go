@@ -69,11 +69,10 @@ func NewWithOptions(options Options) (*Verifier, error) {
 
 // VerifyBundle verifies using one captured platform wall-clock value.
 func (verifier *Verifier) VerifyBundle(bundle []byte) (json.RawMessage, error) {
-	return verifier.VerifyBundleAt(bundle, time.Now().UnixMilli())
+	return verifier.verifyBundleAt(bundle, time.Now().UnixMilli())
 }
 
-// VerifyBundleAt verifies at an injected Unix wall-clock time in milliseconds.
-func (verifier *Verifier) VerifyBundleAt(bundle []byte, nowUnixMS int64) (json.RawMessage, error) {
+func (verifier *Verifier) verifyBundleAt(bundle []byte, nowUnixMS int64) (json.RawMessage, error) {
 	verifier.mu.Lock()
 	defer verifier.mu.Unlock()
 	if verifier.handle == nil {

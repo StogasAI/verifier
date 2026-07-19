@@ -33,11 +33,6 @@ func (*Verifier) VerifyBundle([]byte) (json.RawMessage, error) {
 	return nil, ErrNativeLibraryUnavailable
 }
 
-// VerifyBundleAt reports that the packaged native verifier is unavailable.
-func (*Verifier) VerifyBundleAt([]byte, int64) (json.RawMessage, error) {
-	return nil, ErrNativeLibraryUnavailable
-}
-
 // Close is a no-op for an unavailable verifier.
 func (*Verifier) Close() error { return nil }
 

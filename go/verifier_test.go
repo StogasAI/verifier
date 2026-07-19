@@ -25,7 +25,7 @@ func TestRejectsMalformedBundle(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = verifier.Close() })
-	if _, err := verifier.VerifyBundleAt([]byte(`{"body":`), 1); err == nil || !strings.Contains(err.Error(), "invalid bundle JSON") {
+	if _, err := verifier.verifyBundleAt([]byte(`{"body":`), 1); err == nil || !strings.Contains(err.Error(), "invalid bundle JSON") {
 		t.Fatalf("unexpected verification error: %v", err)
 	}
 }
@@ -40,7 +40,7 @@ func TestVerifiesTheSharedRealStagingBundle(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = verifier.Close() })
-	result, err := verifier.VerifyBundleAt(bundle, stagingBundleNowUnixMS)
+	result, err := verifier.verifyBundleAt(bundle, stagingBundleNowUnixMS)
 	if err != nil {
 		t.Fatal(err)
 	}

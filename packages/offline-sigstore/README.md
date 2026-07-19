@@ -17,7 +17,5 @@ const verified = verify_github_attestation(
 );
 ```
 
-The default Node/Bun export initializes WASM synchronously. Browser consumers initialize the
-`/browser` module with its generated default initializer; compatible Workers can use `/worker`.
-`verify_github_attestation_at` accepts an injected Unix time in milliseconds for deterministic
-tests and audits.
+The default Node/Bun export initializes WebAssembly synchronously. Browser consumers initialize
+the `/browser` module once with its default initializer; compatible Workers use `/worker`.

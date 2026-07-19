@@ -30,10 +30,12 @@ impl PythonVerifier {
         py: Python<'py>,
         bundle: &[u8],
     ) -> PyResult<Bound<'py, PyBytes>> {
-        self.verify_bundle_at(py, bundle, wall_clock_ms()?)
+        self.verify_bundle_with_time(py, bundle, wall_clock_ms()?)
     }
+}
 
-    fn verify_bundle_at<'py>(
+impl PythonVerifier {
+    fn verify_bundle_with_time<'py>(
         &mut self,
         py: Python<'py>,
         bundle: &[u8],
@@ -49,7 +51,7 @@ impl PythonVerifier {
 
 #[pyfunction]
 fn verify_bundle<'py>(py: Python<'py>, bundle: &[u8]) -> PyResult<Bound<'py, PyBytes>> {
-    verify_bundle_at(py, bundle, wall_clock_ms()?)
+    verify_bundle_with_time(py, bundle, wall_clock_ms()?)
 }
 
 fn wall_clock_ms() -> PyResult<i64> {
@@ -62,8 +64,7 @@ fn wall_clock_ms() -> PyResult<i64> {
     .map_err(|_| PyValueError::new_err("system clock is too large"))
 }
 
-#[pyfunction]
-fn verify_bundle_at<'py>(
+fn verify_bundle_with_time<'py>(
     py: Python<'py>,
     bundle: &[u8],
     now_unix_ms: i64,
@@ -96,6 +97,5 @@ fn json_bytes<'py, T: serde::Serialize>(
 #[pymodule]
 fn _stogas_verifier(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<PythonVerifier>()?;
-    module.add_function(wrap_pyfunction!(verify_bundle, module)?)?;
-    module.add_function(wrap_pyfunction!(verify_bundle_at, module)?)
+    module.add_function(wrap_pyfunction!(verify_bundle, module)?)
 }

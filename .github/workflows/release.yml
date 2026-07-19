@@ -227,20 +227,13 @@ jobs:
           python -m pip install --force-reinstall dist/*.whl
           python - <<'PY'
           import stogas_verifier
-          import json
-          from pathlib import Path
           verifier = stogas_verifier.Verifier()
           try:
-              verifier.verify_bundle_at(b'{"body":', 1)
+              verifier.verify_bundle(b'{"body":')
           except ValueError as error:
               assert "invalid bundle JSON" in str(error)
           else:
               raise AssertionError("malformed bundle was accepted")
-          bundle = Path("crates/verifier/tests/fixtures/staging-bundle-sequence-1927.json").read_bytes()
-          output = json.loads(verifier.verify_bundle_at(bundle, 1_784_414_117_082))
-          assert output["bundle"]["sequence"] == 1927
-          assert len(output["bundle"]["nodes"]) == 1
-          assert len(output["bundle"]["releases"]) == 1
           PY
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
@@ -291,7 +284,7 @@ jobs:
           const offline = await import('@stogas/offline-sigstore')
           const verifier = new full.Verifier()
           try {
-            verifier.verify_bundle_at(new TextEncoder().encode('{"body":'), 1)
+            verifier.verify_bundle(new TextEncoder().encode('{"body":'))
             throw new Error('packed verifier accepted malformed input')
           } catch (error) {
             if (!String(error).includes('invalid bundle JSON')) throw error

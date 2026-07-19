@@ -1,6 +1,9 @@
-export {
-	default,
-	Verifier,
-	verify_bundle,
-	verify_bundle_at
-} from '../../pkg/browser/stogas_verifier.js';
+import type { Verifier as CoreVerifier } from '../../pkg/browser/stogas_verifier.js';
+
+export { default, verify_bundle } from '../../pkg/browser/stogas_verifier.js';
+
+export declare class Verifier {
+	constructor(maxNodeAgeMs?: number | null);
+	verify_bundle(bundle: Uint8Array): ReturnType<CoreVerifier['verify_bundle']>;
+	free(): void;
+}
