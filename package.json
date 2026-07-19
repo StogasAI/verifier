@@ -1,0 +1,49 @@
+{
+	"name": "@stogas/verifier",
+	"version": "0.1.0-alpha.1",
+	"description": "Offline WebAssembly verifier for Stogas confidential gateway bundles",
+	"license": "Apache-2.0",
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/StogasAI/verifier.git"
+	},
+	"homepage": "https://github.com/StogasAI/verifier#readme",
+	"bugs": "https://github.com/StogasAI/verifier/issues",
+	"engines": {
+		"node": ">=20"
+	},
+	"sideEffects": false,
+	"publishConfig": {
+		"access": "public",
+		"provenance": true
+	},
+	"type": "module",
+	"files": [
+		"bindings/node",
+		"bindings/wasm",
+		"pkg",
+		"README.md",
+		"LICENSE"
+	],
+	"exports": {
+		".": {
+			"types": "./bindings/node/node.d.ts",
+			"import": "./bindings/node/node.js"
+		},
+		"./browser": {
+			"types": "./pkg/browser/stogas_verifier.d.ts",
+			"import": "./pkg/browser/stogas_verifier.js"
+		},
+		"./worker": {
+			"types": "./bindings/wasm/worker.d.ts",
+			"import": "./bindings/wasm/worker.js"
+		}
+	},
+	"scripts": {
+		"test:browser": "playwright test --config tests/browser/playwright.config.ts",
+		"test:node": "node tests/node/verifier.test.mjs && node tests/node/offline-sigstore.test.mjs"
+	},
+	"devDependencies": {
+		"@playwright/test": "1.61.1"
+	}
+}

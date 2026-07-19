@@ -1,0 +1,160 @@
+name: Publish reviewed release
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+
+jobs:
+  metadata:
+    name: Validate published release
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.release.tag_name }}
+          persist-credentials: false
+      - id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="${{ github.event.release.tag_name }}"
+          [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]]
+          version="${tag#v}"
+          test "$(node -p "require('./package.json').version")" = "$version"
+          test "$(node -p "require('./packages/offline-sigstore/package.json').version")" = "$version"
+          test "$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n1)" = "$version"
+          test "$(git rev-list -n1 "$tag")" = "$(git rev-parse HEAD)"
+          printf 'version=%s\n' "$version" >> "$GITHUB_OUTPUT"
+
+  npm:
+    name: npm
+    needs: metadata
+    runs-on: ubuntu-24.04
+    environment: release
+    permissions:
+      attestations: read
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          ref: ${{ github.event.release.tag_name }}
+          persist-credentials: false
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e
+        with:
+          node-version: 24.13.1
+          registry-url: https://registry.npmjs.org
+      - name: Download and verify the reviewed npm artifact
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir dist
+          gh release download "${{ github.event.release.tag_name }}" --dir dist \
+            --pattern 'stogas-*.tgz' --pattern SHA256SUMS
+          (cd dist && sha256sum -c --ignore-missing SHA256SUMS)
+          for package in dist/stogas-*.tgz; do
+            gh attestation verify "$package" --repo "$GITHUB_REPOSITORY"
+          done
+      - name: Publish both reviewed npm packages
+        shell: bash
+        run: |
+          set -euo pipefail
+          for package in dist/stogas-*.tgz; do
+            npm publish "$package" --access public --provenance
+          done
+
+  pypi:
+    name: PyPI
+    needs: metadata
+    runs-on: ubuntu-24.04
+    environment: release
+    permissions:
+      attestations: read
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          ref: ${{ github.event.release.tag_name }}
+          persist-credentials: false
+      - name: Download and verify every reviewed wheel
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir dist
+          gh release download "${{ github.event.release.tag_name }}" --dir dist \
+            --pattern '*.whl' --pattern SHA256SUMS
+          (cd dist && sha256sum -c --ignore-missing SHA256SUMS)
+          for wheel in dist/*.whl; do
+            gh attestation verify "$wheel" --repo "$GITHUB_REPOSITORY"
+          done
+          rm dist/SHA256SUMS
+      - uses: pypa/gh-action-pypi-publish@cef221092ed1bacb1cc03d23a2d87d1d172e277b
+        with:
+          packages-dir: dist
+          print-hash: true
+
+  crates-io:
+    name: crates.io
+    needs: metadata
+    runs-on: ubuntu-24.04
+    environment: release
+    permissions:
+      attestations: read
+      contents: read
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          ref: ${{ github.event.release.tag_name }}
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c
+        with:
+          toolchain: 1.97.1
+      - name: Verify reviewed crate archives
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir dist
+          gh release download "${{ github.event.release.tag_name }}" --dir dist \
+            --pattern '*.crate' --pattern SHA256SUMS
+          (cd dist && sha256sum -c --ignore-missing SHA256SUMS)
+          for package in dist/*.crate; do
+            gh attestation verify "$package" --repo "$GITHUB_REPOSITORY"
+          done
+      - name: Publish the dependency before the branded verifier
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${{ needs.metadata.outputs.version }}"
+          publish_if_absent() {
+            local package="$1"
+            if cargo info "$package@$version" --registry crates-io >/dev/null 2>&1; then
+              echo "$package $version is already published"
+              return
+            fi
+            cargo publish --locked --package "$package"
+          }
+          publish_if_absent stogas-offline-sigstore
+          for attempt in $(seq 1 30); do
+            cargo info "stogas-offline-sigstore@$version" --registry crates-io >/dev/null 2>&1 && break
+            if [ "$attempt" = 30 ]; then
+              echo 'stogas-offline-sigstore did not become visible on crates.io' >&2
+              exit 1
+            fi
+            sleep 10
+          done
+          publish_if_absent stogas-verifier

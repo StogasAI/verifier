@@ -1,0 +1,45 @@
+[package]
+name = "stogas-verifier-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4.13"
+stogas-offline-sigstore = { path = "../crates/offline-sigstore" }
+stogas-verifier = { path = "../crates/verifier" }
+stogas-verifier-ffi = { path = "../crates/ffi" }
+
+[[bin]]
+name = "sigstore"
+path = "fuzz_targets/sigstore.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "bundle_x509_snp_drand"
+path = "fuzz_targets/bundle_x509_snp_drand.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "heartbeat_admission"
+path = "fuzz_targets/heartbeat_admission.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "c_abi"
+path = "fuzz_targets/c_abi.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]
+members = ["."]

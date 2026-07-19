@@ -4,7 +4,7 @@ description = "Python bindings for stogas-verifier"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
-license.workspace = true
+license-file.workspace = true
 repository.workspace = true
 
 [lib]
@@ -14,8 +14,8 @@ crate-type = ["cdylib"]
 [dependencies]
 pyo3 = { version = "0.26.0", features = ["abi3-py310", "extension-module"] }
 serde_json.workspace = true
+serde.workspace = true
 stogas-verifier = { path = "../../crates/verifier" }
 
 [lints]
 workspace = true
-

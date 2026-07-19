@@ -1,0 +1,41 @@
+{
+	"name": "@stogas/offline-sigstore",
+	"version": "0.1.0-alpha.1",
+	"description": "Lightweight networkless WASM verification for GitHub/Sigstore in-toto attestations",
+	"license": "Apache-2.0",
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/StogasAI/verifier.git",
+		"directory": "packages/offline-sigstore"
+	},
+	"homepage": "https://github.com/StogasAI/verifier#packages",
+	"bugs": "https://github.com/StogasAI/verifier/issues",
+	"engines": {
+		"node": ">=20"
+	},
+	"sideEffects": false,
+	"publishConfig": {
+		"access": "public",
+		"provenance": true
+	},
+	"type": "module",
+	"files": [
+		"bindings",
+		"pkg",
+		"README.md"
+	],
+	"exports": {
+		".": {
+			"types": "./bindings/node/node.d.ts",
+			"import": "./bindings/node/node.js"
+		},
+		"./browser": {
+			"types": "./pkg/browser/stogas_offline_sigstore.d.ts",
+			"import": "./pkg/browser/stogas_offline_sigstore.js"
+		},
+		"./worker": {
+			"types": "./bindings/worker/worker.d.ts",
+			"import": "./bindings/worker/worker.js"
+		}
+	}
+}

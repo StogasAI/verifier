@@ -3,6 +3,6 @@
 Please report vulnerabilities privately through GitHub Security Advisories for this repository.
 Do not include secrets, live API keys, or private customer traffic in a report.
 
-The verifier is pre-1.0. A stable release is blocked on independent review of the supported offline
-Sigstore profile and the composed Stogas verifier.
-
+Verification reduces trust in bundle transport and infrastructure; it is not a substitute for an
+application's own threat analysis. Reports involving Sigstore, X.509, AMD SEV-SNP, drand, parsing,
+or language-boundary discrepancies are especially useful.

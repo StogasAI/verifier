@@ -1,6 +1,12 @@
 //! Offline verification of the narrow GitHub Actions Sigstore profile used by Stogas.
 
+mod crypto;
+mod sct;
+mod sigstore;
 mod strict_json;
+mod tlog;
+mod trust_root;
+mod tsa;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -29,6 +35,18 @@ pub struct GithubPolicy {
     pub predicate_type: String,
     /// Require GitHub-hosted runner provenance.
     pub require_github_hosted: bool,
+}
+
+/// Generic identity policy for the supported Sigstore v0.3 DSSE profile.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct IdentityPolicy {
+    /// Exact URI SAN expected in the Fulcio leaf certificate.
+    pub certificate_identity: String,
+    /// Exact OIDC issuer expected in the Fulcio extension.
+    pub certificate_oidc_issuer: String,
+    /// Required in-toto predicate type.
+    pub predicate_type: String,
 }
 
 /// A subject which must be bound by the attestation.
@@ -82,6 +100,7 @@ pub fn verify_github_attestation(
     bundle_bytes: &[u8],
     expected_subjects: &[Subject<'_>],
     policy: &GithubPolicy,
+    now_unix_ms: i64,
 ) -> Result<VerifiedAttestation, Error> {
     if bundle_bytes.len() > MAX_BUNDLE_BYTES {
         return Err(Error::TooLarge);
@@ -90,7 +109,7 @@ pub fn verify_github_attestation(
     let mut verified = None;
     let mut last_error = None;
     for value in documents {
-        match verify_github_attestation_value(&value, expected_subjects, policy) {
+        match verify_github_attestation_value(&value, expected_subjects, policy, now_unix_ms) {
             Ok(result) if verified.is_none() => verified = Some(result),
             Ok(_) => {
                 return Err(Error::Policy(
@@ -105,10 +124,86 @@ pub fn verify_github_attestation(
     })
 }
 
+/// Verify the supported Sigstore v0.3 DSSE profile with exact identity and subjects.
+///
+/// This generic seam contains no Stogas release policy. Callers which need GitHub build claims
+/// must apply their policy to the authenticated statement, as `verify_github_attestation` does.
+///
+/// # Errors
+///
+/// Returns an error for malformed, unsupported, untrusted, or policy-mismatched evidence.
+pub fn verify_dsse_attestation(
+    bundle_bytes: &[u8],
+    expected_subjects: &[Subject<'_>],
+    policy: &IdentityPolicy,
+    now_unix_ms: i64,
+) -> Result<VerifiedAttestation, Error> {
+    if bundle_bytes.len() > MAX_BUNDLE_BYTES {
+        return Err(Error::TooLarge);
+    }
+    let documents = parse_bundle_documents(bundle_bytes)?;
+    let mut verified = None;
+    let mut last_error = None;
+    for value in documents {
+        let result = verify_dsse_attestation_value(&value, expected_subjects, policy, now_unix_ms);
+        match result {
+            Ok(result) if verified.is_none() => verified = Some(result),
+            Ok(_) => {
+                return Err(Error::Policy(
+                    "multiple attestations match the required subjects and policy".into(),
+                ));
+            }
+            Err(error) => last_error = Some(error),
+        }
+    }
+    verified.ok_or_else(|| {
+        last_error.unwrap_or_else(|| Error::InvalidBundle("attestation input is empty".into()))
+    })
+}
+
+fn verify_dsse_attestation_value(
+    value: &Value,
+    expected_subjects: &[Subject<'_>],
+    policy: &IdentityPolicy,
+    now_unix_ms: i64,
+) -> Result<VerifiedAttestation, Error> {
+    check_bundle_shape(value)?;
+    let payload = decode_dsse_payload(value)?;
+    let statement_value = strict_json::from_slice(&payload)
+        .map_err(|error| Error::InvalidBundle(format!("invalid DSSE statement: {error}")))?;
+    let statement: Statement = serde_json::from_value(statement_value)
+        .map_err(|error| Error::InvalidBundle(format!("invalid DSSE statement: {error}")))?;
+    check_subjects(&statement, expected_subjects)?;
+    if statement.kind != "https://in-toto.io/Statement/v1"
+        || statement.predicate_type != policy.predicate_type
+    {
+        return Err(Error::Policy(
+            "in-toto statement or predicate type differs".into(),
+        ));
+    }
+    let integrated_time = sigstore::verify(
+        value,
+        &policy.certificate_identity,
+        &policy.certificate_oidc_issuer,
+        now_unix_ms,
+    )
+    .map_err(Error::Cryptographic)?;
+    Ok(VerifiedAttestation {
+        integrated_time,
+        predicate_type: statement.predicate_type,
+        subjects: statement
+            .subject
+            .into_iter()
+            .map(|subject| (subject.name, subject.digest.sha256))
+            .collect(),
+    })
+}
+
 fn verify_github_attestation_value(
     value: &Value,
     expected_subjects: &[Subject<'_>],
     policy: &GithubPolicy,
+    now_unix_ms: i64,
 ) -> Result<VerifiedAttestation, Error> {
     check_bundle_shape(value)?;
     let payload = decode_dsse_payload(value)?;
@@ -120,7 +215,13 @@ fn verify_github_attestation_value(
 
     // Keep all Sigstore parsing and cryptography in the community verifier. The concrete API is
     // isolated here so SDKs never duplicate or weaken its policy.
-    let integrated_time = verify_with_sigstore_rust(value, expected_subjects, policy)?;
+    let integrated_time = sigstore::verify(
+        value,
+        &policy.workflow_identity,
+        "https://token.actions.githubusercontent.com",
+        now_unix_ms,
+    )
+    .map_err(Error::Cryptographic)?;
     if integrated_time <= 0 {
         return Err(Error::Cryptographic(
             "Rekor integrated time must be positive".into(),
@@ -160,58 +261,6 @@ fn parse_bundle_documents(bundle_bytes: &[u8]) -> Result<Vec<Value>, Error> {
                 .collect()
         }
     }
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-fn verify_with_sigstore_rust(
-    value: &Value,
-    subjects: &[Subject<'_>],
-    github_policy: &GithubPolicy,
-) -> Result<i64, Error> {
-    use sigstore_trust_root::{SIGSTORE_PRODUCTION_TRUSTED_ROOT, TrustedRoot};
-    use sigstore_types::{Bundle, Sha256Hash};
-    use sigstore_verify::{VerificationPolicy, Verifier};
-
-    let encoded =
-        serde_json::to_string(value).map_err(|error| Error::InvalidBundle(error.to_string()))?;
-    let bundle =
-        Bundle::from_json(&encoded).map_err(|error| Error::InvalidBundle(error.to_string()))?;
-    let root = TrustedRoot::from_json(SIGSTORE_PRODUCTION_TRUSTED_ROOT)
-        .map_err(|error| Error::Cryptographic(error.to_string()))?;
-    let verifier = Verifier::new(&root);
-    let policy = VerificationPolicy::default()
-        .require_identity(&github_policy.workflow_identity)
-        .require_issuer("https://token.actions.githubusercontent.com");
-    let mut authenticated_time = None;
-    for subject in subjects {
-        let digest = Sha256Hash::from_hex(subject.sha256)
-            .map_err(|error| Error::Policy(error.to_string()))?;
-        let result = verifier
-            .verify(digest, &bundle, &policy)
-            .map_err(|error| Error::Cryptographic(error.to_string()))?;
-        let integrated_time = result.integrated_time.ok_or_else(|| {
-            Error::Cryptographic("verified Rekor integrated time is absent".into())
-        })?;
-        if authenticated_time.is_some_and(|existing| existing != integrated_time) {
-            return Err(Error::Cryptographic(
-                "artifact subjects produced different authenticated times".into(),
-            ));
-        }
-        authenticated_time = Some(integrated_time);
-    }
-    authenticated_time
-        .ok_or_else(|| Error::Policy("at least one artifact subject is required".into()))
-}
-
-#[cfg(target_arch = "wasm32")]
-fn verify_with_sigstore_rust(
-    _value: &Value,
-    _subjects: &[Subject<'_>],
-    _github_policy: &GithubPolicy,
-) -> Result<i64, Error> {
-    Err(Error::Cryptographic(
-        "WASM Sigstore backend is unavailable".into(),
-    ))
 }
 
 fn decode_dsse_payload(value: &Value) -> Result<Vec<u8>, Error> {
@@ -483,7 +532,7 @@ mod tests {
     fn rejects_oversized_input_before_parsing() {
         let bytes = vec![b' '; MAX_BUNDLE_BYTES + 1];
         assert!(matches!(
-            verify_github_attestation(&bytes, &[], &policy()),
+            verify_github_attestation(&bytes, &[], &policy(), 0),
             Err(Error::TooLarge)
         ));
     }

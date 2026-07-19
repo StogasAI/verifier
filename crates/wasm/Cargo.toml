@@ -4,7 +4,7 @@ description = "WebAssembly bindings for stogas-verifier"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
-license.workspace = true
+license-file.workspace = true
 repository.workspace = true
 
 [lib]
@@ -15,6 +15,9 @@ js-sys = "0.3.78"
 getrandom = { version = "0.3.4", features = ["wasm_js"] }
 getrandom-02 = { package = "getrandom", version = "0.2.17", features = ["js"] }
 serde-wasm-bindgen = "0.6.5"
+serde.workspace = true
+serde_json.workspace = true
+stogas-offline-sigstore = { path = "../offline-sigstore" }
 stogas-verifier = { path = "../verifier" }
 wasm-bindgen = "0.2.101"
 

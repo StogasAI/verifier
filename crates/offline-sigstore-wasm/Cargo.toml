@@ -1,0 +1,24 @@
+[package]
+name = "stogas-offline-sigstore-wasm"
+description = "WebAssembly bindings for stogas-offline-sigstore"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license-file.workspace = true
+repository.workspace = true
+publish = false
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+getrandom-02 = { package = "getrandom", version = "0.2.17", features = ["js"] }
+js-sys = "0.3.78"
+serde.workspace = true
+serde_json.workspace = true
+serde-wasm-bindgen = "0.6.5"
+stogas-offline-sigstore = { path = "../offline-sigstore" }
+wasm-bindgen = "0.2.101"
+
+[lints]
+workspace = true

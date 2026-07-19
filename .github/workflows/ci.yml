@@ -1,6 +1,7 @@
 name: CI
 
 on:
+  workflow_call:
   pull_request:
   push:
     branches: [main]
@@ -41,9 +42,33 @@ jobs:
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32
       - run: cargo test --locked --workspace --all-targets
 
-  wasm-compile:
-    name: Browser WASM dependency gate
+  go:
+    name: Go binding and C ABI
     runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c
+        with:
+          toolchain: 1.97.1
+      - uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c
+        with:
+          go-version-file: go/go.mod
+          cache-dependency-path: go/go.mod
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32
+      - run: cargo build --locked --package stogas-verifier-ffi
+      - name: Test the Go adapter against the static Rust library
+        working-directory: go
+        env:
+          CGO_ENABLED: '1'
+          CGO_LDFLAGS: -L${{ github.workspace }}/target/debug
+        run: go test ./...
+
+  wasm-compile:
+    name: Browser WASM and network-disabled E2E
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
         with:
@@ -53,12 +78,159 @@ jobs:
           toolchain: 1.97.1
           targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e
+        with:
+          node-version: 24.13.1
+          cache: npm
       - name: Reject native crypto in the browser dependency graph
         shell: bash
         run: |
-          cargo tree --locked --package stogas-verifier-wasm --target wasm32-unknown-unknown > wasm-dependencies.txt
-          if grep -E '(^| )(aws-lc-rs|openssl|ring) v' wasm-dependencies.txt; then
-            echo 'Browser verifier contains a native cryptographic backend.' >&2
-            exit 1
-          fi
-      - run: cargo check --locked --package stogas-verifier-wasm --target wasm32-unknown-unknown
+          set -euo pipefail
+          for package in stogas-offline-sigstore-wasm stogas-verifier-wasm; do
+            cargo tree --locked --package "$package" --target wasm32-unknown-unknown > "${package}-dependencies.txt"
+            if grep -E '(^| )(aws-lc-rs|openssl|ring) v' "${package}-dependencies.txt"; then
+              echo "$package contains a native cryptographic backend." >&2
+              exit 1
+            fi
+            cargo check --locked --package "$package" --target wasm32-unknown-unknown
+          done
+      - name: Build browser and Node packages
+        run: |
+          set -euo pipefail
+          cargo install wasm-bindgen-cli --version =0.2.126 --locked
+          cargo build --locked --release --package stogas-offline-sigstore-wasm --package stogas-verifier-wasm --target wasm32-unknown-unknown
+          wasm-bindgen target/wasm32-unknown-unknown/release/stogas_verifier_wasm.wasm \
+            --target no-modules \
+            --out-dir target/browser \
+            --out-name stogas_verifier
+          wasm-bindgen target/wasm32-unknown-unknown/release/stogas_offline_sigstore_wasm.wasm \
+            --target no-modules \
+            --out-dir target/offline-browser \
+            --out-name stogas_offline_sigstore
+          wasm-bindgen target/wasm32-unknown-unknown/release/stogas_verifier_wasm.wasm \
+            --target web \
+            --out-dir pkg/browser \
+            --out-name stogas_verifier
+          wasm-bindgen target/wasm32-unknown-unknown/release/stogas_offline_sigstore_wasm.wasm \
+            --target web \
+            --out-dir packages/offline-sigstore/pkg/browser \
+            --out-name stogas_offline_sigstore
+      - name: Install browser test runtime
+        run: |
+          npm ci --ignore-scripts --workspaces=false
+          npx --no-install playwright install --with-deps chromium
+      - name: Verify with every browser network request blocked
+        run: npm run test:browser
+      - name: Verify the Node package entrypoint
+        run: npm run test:node
+
+  sigstore-conformance:
+    name: Sigstore conformance and differential verification
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          persist-credentials: false
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          repository: sigstore/sigstore-conformance
+          # sigstore-conformance v0.0.29
+          ref: 21533cde107c734ebc153c3e3a24d75fc9811a36
+          path: sigstore-conformance
+          persist-credentials: false
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          repository: sigstore/sigstore-go
+          ref: 55aa6240784677449a564e66a0fca7a6a3605ecd
+          path: sigstore-go
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c
+        with:
+          toolchain: 1.97.1
+      - uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c
+        with:
+          go-version-file: sigstore-go/go.mod
+          cache-dependency-path: sigstore-go/go.sum
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32
+      - name: Compare RustCrypto with the native Sigstore backend
+        run: cargo test --locked --package stogas-offline-sigstore --test native_differential
+      - name: Run every applicable official Sigstore v0.3 DSSE/SLSA case
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build --locked --package stogas-offline-sigstore --bin stogas-sigstore-conformance
+          client="$GITHUB_WORKSPACE/target/debug/stogas-sigstore-conformance"
+          assets="$GITHUB_WORKSPACE/sigstore-conformance/test/assets/bundle-verify"
+          default_identity="https://github.com/sigstore-conformance/extremely-dangerous-public-oidc-beacon/.github/workflows/extremely-dangerous-oidc-beacon.yml@refs/heads/main"
+          default_issuer="https://token.actions.githubusercontent.com"
+          cases=0
+          for case_dir in "$assets"/*; do
+            bundle="$case_dir/bundle.sigstore.json"
+            [ -f "$bundle" ] || continue
+            [ ! -f "$case_dir/key.pub" ] || continue
+            [ ! -f "$case_dir/trusted_root.json" ] || continue
+            jq -e '.mediaType == "application/vnd.dev.sigstore.bundle.v0.3+json" and has("dsseEnvelope")' "$bundle" >/dev/null || continue
+            jq -r '.dsseEnvelope.payload' "$bundle" | base64 -d > "$RUNNER_TEMP/statement.json"
+            jq -e '._type == "https://in-toto.io/Statement/v1" and .predicateType == "https://slsa.dev/provenance/v1"' "$RUNNER_TEMP/statement.json" >/dev/null || continue
+            case_name="$(basename "$case_dir")"
+            identity="$default_identity"
+            issuer="$default_issuer"
+            artifact="$assets/a.txt"
+            [ ! -f "$case_dir/identity" ] || identity="$(tr -d '\r\n' < "$case_dir/identity")"
+            [ ! -f "$case_dir/issuer" ] || issuer="$(tr -d '\r\n' < "$case_dir/issuer")"
+            [ ! -f "$case_dir/artifact" ] || artifact="$case_dir/artifact"
+            cases=$((cases + 1))
+            if "$client" verify-bundle --bundle "$bundle" --certificate-identity "$identity" --certificate-oidc-issuer "$issuer" "$artifact"; then
+              if [[ "$case_name" == *_fail ]]; then
+                echo "Official negative conformance case was accepted: $case_name" >&2
+                exit 1
+              fi
+            elif [[ "$case_name" != *_fail ]]; then
+              echo "Official supported conformance case was rejected: $case_name" >&2
+              exit 1
+            fi
+          done
+          test "$cases" -ge 4
+      - name: Verify the Stogas gateway fixture with gh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh attestation verify tests/fixtures/gateway-v0.0.1-launch-policy.json \
+            --bundle tests/fixtures/gateway-v0.0.1-attestation.jsonl \
+            --repo StogasAI/gateway \
+            --cert-identity 'https://github.com/StogasAI/gateway/.github/workflows/gateway-igvm-release.yml@refs/tags/v0.0.1' \
+            --source-ref refs/tags/v0.0.1 \
+            --source-digest 27eb4b954a372975c9e7c5dbc77fbf0d0ca53b3f \
+            --deny-self-hosted-runners
+      - name: Verify the Stogas gateway fixture with sigstore-go
+        working-directory: sigstore-go
+        run: |
+          go run ./test/conformance verify-bundle \
+            --bundle "$GITHUB_WORKSPACE/tests/fixtures/gateway-v0.0.1-attestation.jsonl" \
+            --certificate-identity 'https://github.com/StogasAI/gateway/.github/workflows/gateway-igvm-release.yml@refs/tags/v0.0.1' \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+            "$GITHUB_WORKSPACE/tests/fixtures/gateway-v0.0.1-launch-policy.json"
+
+  fuzz-smoke:
+    name: Sanitized fuzz-target smoke gate
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c
+        with:
+          toolchain: nightly-2026-07-01
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32
+        with:
+          workspaces: fuzz
+      - run: cargo install cargo-fuzz --version =0.13.2 --locked
+      - name: Exercise every native trust boundary under libFuzzer and sanitizers
+        shell: bash
+        run: |
+          set -euo pipefail
+          for target in sigstore bundle_x509_snp_drand heartbeat_admission c_abi; do
+            cargo fuzz run "$target" -- -max_total_time=10 -timeout=10
+          done

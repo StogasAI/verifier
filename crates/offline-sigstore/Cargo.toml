@@ -1,24 +1,45 @@
 [package]
 name = "stogas-offline-sigstore"
 description = "Networkless verification of the GitHub/Sigstore in-toto profile"
+readme = "../../README.md"
+homepage = "https://github.com/StogasAI/verifier"
+documentation = "https://docs.rs/stogas-offline-sigstore"
+keywords = ["sigstore", "in-toto", "slsa", "verification", "wasm"]
+categories = ["authentication", "cryptography", "web-programming::wasm"]
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
-license.workspace = true
+license-file.workspace = true
 repository.workspace = true
 
 [dependencies]
 base64.workspace = true
+chrono.workspace = true
+cms = { version = "0.2.3", default-features = false }
+const-oid = "0.9.6"
+der = { version = "0.7.10", features = ["derive"] }
+ed25519-dalek.workspace = true
 hex.workspace = true
+p256 = { version = "0.13.2", default-features = false, features = ["ecdsa", "pkcs8"] }
+p384 = { version = "0.13.1", default-features = false, features = ["ecdsa", "pkcs8"] }
+pem = "3.0.5"
+rsa = { version = "0.9.10", default-features = false, features = ["sha2", "std"] }
+rustls-pki-types = { version = "1.15.0", default-features = false, features = ["alloc"] }
+rustls-webpki = { version = "0.103.13", default-features = false, features = ["alloc", "std"] }
 serde.workspace = true
 serde_json.workspace = true
+serde_json_canonicalizer = "0.3.2"
 sha2.workspace = true
+signature = "2.2.0"
+spki = "0.7.3"
 thiserror.workspace = true
+tls_codec = { version = "0.4.2", default-features = false, features = ["derive"] }
+x509-cert = { version = "0.2.5", features = ["builder", "sct"] }
 
-[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-sigstore-trust-root = { version = "=0.8.0", default-features = false }
-sigstore-types = "=0.8.0"
-sigstore-verify = { version = "=0.8.0", default-features = false }
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
+sigstore-trust-root = { version = "=0.11.0", default-features = false }
+sigstore-types = "=0.11.0"
+sigstore-verify = { version = "=0.11.0", default-features = false }
 
 [lints]
 workspace = true

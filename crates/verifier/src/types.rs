@@ -7,7 +7,6 @@ use std::collections::BTreeMap;
 pub struct BundleEnvelope {
     pub body: BundleBody,
     pub body_sha256: String,
-    pub signature: Signature,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -21,14 +20,6 @@ pub struct BundleBody {
     pub sequence: u64,
     pub ttl_ms: u64,
     pub vendor_collateral: Vec<VendorCollateral>,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct Signature {
-    pub algorithm: String,
-    pub key_id: String,
-    pub signature: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -91,10 +82,6 @@ pub struct Node {
     pub health: NodeHealth,
     pub node_id: String,
     pub quote: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub quote_verifier_jwt: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub quote_verifier: Option<String>,
     pub quote_verified_at: String,
     pub region: String,
     pub release_measurement: String,
@@ -110,6 +97,73 @@ pub struct NodeHealth {
     pub last_quote_error: Option<String>,
     pub ready: bool,
     pub secret_versions: BTreeMap<String, String>,
+}
+
+/// Untrusted heartbeat payload received by Control before admission.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct HeartbeatCandidate {
+    pub cert_expires_at: String,
+    pub health: NodeHealth,
+    pub node_id: String,
+    pub observed_at: String,
+    pub quote: String,
+    pub quote_generated_at: String,
+    pub report_data: ReportData,
+    pub report_data_sha512: String,
+}
+
+/// Deterministic inputs for verifying one Control heartbeat admission.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AdmissionRequest {
+    pub heartbeat: HeartbeatCandidate,
+    pub launch_policies: Vec<LaunchPolicy>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_drand_round: Option<u64>,
+    pub region: String,
+    pub trusted_chip_ids: Vec<String>,
+    pub vendor_collateral: Vec<VendorCollateral>,
+}
+
+/// Explicitly local-only inputs for Control's emulated guest admission path.
+///
+/// This keeps parsing and cryptographic checks in the Rust verifier while making the absence of
+/// production AMD collateral impossible to confuse with a real admission.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct LocalAdmissionRequest {
+    pub attester_mode: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub amd_report_signing_public_key: Option<String>,
+    pub heartbeat: HeartbeatCandidate,
+    pub launch_policies: Vec<LaunchPolicy>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_drand_round: Option<u64>,
+    pub region: String,
+    pub trusted_platforms: Vec<TrustedPlatform>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct TrustedPlatform {
+    pub chip_id: String,
+    pub reported_tcb: String,
+}
+
+/// Identity fields extracted from an untrusted raw report for collateral lookup only.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct InspectedSnpQuote {
+    pub chip_id: String,
+    pub release_measurement: String,
+    pub reported_tcb: String,
+}
+
+/// A heartbeat accepted by the same cryptographic implementation used by clients.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct VerifiedAdmission {
+    pub node: Node,
+    pub verified: VerifiedNode,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -147,21 +201,61 @@ pub struct VendorCollateral {
     pub source_url: String,
 }
 
+/// Exact AMD collateral stack that Control proposes to activate for one platform.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AmdCollateralAdmissionRequest {
+    pub chip_id: String,
+    pub reported_tcb: String,
+    pub vendor_collateral: Vec<VendorCollateral>,
+}
+
+/// Digests of an AMD collateral stack accepted for database activation.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct VerifiedAmdCollateral {
+    pub chip_id: String,
+    pub reported_tcb: String,
+    pub sha256: Vec<String>,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct VerifiedRelease {
+    pub github_integrated_time_unix_ms: i64,
     pub igvm_sha256: String,
+    pub launch: LaunchValues,
+    pub launch_policy_sha256: String,
     pub measurement: String,
     pub release_tag: String,
+    pub sequence: u64,
     pub source_commit: String,
+    pub source_repository: String,
+    pub source_tree: String,
+    pub stogas_signing_key_id: String,
+    pub vcpu_count: u16,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct VerifiedNode {
     pub accepted_cert_sha256: Vec<String>,
+    pub drand_round: u64,
+    pub drand_round_time_unix_ms: i64,
+    pub evidence_age_ms: i64,
     pub node_id: String,
+    pub quote_verified_at_unix_ms: i64,
     pub region: String,
+    pub report_data: ReportData,
+    pub report_data_sha512: String,
     pub release_measurement: String,
     pub tls_spki_sha256: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct ExcludedNode {
+    pub drand_round: u64,
+    pub drand_round_time_unix_ms: i64,
+    pub evidence_age_ms: i64,
+    pub node_id: String,
+    pub reason: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -169,22 +263,16 @@ pub struct VerifiedBundle {
     pub sequence: u64,
     pub created_at_unix_ms: i64,
     pub expires_at_unix_ms: i64,
+    /// Earliest deadline at which any currently returned node becomes stale.
+    /// `None` means the bundle contains no node currently usable by this verifier policy.
+    pub trust_expires_at_unix_ms: Option<i64>,
+    pub excluded_nodes: Vec<ExcludedNode>,
     pub releases: Vec<VerifiedRelease>,
     pub nodes: Vec<VerifiedNode>,
     pub original: BundleEnvelope,
 }
 
-#[derive(Clone, Debug, Default, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct VerifierState {
-    pub version: u8,
-    pub highest_bundle_sequence: u64,
-    pub highest_observed_time_unix_ms: i64,
-    pub highest_drand_round_by_node: BTreeMap<String, u64>,
-}
-
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct VerificationOutput {
     pub bundle: VerifiedBundle,
-    pub next_state: VerifierState,
 }

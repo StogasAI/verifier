@@ -1,0 +1,477 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    name: Full release gate
+    uses: ./.github/workflows/ci.yml
+
+  metadata:
+    name: Validate release version
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          persist-credentials: false
+      - id: version
+        name: Match the tag to every package
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          [[ "$GITHUB_REF_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]]
+          test "$(node -p "require('./package.json').version")" = "$version"
+          test "$(node -p "require('./packages/offline-sigstore/package.json').version")" = "$version"
+          test "$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n1)" = "$version"
+          test "$(sed -n 's/^version = "\([^"]*\)"/\1/p' bindings/python/Cargo.toml | head -n1 || true)" = ""
+          printf 'version=%s\n' "$version" >> "$GITHUB_OUTPUT"
+
+  native:
+    name: Native ${{ matrix.platform }}
+    needs: [metadata, verify]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            platform: linux-amd64
+            target: x86_64-unknown-linux-gnu
+            archive: tar.gz
+            shared_ext: so
+          - os: ubuntu-24.04-arm
+            platform: linux-arm64
+            target: aarch64-unknown-linux-gnu
+            archive: tar.gz
+            shared_ext: so
+          - os: macos-15-intel
+            platform: darwin-amd64
+            target: x86_64-apple-darwin
+            archive: tar.gz
+            shared_ext: dylib
+          - os: macos-15
+            platform: darwin-arm64
+            target: aarch64-apple-darwin
+            archive: tar.gz
+            shared_ext: dylib
+          - os: windows-2025
+            platform: windows-amd64
+            target: x86_64-pc-windows-msvc
+            archive: zip
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c
+        with:
+          toolchain: 1.97.1
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32
+      - name: Build CLI and C ABI
+        run: cargo build --locked --release --target ${{ matrix.target }} --package stogas-verify --package stogas-verifier-ffi
+      - name: Exercise the exact release CLI
+        shell: bash
+        run: |
+          set -euo pipefail
+          target="target/${{ matrix.target }}/release"
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            "$target/stogas-verify.exe" --help
+          else
+            "$target/stogas-verify" --help
+          fi
+      - name: Assemble native package
+        shell: bash
+        run: |
+          set -euo pipefail
+          name="stogas-verifier-${GITHUB_REF_NAME}-${{ matrix.platform }}"
+          root="dist/$name"
+          target="target/${{ matrix.target }}/release"
+          mkdir -p "$root/include"
+          cp LICENSE README.md "$root/"
+          cmp LICENSE "$root/LICENSE"
+          cp include/stogas_verifier.h "$root/include/"
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            cp "$target/stogas-verify.exe" "$target/stogas_verifier_ffi.dll" "$target/stogas_verifier_ffi.lib" "$root/"
+            (cd dist && 7z a -bd -tzip "$name.zip" "$name")
+          else
+            cp "$target/stogas-verify" "$target/libstogas_verifier_ffi.a" "$target/libstogas_verifier_ffi.${{ matrix.shared_ext }}" "$root/"
+            tar -C dist -czf "dist/$name.tar.gz" "$name"
+          fi
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: native-${{ matrix.platform }}
+          path: dist/stogas-verifier-${{ github.ref_name }}-${{ matrix.platform }}.${{ matrix.archive }}
+          if-no-files-found: error
+          retention-days: 7
+
+  go-native:
+    name: Go native ${{ matrix.platform }}
+    needs: [metadata, verify]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            platform: linux-amd64
+            target: x86_64-unknown-linux-gnu
+          - os: ubuntu-24.04-arm
+            platform: linux-arm64
+            target: aarch64-unknown-linux-gnu
+          - os: macos-15-intel
+            platform: darwin-amd64
+            target: x86_64-apple-darwin
+          - os: macos-15
+            platform: darwin-arm64
+            target: aarch64-apple-darwin
+          - os: windows-2025
+            platform: windows-amd64
+            target: x86_64-pc-windows-gnu
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c
+        with:
+          toolchain: 1.97.1
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32
+      - name: Build the Go static library
+        run: cargo build --locked --release --target ${{ matrix.target }} --package stogas-verifier-ffi
+      - name: Stage the module-native library
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "go-native/${{ matrix.platform }}"
+          cp "target/${{ matrix.target }}/release/libstogas_verifier_ffi.a" "go-native/${{ matrix.platform }}/"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: go-native-${{ matrix.platform }}
+          path: go-native
+          if-no-files-found: error
+          retention-days: 7
+
+  python:
+    name: Python wheel ${{ matrix.platform }}
+    needs: [metadata, verify]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            platform: linux-amd64
+            target: x86_64
+            manylinux: '2014'
+          - os: ubuntu-24.04-arm
+            platform: linux-arm64
+            target: aarch64
+            manylinux: '2014'
+          - os: macos-15-intel
+            platform: darwin-amd64
+            target: x86_64
+            manylinux: 'off'
+          - os: macos-15
+            platform: darwin-arm64
+            target: aarch64
+            manylinux: 'off'
+          - os: windows-2025
+            platform: windows-amd64
+            target: x64
+            manylinux: 'off'
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405
+        with:
+          python-version: '3.10'
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c
+        with:
+          toolchain: 1.97.1
+      - name: Build abi3 wheel
+        uses: PyO3/maturin-action@36db84001d74475ad1b8e6613557ae4ee2dc3598
+        with:
+          target: ${{ matrix.target }}
+          manylinux: ${{ matrix.manylinux }}
+          args: --release --locked --out dist --manifest-path bindings/python/Cargo.toml
+      - name: Verify the wheel carries the canonical license
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from pathlib import Path
+          from zipfile import ZipFile
+
+          expected = Path("LICENSE").read_bytes()
+          wheels = list(Path("dist").glob("*.whl"))
+          assert len(wheels) == 1, f"expected one wheel, found {len(wheels)}"
+          with ZipFile(wheels[0]) as wheel:
+              licenses = [name for name in wheel.namelist() if name.endswith(".dist-info/licenses/LICENSE")]
+              assert len(licenses) == 1, f"expected one PEP 639 LICENSE, found {licenses}"
+              assert wheel.read(licenses[0]) == expected, "wheel LICENSE differs from repository root"
+          PY
+      - name: Install and import the built wheel
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --force-reinstall dist/*.whl
+          python - <<'PY'
+          import stogas_verifier
+          import json
+          from pathlib import Path
+          verifier = stogas_verifier.Verifier()
+          try:
+              verifier.verify_bundle_at(b'{"body":', 1)
+          except ValueError as error:
+              assert "invalid bundle JSON" in str(error)
+          else:
+              raise AssertionError("malformed bundle was accepted")
+          bundle = Path("crates/verifier/tests/fixtures/staging-bundle-sequence-1927.json").read_bytes()
+          output = json.loads(verifier.verify_bundle_at(bundle, 1_784_414_117_082))
+          assert output["bundle"]["sequence"] == 1927
+          assert len(output["bundle"]["nodes"]) == 1
+          assert len(output["bundle"]["releases"]) == 1
+          PY
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: python-${{ matrix.platform }}
+          path: dist/*.whl
+          if-no-files-found: error
+          retention-days: 7
+
+  wasm:
+    name: npm/WASM packages
+    needs: [metadata, verify]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c
+        with:
+          toolchain: 1.97.1
+          targets: wasm32-unknown-unknown
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e
+        with:
+          node-version: 24.13.1
+          cache: npm
+      - name: Build browser and Worker modules
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo install wasm-bindgen-cli --version =0.2.126 --locked
+          cargo build --locked --release --package stogas-offline-sigstore-wasm --package stogas-verifier-wasm --target wasm32-unknown-unknown
+          wasm-bindgen target/wasm32-unknown-unknown/release/stogas_verifier_wasm.wasm --target web --out-dir pkg/browser --out-name stogas_verifier
+          wasm-bindgen target/wasm32-unknown-unknown/release/stogas_offline_sigstore_wasm.wasm --target web --out-dir packages/offline-sigstore/pkg/browser --out-name stogas_offline_sigstore
+          npm ci --ignore-scripts --workspaces=false
+          node scripts/package-npm.mjs --pack-destination dist
+          for package in dist/*.tgz; do
+            tar -xOzf "$package" package/LICENSE | cmp - LICENSE
+          done
+      - name: Install and exercise the exact packed npm artifacts
+        shell: bash
+        run: |
+          set -euo pipefail
+          smoke="$RUNNER_TEMP/npm-smoke"
+          mkdir -p "$smoke"
+          npm install --prefix "$smoke" --ignore-scripts "$PWD"/dist/*.tgz
+          cd "$smoke"
+          node --input-type=module <<'NODE'
+          const full = await import('@stogas/verifier')
+          const offline = await import('@stogas/offline-sigstore')
+          const verifier = new full.Verifier()
+          try {
+            verifier.verify_bundle_at(new TextEncoder().encode('{"body":'), 1)
+            throw new Error('packed verifier accepted malformed input')
+          } catch (error) {
+            if (!String(error).includes('invalid bundle JSON')) throw error
+          } finally {
+            verifier.free()
+          }
+          try {
+            offline.verify_github_attestation_at(
+              new TextEncoder().encode('{'),
+              '[]',
+              '{}',
+              1
+            )
+            throw new Error('packed offline Sigstore verifier accepted malformed input')
+          } catch (error) {
+            if (!String(error).includes('invalid')) throw error
+          }
+          NODE
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: npm-wasm
+          path: dist/*.tgz
+          if-no-files-found: error
+          retention-days: 7
+
+  crates:
+    name: Rust crate packages
+    needs: [metadata, verify]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c
+        with:
+          toolchain: 1.97.1
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32
+      - name: Package and verify public Rust crates
+        run: |
+          cargo package --locked --package stogas-offline-sigstore
+          # The branded crate cannot be registry-verified until this exact version of
+          # stogas-offline-sigstore is visible on crates.io. The full workspace gate
+          # has already compiled and tested the same sources; the registry publish job
+          # below performs Cargo's isolated verification after publishing its dependency.
+          cargo package --locked --no-verify \
+            --config 'patch.crates-io.stogas-offline-sigstore.path="crates/offline-sigstore"' \
+            --package stogas-verifier
+          for package in target/package/*.crate; do
+            license_path="$(tar -tzf "$package" | awk '/\/LICENSE$/ { print; exit }')"
+            test -n "$license_path"
+            tar -xOzf "$package" "$license_path" | cmp - LICENSE
+          done
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: rust-crates
+          path: target/package/*.crate
+          if-no-files-found: error
+          retention-days: 7
+
+  go-module:
+    name: Publish immutable Go module tag
+    needs: [crates, go-native, metadata, native, python, verify, wasm]
+    runs-on: ubuntu-24.04
+    permissions:
+      attestations: write
+      contents: write
+      id-token: write
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c
+        with:
+          go-version-file: go/go.mod
+          cache-dependency-path: go/go.mod
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          pattern: go-native-*
+          path: go/native
+          merge-multiple: true
+      - name: Test and tag the self-contained Go module
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          go_tag="go/v${{ needs.metadata.outputs.version }}"
+          cp LICENSE go/LICENSE
+          cmp LICENSE go/LICENSE
+          (cd go && CGO_ENABLED=1 go test ./...)
+          (cd go/native && find . -type f ! -name SHA256SUMS -printf '%P\n' | LC_ALL=C sort | xargs sha256sum > SHA256SUMS && sha256sum -c SHA256SUMS)
+          if git rev-parse "$go_tag" >/dev/null 2>&1; then
+            git show "$go_tag^{commit}:go/native/SHA256SUMS" > "$RUNNER_TEMP/published-go-SHA256SUMS"
+            diff -u "$RUNNER_TEMP/published-go-SHA256SUMS" go/native/SHA256SUMS
+            git show "$go_tag^{commit}:go/LICENSE" > "$RUNNER_TEMP/published-go-LICENSE"
+            cmp LICENSE "$RUNNER_TEMP/published-go-LICENSE"
+          fi
+      - name: Attest every Go native library
+        uses: actions/attest-build-provenance@a2bbfa25375fe432b6a289bc6b6cd05ecd0c4c32
+        with:
+          subject-path: go/native/*/libstogas_verifier_ffi.a
+      - name: Create immutable Go module tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          go_tag="go/v${{ needs.metadata.outputs.version }}"
+          if git rev-parse "$go_tag" >/dev/null 2>&1; then
+            echo "$go_tag already contains the identical native libraries"
+            exit 0
+          fi
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add -f go/LICENSE go/native
+          git commit -m "Release Go verifier $go_tag"
+          git tag -a "$go_tag" -m "Stogas verifier $go_tag"
+          gh auth setup-git
+          git push origin "$go_tag"
+
+  release:
+    name: Create attested draft release
+    needs: [crates, go-module, metadata, native, python, wasm]
+    runs-on: ubuntu-24.04
+    permissions:
+      attestations: write
+      contents: write
+      id-token: write
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          pattern: native-*
+          path: dist
+          merge-multiple: true
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          pattern: python-*
+          path: dist
+          merge-multiple: true
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          name: npm-wasm
+          path: dist
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          name: rust-crates
+          path: dist
+      - name: Create and verify reproducible checksum manifest
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd dist
+          find . -maxdepth 1 -type f ! -name SHA256SUMS -printf '%P\n' | LC_ALL=C sort | xargs sha256sum > SHA256SUMS
+          sha256sum -c SHA256SUMS
+      - name: Attest every published artifact
+        uses: actions/attest-build-provenance@a2bbfa25375fe432b6a289bc6b6cd05ecd0c4c32
+        with:
+          subject-path: dist/*
+      - name: Create immutable draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-list -n1 "$GITHUB_REF_NAME")" = "$(git rev-parse HEAD)"
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            draft="$(gh release view "$GITHUB_REF_NAME" --json isDraft --jq .isDraft)"
+            if [ "$draft" != true ]; then
+              echo "published release $GITHUB_REF_NAME is immutable" >&2
+              exit 1
+            fi
+            gh release view "$GITHUB_REF_NAME" --json assets --jq '.assets[].name' | while IFS= read -r asset; do
+              [ -z "$asset" ] || gh release delete-asset "$GITHUB_REF_NAME" "$asset" --yes
+            done
+            gh release upload "$GITHUB_REF_NAME" dist/*
+          else
+            gh release create "$GITHUB_REF_NAME" dist/* --draft --verify-tag --target "$GITHUB_SHA" --title "Stogas Verifier $GITHUB_REF_NAME"
+          fi

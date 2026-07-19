@@ -1,15 +1,20 @@
 [package]
 name = "stogas-verifier"
 description = "Offline verifier for Stogas confidential-gateway trust bundles"
+readme = "../../README.md"
+homepage = "https://github.com/StogasAI/verifier"
+documentation = "https://docs.rs/stogas-verifier"
+keywords = ["confidential-computing", "sev-snp", "sigstore", "verification"]
+categories = ["authentication", "cryptography", "web-programming::wasm"]
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
-license.workspace = true
+license-file.workspace = true
 repository.workspace = true
 
 [features]
 default = ["snp"]
-snp = ["dep:rsa", "dep:sev", "dep:signature", "dep:x509-parser"]
+snp = ["dep:p384", "dep:rsa", "dep:sev", "dep:signature", "dep:x509-parser"]
 
 [dependencies]
 base64.workspace = true
@@ -17,13 +22,14 @@ chrono.workspace = true
 drand-verify = { version = "0.6.2", default-features = false }
 ed25519-dalek.workspace = true
 hex.workspace = true
+p384 = { version = "0.13.1", default-features = false, features = ["ecdsa", "pkcs8"], optional = true }
 serde.workspace = true
 serde_json.workspace = true
 sev = { version = "8.0.0", default-features = false, features = ["crypto_nossl", "snp"], optional = true }
 sha2.workspace = true
 signature = { version = "2.2.0", optional = true }
 rsa = { version = "0.9.10", default-features = false, features = ["sha2", "std"], optional = true }
-stogas-offline-sigstore = { path = "../offline-sigstore" }
+stogas-offline-sigstore = { path = "../offline-sigstore", version = "0.1.0-alpha.1" }
 thiserror.workspace = true
 x509-parser = { version = "0.18.0", optional = true }
 

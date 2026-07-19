@@ -1,12 +1,11 @@
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand, ValueEnum};
-use directories::ProjectDirs;
 use std::{
     io::Read as _,
-    path::{Path, PathBuf},
+    path::PathBuf,
     time::{SystemTime, UNIX_EPOCH},
 };
-use stogas_verifier::{Environment, VerificationOutput, VerifierState, verify_bundle};
+use stogas_verifier::{Environment, VerificationOutput, verify_bundle};
 
 mod proxy;
 
@@ -29,15 +28,15 @@ enum Command {
         /// Emit stable JSON.
         #[arg(long)]
         json: bool,
-        /// Do not load or persist rollback state.
-        #[arg(long)]
-        no_store: bool,
         /// Trust environment.
         #[arg(long, value_enum, default_value_t = Target::Staging)]
         target: Target,
         /// Exact Unix time in milliseconds, for tests and auditing only.
         #[arg(long, hide = true)]
         now_unix_ms: Option<i64>,
+        /// Maximum age of attested node evidence admitted to the trust set.
+        #[arg(long, default_value_t = 3, value_parser = clap::value_parser!(u16).range(1..=3))]
+        max_node_age_minutes: u16,
     },
     /// Run the verified loopback proxy.
     Serve {
@@ -49,6 +48,9 @@ enum Command {
         listen: String,
         #[arg(long, value_enum, default_value_t = Target::Production)]
         target: Target,
+        /// Maximum age of attested node evidence admitted to the trust set.
+        #[arg(long, default_value_t = 3, value_parser = clap::value_parser!(u16).range(1..=3))]
+        max_node_age_minutes: u16,
     },
 }
 
@@ -64,9 +66,9 @@ async fn main() -> Result<()> {
         Command::Verify {
             bundle,
             json,
-            no_store,
             target,
             now_unix_ms,
+            max_node_age_minutes,
         } => {
             let bytes = if bundle.as_os_str() == "-" {
                 let mut input = Vec::new();
@@ -77,21 +79,11 @@ async fn main() -> Result<()> {
                     .await
                     .with_context(|| format!("could not read {}", bundle.display()))?
             };
-            let state_path = state_path(target)?;
-            let prior = if no_store {
-                None
-            } else {
-                read_state(&state_path).await?
-            };
             let output = verify_bundle(
                 &bytes,
                 now_unix_ms.unwrap_or_else(wall_clock_ms),
-                &environment(target)?,
-                prior.as_ref(),
+                &environment(target, max_node_age_minutes),
             )?;
-            if !no_store {
-                write_state(&state_path, &output.next_state).await?;
-            }
             print_output(&output, json)?;
         }
         Command::Serve {
@@ -99,23 +91,29 @@ async fn main() -> Result<()> {
             upstream,
             listen,
             target,
+            max_node_age_minutes,
         } => {
-            serve(bundle_url, upstream, listen, target).await?;
+            serve(bundle_url, upstream, listen, target, max_node_age_minutes).await?;
         }
     }
     Ok(())
 }
 
-fn environment(target: Target) -> Result<Environment> {
-    match target {
-        Target::Staging => Ok(Environment::staging_legacy()),
-        Target::Production => bail!(
-            "production verifier trust root is not published; stable use is blocked until the dedicated fleet key rollout"
-        ),
-    }
+fn environment(target: Target, max_node_age_minutes: u16) -> Environment {
+    let mut environment = match target {
+        Target::Staging | Target::Production => Environment::stogas(),
+    };
+    environment.max_node_evidence_age_ms = i64::from(max_node_age_minutes) * 60 * 1000;
+    environment
 }
 
-async fn serve(bundle_url: String, upstream: String, listen: String, target: Target) -> Result<()> {
+async fn serve(
+    bundle_url: String,
+    upstream: String,
+    listen: String,
+    target: Target,
+    max_node_age_minutes: u16,
+) -> Result<()> {
     let expected_default = match target {
         Target::Staging => STAGING_BUNDLE_URL,
         Target::Production => PRODUCTION_BUNDLE_URL,
@@ -127,8 +125,7 @@ async fn serve(bundle_url: String, upstream: String, listen: String, target: Tar
         &bundle_url,
         &upstream,
         &listen,
-        environment(target)?,
-        state_path(target)?,
+        environment(target, max_node_age_minutes),
     )?)
     .await
 }
@@ -141,38 +138,15 @@ fn print_output(output: &VerificationOutput, json: bool) -> Result<()> {
     println!("Verified bundle {}", output.bundle.sequence);
     println!("  releases: {}", output.bundle.releases.len());
     println!("  nodes: {}", output.bundle.nodes.len());
-    println!("  trust expires: {}", output.bundle.expires_at_unix_ms);
-    Ok(())
-}
-
-fn state_path(target: Target) -> Result<PathBuf> {
-    let project = ProjectDirs::from("ai", "StogasAI", "verifier")
-        .context("platform data directory is unavailable")?;
-    Ok(project.data_dir().join(format!(
-        "state-{}.json",
-        match target {
-            Target::Staging => "staging",
-            Target::Production => "production",
-        }
-    )))
-}
-
-async fn read_state(path: &Path) -> Result<Option<VerifierState>> {
-    match tokio::fs::read(path).await {
-        Ok(bytes) => Ok(Some(
-            serde_json::from_slice(&bytes).context("invalid verifier state")?,
-        )),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(error.into()),
-    }
-}
-
-async fn write_state(path: &Path, state: &VerifierState) -> Result<()> {
-    let parent = path.parent().context("state path has no parent")?;
-    tokio::fs::create_dir_all(parent).await?;
-    let temporary = path.with_extension(format!("tmp-{}", std::process::id()));
-    tokio::fs::write(&temporary, serde_json::to_vec(state)?).await?;
-    tokio::fs::rename(&temporary, path).await?;
+    println!("  excluded nodes: {}", output.bundle.excluded_nodes.len());
+    println!(
+        "  node trust expires: {}",
+        output
+            .bundle
+            .trust_expires_at_unix_ms
+            .map_or_else(|| "no usable nodes".into(), |value| value.to_string())
+    );
+    println!("  bundle expires: {}", output.bundle.expires_at_unix_ms);
     Ok(())
 }
 

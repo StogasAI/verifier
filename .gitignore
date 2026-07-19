@@ -1,4 +1,13 @@
 /target
+/pkg
+/packages/offline-sigstore/pkg
+/fuzz/artifacts
+/fuzz/coverage
+/fuzz/target
+/go/native
+/go/LICENSE
+/node_modules
+/test-results
 **/*.so
 **/*.dylib
 **/*.dll
@@ -6,4 +15,3 @@
 **/*.lib
 *.profraw
 .DS_Store
-

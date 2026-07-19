@@ -1,15 +1,29 @@
 [build-system]
-requires = ["maturin>=1.9,<2"]
+requires = ["maturin>=1.14,<2"]
 build-backend = "maturin"
 
 [project]
 name = "stogas-verifier"
+description = "Offline verifier for Stogas confidential-gateway trust bundles"
 requires-python = ">=3.10"
 dynamic = ["version"]
 license = "Apache-2.0"
+readme = "../../README.md"
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "License :: OSI Approved :: Apache Software License",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+  "Programming Language :: Rust",
+  "Topic :: Security :: Cryptography",
+]
+
+[project.urls]
+Documentation = "https://docs.stogas.ai/confidential-verification"
+Issues = "https://github.com/StogasAI/verifier/issues"
+Repository = "https://github.com/StogasAI/verifier"
 
 [tool.maturin]
 features = ["pyo3/extension-module"]
 module-name = "stogas_verifier._stogas_verifier"
 python-source = "python"
-

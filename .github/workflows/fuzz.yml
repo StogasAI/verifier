@@ -1,0 +1,41 @@
+name: Continuous fuzzing
+
+on:
+  schedule:
+    - cron: '17 4 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  fuzz:
+    name: ${{ matrix.target }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    concurrency:
+      group: verifier-fuzz-${{ github.ref }}-${{ matrix.target }}
+      cancel-in-progress: false
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [sigstore, bundle_x509_snp_drand, heartbeat_admission, c_abi]
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c
+        with:
+          toolchain: nightly-2026-07-01
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32
+        with:
+          workspaces: fuzz
+      - run: cargo install cargo-fuzz --version =0.13.2 --locked
+      - run: cargo fuzz run "${{ matrix.target }}" -- -max_total_time=300 -timeout=15
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        if: failure()
+        with:
+          name: fuzz-${{ matrix.target }}-${{ github.sha }}
+          path: fuzz/artifacts
+          if-no-files-found: ignore
+          retention-days: 30

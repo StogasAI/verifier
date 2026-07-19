@@ -1,4 +1,3 @@
 module github.com/StogasAI/verifier/go
 
-go 1.24
-
+go 1.24.0

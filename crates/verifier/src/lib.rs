@@ -17,17 +17,22 @@ use std::collections::{BTreeMap, BTreeSet};
 use stogas_offline_sigstore::{GithubPolicy, Subject, verify_github_attestation};
 use thiserror::Error;
 
-const MAX_BUNDLE_BYTES: usize = 16 * 1024 * 1024;
+/// Maximum serialized bundle or heartbeat-admission request accepted by public adapters.
+pub const MAX_INPUT_BYTES: usize = 16 * 1024 * 1024;
 const MAX_NODES: usize = 1_024;
 const MAX_VENDOR_COLLATERAL: usize = 4_096;
-const MAX_BUNDLE_VALIDITY_MS: i64 = 10 * 60 * 1000;
+const MAX_BUNDLE_VALIDITY_MS: i64 = 3 * 60 * 1000;
 const MAX_CLOCK_SKEW_MS: i64 = 60_000;
-const MAX_CLOCK_ROLLBACK_MS: i64 = 60_000;
 const DRAND_CHAIN_HASH: &str = "52db9ba70e0cc0f6eaf7803dd07447a1f5477735fd3f661792ba94600c84e971";
 const DRAND_GENESIS_SECONDS: i64 = 1_692_803_367;
 const DRAND_PERIOD_SECONDS: i64 = 3;
-const DRAND_MAX_AGE_AT_QUOTE_VERIFICATION_MS: i64 = 10 * 60 * 1000;
-const CLIENT_QUOTE_WINDOW_MS: i64 = 24 * 60 * 60 * 1000;
+const DRAND_MAX_AGE_AT_QUOTE_VERIFICATION_MS: i64 = 2 * 60 * 1000;
+/// Maximum node-proof age at the caller's captured verification time.
+pub const DEFAULT_NODE_EVIDENCE_AGE_MS: i64 = 3 * 60 * 1000;
+/// Strictest supported nonzero node-evidence policy exposed by packaged adapters.
+pub const MIN_NODE_EVIDENCE_AGE_MS: i64 = 60 * 1000;
+/// Longest node-evidence policy supported by the verifier.
+pub const MAX_NODE_EVIDENCE_AGE_MS: i64 = DEFAULT_NODE_EVIDENCE_AGE_MS;
 const AMD_COLLATERAL_VALIDITY_MS: i64 = 24 * 60 * 60 * 1000;
 const STOGAS_RELEASE_KEY_ID: &str = "stogas-ed25519-stamp-v1";
 const STOGAS_RELEASE_PUBLIC_KEY_DER_BASE64: &str =
@@ -36,29 +41,23 @@ const STOGAS_RELEASE_PUBLIC_KEY_DER_BASE64: &str =
 /// Runtime-independent trust configuration.
 #[derive(Clone, Debug)]
 pub struct Environment {
-    /// Environment label included in diagnostics.
-    pub name: String,
-    /// Trusted fleet bundle signing keys, keyed by key id, as base64 SPKI DER.
-    pub fleet_keys: BTreeMap<String, String>,
     /// Trusted Stogas release signing keys, keyed by key id, as base64 SPKI DER.
     pub release_keys: BTreeMap<String, String>,
-    /// Reject an empty production trust set.
-    pub require_nodes: bool,
+    /// Maximum age of a valid node drand proof admitted to the returned trust set.
+    pub max_node_evidence_age_ms: i64,
 }
 
 impl Environment {
-    /// Temporary staging policy matching bundles created before the dedicated fleet key rollout.
+    /// Standard Stogas trust roots and node-freshness policy.
     #[must_use]
-    pub fn staging_legacy() -> Self {
+    pub fn stogas() -> Self {
         let release_keys = BTreeMap::from([(
             STOGAS_RELEASE_KEY_ID.to_owned(),
             STOGAS_RELEASE_PUBLIC_KEY_DER_BASE64.to_owned(),
         )]);
         Self {
-            name: "staging".into(),
-            fleet_keys: release_keys.clone(),
             release_keys,
-            require_nodes: false,
+            max_node_evidence_age_ms: DEFAULT_NODE_EVIDENCE_AGE_MS,
         }
     }
 }
@@ -66,35 +65,628 @@ impl Environment {
 /// Complete verification failure. No state may be persisted after this error.
 #[derive(Debug, Error)]
 pub enum Error {
-    #[error("bundle exceeds {MAX_BUNDLE_BYTES} bytes")]
+    #[error("bundle exceeds {MAX_INPUT_BYTES} bytes")]
     TooLarge,
     #[error("invalid bundle JSON: {0}")]
     InvalidJson(String),
     #[error("unsupported or invalid bundle: {0}")]
     InvalidBundle(String),
-    #[error("bundle signature failed: {0}")]
-    BundleSignature(String),
+    #[error("bundle checksum failed: {0}")]
+    BundleChecksum(String),
     #[error("release verification failed: {0}")]
     Release(String),
     #[error("node verification failed: {0}")]
     Node(String),
-    #[error("rollback protection failed: {0}")]
-    Rollback(String),
+    #[error("heartbeat replay protection failed: {0}")]
+    Replay(String),
 }
 
-/// Verify a bundle using one captured wall-clock time and optional prior rollback state.
+/// Verifier with a bounded in-memory cache for immutable release evidence.
+///
+/// The cache is only a performance optimization. It is deliberately ephemeral and cannot bypass
+/// GitHub or Stogas signature verification for new release bytes.
+#[derive(Debug, Default)]
+pub struct Verifier {
+    verified_releases: BTreeMap<String, VerifiedRelease>,
+}
+
+impl Verifier {
+    /// Verify a bundle and retain only the release results referenced by that accepted bundle.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error without changing the release cache.
+    pub fn verify_bundle(
+        &mut self,
+        bundle_bytes: &[u8],
+        now_unix_ms: i64,
+        environment: &Environment,
+    ) -> Result<VerificationOutput, Error> {
+        let (output, next_cache) = verify_bundle_inner(
+            bundle_bytes,
+            now_unix_ms,
+            environment,
+            &self.verified_releases,
+        )?;
+        self.verified_releases = next_cache;
+        Ok(output)
+    }
+}
+
+/// Verify a bundle using one captured wall-clock time.
 ///
 /// # Errors
 ///
-/// Returns an error without a state update if any parsing, cryptographic, policy, freshness, or
-/// rollback check fails.
+/// Returns an error if any parsing, cryptographic, policy, or freshness check fails.
 pub fn verify_bundle(
     bundle_bytes: &[u8],
     now_unix_ms: i64,
     environment: &Environment,
-    prior_state: Option<&VerifierState>,
 ) -> Result<VerificationOutput, Error> {
-    if bundle_bytes.len() > MAX_BUNDLE_BYTES {
+    Verifier::default().verify_bundle(bundle_bytes, now_unix_ms, environment)
+}
+
+/// Verify one release authorization before Control persists it.
+///
+/// This applies the same built-in Stogas release key, canonical launch-policy signature, and
+/// GitHub/Sigstore provenance policy used when verifying a complete bundle.
+///
+/// # Errors
+///
+/// Returns an error when parsing, the Stogas signature, provenance, identity, subjects, or signing
+/// time is invalid.
+pub fn verify_release_approval(
+    release_bytes: &[u8],
+    now_unix_ms: i64,
+) -> Result<VerifiedRelease, Error> {
+    if release_bytes.len() > MAX_INPUT_BYTES {
+        return Err(Error::TooLarge);
+    }
+    let value = strict_json::from_slice(release_bytes)
+        .map_err(|error| Error::InvalidJson(error.to_string()))?;
+    let release: AllowedIgvm =
+        serde_json::from_value(value).map_err(|error| Error::InvalidBundle(error.to_string()))?;
+    verify_release(&release, &Environment::stogas(), now_unix_ms)
+}
+
+/// Verify one exact AMD collateral stack before Control makes it active.
+///
+/// This enforces the same AMD root, certificate-chain, chip/TCB extension, CRL, digest, and
+/// lifetime policy used by complete heartbeat and bundle verification.
+///
+/// # Errors
+///
+/// Returns an error without producing an activation result when any collateral is untrusted.
+pub fn verify_amd_collateral_admission(
+    request_bytes: &[u8],
+    now_unix_ms: i64,
+    required_until_unix_ms: i64,
+) -> Result<VerifiedAmdCollateral, Error> {
+    if request_bytes.len() > MAX_INPUT_BYTES {
+        return Err(Error::TooLarge);
+    }
+    if required_until_unix_ms < now_unix_ms
+        || required_until_unix_ms > now_unix_ms + AMD_COLLATERAL_VALIDITY_MS
+    {
+        return Err(Error::InvalidBundle(
+            "AMD collateral required-until time is invalid".into(),
+        ));
+    }
+    let value = strict_json::from_slice(request_bytes)
+        .map_err(|error| Error::InvalidJson(error.to_string()))?;
+    let request: AmdCollateralAdmissionRequest =
+        serde_json::from_value(value).map_err(|error| {
+            Error::InvalidBundle(format!("invalid AMD collateral admission request: {error}"))
+        })?;
+    if request.vendor_collateral.len() != 4 {
+        return Err(Error::InvalidBundle(
+            "AMD collateral admission requires exactly ARK, ASK, CRL, and VCEK".into(),
+        ));
+    }
+    let stack = exact_amd_stack(
+        &request.vendor_collateral,
+        &request.chip_id,
+        &request.reported_tcb,
+        now_unix_ms,
+        required_until_unix_ms,
+    )?;
+    verify_amd_collateral_stack(
+        &stack,
+        &request.chip_id,
+        &request.reported_tcb,
+        now_unix_ms,
+        required_until_unix_ms,
+    )?;
+    let mut sha256 = request
+        .vendor_collateral
+        .iter()
+        .map(|row| row.sha256.clone())
+        .collect::<Vec<_>>();
+    sha256.sort_unstable();
+    Ok(VerifiedAmdCollateral {
+        chip_id: request.chip_id.to_lowercase(),
+        reported_tcb: request.reported_tcb.to_lowercase(),
+        sha256,
+    })
+}
+
+/// Decode only the routing identity from a raw SNP report.
+///
+/// This result is untrusted and exists solely so Control can select the candidate AMD collateral.
+/// Call [`verify_heartbeat_admission`] before using any returned field as trusted state.
+///
+/// # Errors
+///
+/// Returns an error for a malformed, unsupported, or incorrectly sized quote envelope/report.
+pub fn inspect_snp_quote(quote: &str) -> Result<InspectedSnpQuote, Error> {
+    let report = decode_snp_report(quote, "heartbeat")?;
+    if !(2..=5).contains(&u32::from_le_bytes(
+        report[0x00..0x04].try_into().unwrap_or_default(),
+    )) {
+        return Err(Error::Node("unsupported SNP report version".into()));
+    }
+    Ok(InspectedSnpQuote {
+        chip_id: hex::encode(&report[0x1a0..0x1e0]),
+        release_measurement: hex::encode(&report[0x90..0xc0]),
+        reported_tcb: hex::encode(&report[0x180..0x188]),
+    })
+}
+
+/// Verify one heartbeat admission using the same SNP, AMD, report-data, and drand code as bundle
+/// verification. Release provenance must have been authorized before its launch policy is supplied.
+///
+/// # Errors
+///
+/// Returns an error without producing a normalized node when any input or cryptographic check fails.
+pub fn verify_heartbeat_admission(
+    request_bytes: &[u8],
+    now_unix_ms: i64,
+) -> Result<VerifiedAdmission, Error> {
+    if request_bytes.len() > MAX_INPUT_BYTES {
+        return Err(Error::TooLarge);
+    }
+    let value = strict_json::from_slice(request_bytes)
+        .map_err(|error| Error::InvalidJson(error.to_string()))?;
+    let request: AdmissionRequest = serde_json::from_value(value)
+        .map_err(|error| Error::InvalidBundle(format!("invalid admission request: {error}")))?;
+    if request.launch_policies.is_empty() || request.launch_policies.len() > 2 {
+        return Err(Error::InvalidBundle(
+            "admission requires one or two launch policies".into(),
+        ));
+    }
+    if request.vendor_collateral.len() > MAX_VENDOR_COLLATERAL {
+        return Err(Error::InvalidBundle(
+            "admission contains too many collateral records".into(),
+        ));
+    }
+    let heartbeat = &request.heartbeat;
+    for (label, value) in [
+        ("heartbeat observation", &heartbeat.observed_at),
+        ("quote generation", &heartbeat.quote_generated_at),
+    ] {
+        if parse_time(value)? > now_unix_ms + MAX_CLOCK_SKEW_MS {
+            return Err(Error::Node(format!("{label} time is in the future")));
+        }
+    }
+    let identity = inspect_snp_quote(&heartbeat.quote)?;
+    if !request
+        .trusted_chip_ids
+        .iter()
+        .any(|chip| chip.eq_ignore_ascii_case(&identity.chip_id))
+    {
+        return Err(Error::Node("unknown chip id".into()));
+    }
+    let mut policies = BTreeMap::new();
+    for policy in &request.launch_policies {
+        if policies
+            .insert(policy.measurement.as_str(), policy)
+            .is_some()
+        {
+            return Err(Error::InvalidBundle(
+                "admission launch policies contain a duplicate measurement".into(),
+            ));
+        }
+    }
+    if !policies.contains_key(identity.release_measurement.as_str()) {
+        return Err(Error::Node(
+            "SNP measurement is absent from the authorized release stack".into(),
+        ));
+    }
+    if parse_time(&heartbeat.cert_expires_at)? <= now_unix_ms {
+        return Err(Error::Node("active certificate is expired".into()));
+    }
+    let node = Node {
+        cert_expires_at: heartbeat.cert_expires_at.clone(),
+        chip_id: identity.chip_id,
+        health: heartbeat.health.clone(),
+        node_id: heartbeat.node_id.clone(),
+        quote: heartbeat.quote.clone(),
+        quote_verified_at: DateTime::<Utc>::from_timestamp_millis(now_unix_ms)
+            .ok_or_else(|| Error::Node("captured time is out of range".into()))?
+            .to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+        region: request.region,
+        release_measurement: identity.release_measurement,
+        reported_tcb: identity.reported_tcb,
+        report_data: heartbeat.report_data.clone(),
+        report_data_sha512: heartbeat.report_data_sha512.clone(),
+    };
+    let amd_stacks = verified_amd_stacks(
+        &request.vendor_collateral,
+        std::slice::from_ref(&node),
+        now_unix_ms,
+        now_unix_ms,
+    )?;
+    let verified = verify_node(
+        &node,
+        now_unix_ms,
+        now_unix_ms,
+        now_unix_ms,
+        &policies,
+        &amd_stacks,
+    )?;
+    if request
+        .last_drand_round
+        .is_some_and(|round| verified.drand_round < round)
+    {
+        return Err(Error::Replay("heartbeat drand round regressed".into()));
+    }
+    Ok(VerifiedAdmission { node, verified })
+}
+
+/// Verify one explicitly local Control heartbeat without treating emulated evidence as AMD trust.
+///
+/// Local mock/native quotes are useful for exercising the complete guest and Control lifecycle,
+/// while a local raw-report mode additionally verifies an injected software P-384 signing key.
+/// Neither path is reachable from the production admission API.
+///
+/// # Errors
+///
+/// Returns an error without producing a normalized node when parsing, binding, time, replay, or
+/// configured local signature checks fail.
+pub fn verify_local_heartbeat_admission(
+    request_bytes: &[u8],
+    now_unix_ms: i64,
+) -> Result<VerifiedAdmission, Error> {
+    let request = parse_local_admission_request(request_bytes)?;
+    let heartbeat = &request.heartbeat;
+    validate_local_heartbeat(heartbeat, now_unix_ms)?;
+
+    let identity = inspect_local_quote(&request, now_unix_ms)?;
+    if !request.trusted_platforms.iter().any(|platform| {
+        platform.chip_id.eq_ignore_ascii_case(&identity.chip_id)
+            && platform
+                .reported_tcb
+                .eq_ignore_ascii_case(&identity.reported_tcb)
+    }) {
+        return Err(Error::Node("unknown local chip id or reported TCB".into()));
+    }
+    let launch_policy = request
+        .launch_policies
+        .iter()
+        .find(|policy| {
+            policy
+                .measurement
+                .eq_ignore_ascii_case(&identity.release_measurement)
+        })
+        .ok_or_else(|| {
+            Error::Node("local SNP measurement is absent from the authorized release stack".into())
+        })?;
+
+    let quote_verified_at = DateTime::<Utc>::from_timestamp_millis(now_unix_ms)
+        .ok_or_else(|| Error::Node("captured time is out of range".into()))?
+        .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    let node = Node {
+        cert_expires_at: heartbeat.cert_expires_at.clone(),
+        chip_id: identity.chip_id,
+        health: heartbeat.health.clone(),
+        node_id: heartbeat.node_id.clone(),
+        quote: heartbeat.quote.clone(),
+        quote_verified_at,
+        region: request.region,
+        release_measurement: identity.release_measurement,
+        reported_tcb: identity.reported_tcb,
+        report_data: heartbeat.report_data.clone(),
+        report_data_sha512: heartbeat.report_data_sha512.clone(),
+    };
+
+    let (drand_round_time_unix_ms, evidence_age_ms) = if request.attester_mode == "sev-snp" {
+        if let Some(prior) = request.last_drand_round
+            && node.report_data.drand.round < prior
+        {
+            return Err(Error::Replay("local drand round regressed".into()));
+        }
+        let round_time = validate_node_evidence_time(
+            &node.node_id,
+            node.report_data.drand.round,
+            now_unix_ms,
+            now_unix_ms,
+        )?;
+        verify_quicknet(&node.report_data.drand)?;
+        if let Some(report) = identity.raw_report.as_deref() {
+            check_raw_report_bindings(&node, launch_policy, report)?;
+            verify_local_raw_report_signature(
+                report,
+                request.amd_report_signing_public_key.as_deref(),
+            )?;
+        }
+        (round_time, now_unix_ms.saturating_sub(round_time).max(0))
+    } else {
+        (now_unix_ms, 0)
+    };
+
+    let verified = VerifiedNode {
+        accepted_cert_sha256: node.report_data.accepted_cert_sha256.clone(),
+        drand_round: node.report_data.drand.round,
+        drand_round_time_unix_ms,
+        evidence_age_ms,
+        node_id: node.node_id.clone(),
+        quote_verified_at_unix_ms: now_unix_ms,
+        region: node.region.clone(),
+        report_data: node.report_data.clone(),
+        report_data_sha512: node.report_data_sha512.clone(),
+        release_measurement: node.release_measurement.clone(),
+        tls_spki_sha256: node.report_data.tls_spki_sha256.clone(),
+    };
+    Ok(VerifiedAdmission { node, verified })
+}
+
+fn parse_local_admission_request(request_bytes: &[u8]) -> Result<LocalAdmissionRequest, Error> {
+    if request_bytes.len() > MAX_INPUT_BYTES {
+        return Err(Error::TooLarge);
+    }
+    let value = strict_json::from_slice(request_bytes)
+        .map_err(|error| Error::InvalidJson(error.to_string()))?;
+    let request: LocalAdmissionRequest = serde_json::from_value(value).map_err(|error| {
+        Error::InvalidBundle(format!("invalid local admission request: {error}"))
+    })?;
+    if request.launch_policies.is_empty() || request.launch_policies.len() > 2 {
+        return Err(Error::InvalidBundle(
+            "local admission requires one or two launch policies".into(),
+        ));
+    }
+    if request.trusted_platforms.is_empty() || request.trusted_platforms.len() > 16 {
+        return Err(Error::InvalidBundle(
+            "local admission requires one to sixteen trusted platforms".into(),
+        ));
+    }
+    if !matches!(
+        request.attester_mode.as_str(),
+        "mock" | "igvm-native" | "sev-snp"
+    ) {
+        return Err(Error::InvalidBundle(
+            "local admission has an unsupported attester mode".into(),
+        ));
+    }
+    Ok(request)
+}
+
+fn validate_local_heartbeat(heartbeat: &HeartbeatCandidate, now_unix_ms: i64) -> Result<(), Error> {
+    for (label, value) in [
+        ("heartbeat observation", &heartbeat.observed_at),
+        ("quote generation", &heartbeat.quote_generated_at),
+    ] {
+        if parse_time(value)? > now_unix_ms + MAX_CLOCK_SKEW_MS {
+            return Err(Error::Node(format!("{label} time is in the future")));
+        }
+    }
+    if parse_time(&heartbeat.cert_expires_at)? <= now_unix_ms {
+        return Err(Error::Node("active certificate is expired".into()));
+    }
+    let canonical_report = canonical_report_data(&heartbeat.report_data)?;
+    if hex::encode(Sha512::digest(canonical_report.as_bytes())) != heartbeat.report_data_sha512 {
+        return Err(Error::Node("report-data hash differs".into()));
+    }
+    Ok(())
+}
+
+struct LocalQuoteIdentity {
+    chip_id: String,
+    raw_report: Option<Vec<u8>>,
+    release_measurement: String,
+    reported_tcb: String,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LocalMockQuote {
+    attester_mode: String,
+    quote_generated_at: String,
+    report_data_sha512: String,
+    schema: String,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LocalStructuredQuote {
+    attester_mode: String,
+    chip_id: String,
+    collateral_expires_at: String,
+    quote_generated_at: String,
+    release_measurement: String,
+    report_data_sha512: String,
+    reported_tcb: String,
+    schema: String,
+    tcb_status: String,
+}
+
+fn inspect_local_quote(
+    request: &LocalAdmissionRequest,
+    now_unix_ms: i64,
+) -> Result<LocalQuoteIdentity, Error> {
+    let quote_json = URL_SAFE_NO_PAD
+        .decode(&request.heartbeat.quote)
+        .map_err(|_| Error::Node("local quote encoding is invalid".into()))?;
+    let value = strict_json::from_slice(&quote_json)
+        .map_err(|_| Error::Node("local quote JSON is invalid".into()))?;
+    let schema = value
+        .get("schema")
+        .and_then(Value::as_str)
+        .ok_or_else(|| Error::Node("local quote schema is missing".into()))?;
+
+    match schema {
+        "stogas.local-mock-quote.v1" => inspect_local_mock_quote(request, value, now_unix_ms),
+        "stogas.structured-snp-quote.v1" => {
+            inspect_local_structured_quote(request, value, now_unix_ms)
+        }
+        "stogas.sev-snp-quote-envelope.v1" => inspect_local_raw_quote(request),
+        _ => Err(Error::Node("unsupported local quote schema".into())),
+    }
+}
+
+fn inspect_local_mock_quote(
+    request: &LocalAdmissionRequest,
+    value: Value,
+    now_unix_ms: i64,
+) -> Result<LocalQuoteIdentity, Error> {
+    if request.attester_mode == "sev-snp" {
+        return Err(Error::Node(
+            "SEV-SNP local mode requires a raw SNP report".into(),
+        ));
+    }
+    let quote: LocalMockQuote = serde_json::from_value(value)
+        .map_err(|error| Error::Node(format!("invalid local mock quote: {error}")))?;
+    if quote.schema != "stogas.local-mock-quote.v1"
+        || quote.attester_mode != request.attester_mode
+        || quote.report_data_sha512 != request.heartbeat.report_data_sha512
+        || quote.quote_generated_at != request.heartbeat.quote_generated_at
+        || parse_time(&quote.quote_generated_at)? > now_unix_ms + MAX_CLOCK_SKEW_MS
+    {
+        return Err(Error::Node("local mock quote binding differs".into()));
+    }
+    if request.trusted_platforms.len() != 1 || request.launch_policies.len() != 1 {
+        return Err(Error::Node(
+            "local mock admission requires exactly one platform and release".into(),
+        ));
+    }
+    let platform = &request.trusted_platforms[0];
+    Ok(LocalQuoteIdentity {
+        chip_id: platform.chip_id.to_lowercase(),
+        raw_report: None,
+        release_measurement: request.launch_policies[0].measurement.to_lowercase(),
+        reported_tcb: platform.reported_tcb.to_lowercase(),
+    })
+}
+
+fn inspect_local_structured_quote(
+    request: &LocalAdmissionRequest,
+    value: Value,
+    now_unix_ms: i64,
+) -> Result<LocalQuoteIdentity, Error> {
+    let quote: LocalStructuredQuote = serde_json::from_value(value)
+        .map_err(|error| Error::Node(format!("invalid structured local quote: {error}")))?;
+    if quote.schema != "stogas.structured-snp-quote.v1"
+        || quote.attester_mode != request.attester_mode
+        || quote.report_data_sha512 != request.heartbeat.report_data_sha512
+        || quote.quote_generated_at != request.heartbeat.quote_generated_at
+    {
+        return Err(Error::Node("structured local quote binding differs".into()));
+    }
+    if quote.tcb_status != "up_to_date" {
+        return Err(Error::Node("local AMD TCB status is below policy".into()));
+    }
+    if parse_time(&quote.collateral_expires_at)? <= now_unix_ms {
+        return Err(Error::Node("local AMD collateral expired".into()));
+    }
+    if parse_time(&quote.quote_generated_at)? > now_unix_ms + MAX_CLOCK_SKEW_MS {
+        return Err(Error::Node(
+            "local quote evidence timestamp is in the future".into(),
+        ));
+    }
+    Ok(LocalQuoteIdentity {
+        chip_id: quote.chip_id.to_lowercase(),
+        raw_report: None,
+        release_measurement: quote.release_measurement.to_lowercase(),
+        reported_tcb: quote.reported_tcb.to_lowercase(),
+    })
+}
+
+fn inspect_local_raw_quote(request: &LocalAdmissionRequest) -> Result<LocalQuoteIdentity, Error> {
+    if request.attester_mode != "sev-snp" {
+        return Err(Error::Node(
+            "raw SNP report requires the local SEV-SNP attester mode".into(),
+        ));
+    }
+    let report = decode_snp_report(&request.heartbeat.quote, &request.heartbeat.node_id)?;
+    Ok(LocalQuoteIdentity {
+        chip_id: hex::encode(&report[0x1a0..0x1e0]),
+        raw_report: Some(report.clone()),
+        release_measurement: hex::encode(&report[0x90..0xc0]),
+        reported_tcb: hex::encode(&report[0x180..0x188]),
+    })
+}
+
+#[cfg(feature = "snp")]
+fn verify_local_raw_report_signature(report: &[u8], public_key: Option<&str>) -> Result<(), Error> {
+    use p384::{
+        ecdsa::{Signature, VerifyingKey, signature::hazmat::PrehashVerifier as _},
+        pkcs8::DecodePublicKey as _,
+    };
+    use sha2::Sha384;
+
+    let public_key = public_key
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| Error::Node("local AMD report signing key is not configured".into()))?;
+    let der = decode_public_key_material(public_key)?;
+    let key = VerifyingKey::from_public_key_der(&der)
+        .map_err(|error| Error::Node(format!("local AMD report signing key: {error}")))?;
+    let signature = &report[0x2a0..0x4a0];
+    if signature[48..72].iter().any(|byte| *byte != 0)
+        || signature[120..144].iter().any(|byte| *byte != 0)
+        || signature[144..].iter().any(|byte| *byte != 0)
+    {
+        return Err(Error::Node(
+            "local SNP signature reserved bytes are nonzero".into(),
+        ));
+    }
+    let mut r = [0_u8; 48];
+    let mut s = [0_u8; 48];
+    for index in 0..48 {
+        r[index] = signature[47 - index];
+        s[index] = signature[72 + 47 - index];
+    }
+    let signature = Signature::from_scalars(r, s)
+        .map_err(|error| Error::Node(format!("local SNP signature encoding: {error}")))?;
+    let digest = Sha384::digest(&report[..0x2a0]);
+    key.verify_prehash(&digest, &signature)
+        .map_err(|error| Error::Node(format!("local SNP signature: {error}")))
+}
+
+#[cfg(not(feature = "snp"))]
+fn verify_local_raw_report_signature(
+    _report: &[u8],
+    _public_key: Option<&str>,
+) -> Result<(), Error> {
+    Err(Error::Node(
+        "local SNP signature verification is unavailable in this build".into(),
+    ))
+}
+
+fn decode_public_key_material(value: &str) -> Result<Vec<u8>, Error> {
+    let trimmed = value.trim();
+    let encoded = if trimmed.contains("-----BEGIN") {
+        trimmed
+            .lines()
+            .filter(|line| !line.starts_with("-----"))
+            .collect::<String>()
+    } else {
+        trimmed
+            .chars()
+            .filter(|character| !character.is_whitespace())
+            .collect()
+    };
+    STANDARD
+        .decode(&encoded)
+        .or_else(|_| URL_SAFE_NO_PAD.decode(&encoded))
+        .map_err(|_| Error::Node("local AMD report signing key encoding is invalid".into()))
+}
+
+fn verify_bundle_inner(
+    bundle_bytes: &[u8],
+    now_unix_ms: i64,
+    environment: &Environment,
+    verified_releases: &BTreeMap<String, VerifiedRelease>,
+) -> Result<(VerificationOutput, BTreeMap<String, VerifiedRelease>), Error> {
+    if bundle_bytes.len() > MAX_INPUT_BYTES {
         return Err(Error::TooLarge);
     }
     let value = strict_json::from_slice(bundle_bytes)
@@ -108,19 +700,34 @@ pub fn verify_bundle(
     let envelope: BundleEnvelope =
         serde_json::from_value(value).map_err(|error| Error::InvalidBundle(error.to_string()))?;
     validate_shape(&envelope)?;
-    verify_envelope(&envelope, &signed_body, environment)?;
+    if !(MIN_NODE_EVIDENCE_AGE_MS..=MAX_NODE_EVIDENCE_AGE_MS)
+        .contains(&environment.max_node_evidence_age_ms)
+    {
+        return Err(Error::InvalidBundle(
+            "node evidence age policy is outside the supported range".into(),
+        ));
+    }
+    verify_envelope(&envelope, &signed_body)?;
 
     let created_at = parse_time(&envelope.body.created_at)?;
     let expires_at = parse_time(&envelope.body.expires_at)?;
     validate_time(created_at, expires_at, envelope.body.ttl_ms, now_unix_ms)?;
-    validate_prior_state(&envelope, now_unix_ms, prior_state)?;
 
+    let mut next_release_cache = BTreeMap::new();
     let releases = envelope
         .body
         .allowed_igvms
         .iter()
-        .map(|release| verify_release(release, environment))
-        .collect::<Result<Vec<_>, _>>()?;
+        .map(|release| {
+            let key = release_cache_key(release, environment)?;
+            let verified = verified_releases.get(&key).map_or_else(
+                || verify_release(release, environment, now_unix_ms),
+                |release| Ok(release.clone()),
+            )?;
+            next_release_cache.insert(key, verified.clone());
+            Ok(verified)
+        })
+        .collect::<Result<Vec<_>, Error>>()?;
     let launch_policies: BTreeMap<_, _> = envelope
         .body
         .allowed_igvms
@@ -138,47 +745,101 @@ pub fn verify_bundle(
         created_at,
         expires_at,
     )?;
-    let mut rounds = prior_state
-        .map(|state| state.highest_drand_round_by_node.clone())
-        .unwrap_or_default();
-    let nodes = envelope
-        .body
-        .nodes
+    let (nodes, excluded_nodes) = verify_and_partition_nodes(
+        &envelope.body.nodes,
+        created_at,
+        expires_at,
+        now_unix_ms,
+        environment.max_node_evidence_age_ms,
+        &launch_policies,
+        &amd_stacks,
+    )?;
+    let trust_expires_at_unix_ms =
+        node_trust_expiry(&nodes, expires_at, environment.max_node_evidence_age_ms);
+    Ok((
+        VerificationOutput {
+            bundle: VerifiedBundle {
+                sequence: envelope.body.sequence,
+                created_at_unix_ms: created_at,
+                expires_at_unix_ms: expires_at,
+                trust_expires_at_unix_ms,
+                excluded_nodes,
+                releases,
+                nodes,
+                original: envelope.clone(),
+            },
+        },
+        next_release_cache,
+    ))
+}
+
+fn node_trust_expiry(
+    nodes: &[VerifiedNode],
+    bundle_expires_at: i64,
+    max_node_evidence_age_ms: i64,
+) -> Option<i64> {
+    nodes
         .iter()
         .map(|node| {
-            verify_node(
-                node,
-                created_at,
-                expires_at,
-                now_unix_ms,
-                &launch_policies,
-                &amd_stacks,
-                &mut rounds,
-            )
+            node.drand_round_time_unix_ms
+                .saturating_add(max_node_evidence_age_ms)
+                .min(bundle_expires_at)
         })
-        .collect::<Result<Vec<_>, _>>()?;
-    if environment.require_nodes && nodes.is_empty() {
-        return Err(Error::InvalidBundle("production trust set is empty".into()));
-    }
+        .min()
+}
 
-    Ok(VerificationOutput {
-        bundle: VerifiedBundle {
-            sequence: envelope.body.sequence,
-            created_at_unix_ms: created_at,
-            expires_at_unix_ms: expires_at,
-            releases,
-            nodes,
-            original: envelope.clone(),
-        },
-        next_state: VerifierState {
-            version: 1,
-            highest_bundle_sequence: envelope.body.sequence,
-            highest_observed_time_unix_ms: prior_state.map_or(now_unix_ms, |state| {
-                state.highest_observed_time_unix_ms.max(now_unix_ms)
-            }),
-            highest_drand_round_by_node: rounds,
-        },
-    })
+#[allow(clippy::too_many_arguments)]
+fn verify_and_partition_nodes(
+    bundle_nodes: &[Node],
+    created_at: i64,
+    expires_at: i64,
+    now_unix_ms: i64,
+    max_node_evidence_age_ms: i64,
+    launch_policies: &BTreeMap<&str, &LaunchPolicy>,
+    amd_stacks: &BTreeMap<String, AmdCollateralStack>,
+) -> Result<(Vec<VerifiedNode>, Vec<ExcludedNode>), Error> {
+    let mut nodes = Vec::new();
+    let mut excluded = Vec::new();
+    for node in bundle_nodes {
+        let verified = verify_node(
+            node,
+            created_at,
+            expires_at,
+            now_unix_ms,
+            launch_policies,
+            amd_stacks,
+        )?;
+        if now_unix_ms
+            >= verified
+                .drand_round_time_unix_ms
+                .saturating_add(max_node_evidence_age_ms)
+        {
+            excluded.push(ExcludedNode {
+                drand_round: verified.drand_round,
+                drand_round_time_unix_ms: verified.drand_round_time_unix_ms,
+                evidence_age_ms: verified.evidence_age_ms,
+                node_id: verified.node_id,
+                reason: "attested node evidence exceeds the caller freshness policy".into(),
+            });
+        } else {
+            nodes.push(verified);
+        }
+    }
+    Ok((nodes, excluded))
+}
+
+fn release_cache_key(release: &AllowedIgvm, environment: &Environment) -> Result<String, Error> {
+    let trusted_key = environment
+        .release_keys
+        .get(&release.stogas_signature.key_id)
+        .ok_or_else(|| Error::Release("release signing key is not trusted".into()))?;
+    let encoded = serde_json::to_vec(release).map_err(|error| Error::Release(error.to_string()))?;
+    let mut digest = Sha256::new();
+    digest.update(b"stogas verified release cache v1\0");
+    digest.update(trusted_key.as_bytes());
+    digest.update([0]);
+    digest.update(encoded);
+    Ok(hex::encode(digest.finalize()))
 }
 
 fn validate_shape(envelope: &BundleEnvelope) -> Result<(), Error> {
@@ -324,28 +985,18 @@ fn is_p256_uncompressed_b64url(value: &str) -> bool {
         .is_ok_and(|bytes| bytes.len() == 65 && bytes[0] == 0x04)
 }
 
-fn verify_envelope(
-    envelope: &BundleEnvelope,
-    signed_body: &[u8],
-    environment: &Environment,
-) -> Result<(), Error> {
-    if envelope.signature.algorithm != "Ed25519" {
-        return Err(Error::BundleSignature("unsupported algorithm".into()));
-    }
+fn verify_envelope(envelope: &BundleEnvelope, signed_body: &[u8]) -> Result<(), Error> {
     let actual = hex::encode(Sha256::digest(signed_body));
     if actual != envelope.body_sha256 {
-        return Err(Error::BundleSignature("body SHA-256 differs".into()));
+        return Err(Error::BundleChecksum("body SHA-256 differs".into()));
     }
-    let key = environment
-        .fleet_keys
-        .get(&envelope.signature.key_id)
-        .ok_or_else(|| Error::BundleSignature("fleet signing key is not trusted".into()))?;
-    verify_ed25519(key, signed_body, &envelope.signature.signature).map_err(Error::BundleSignature)
+    Ok(())
 }
 
 fn verify_release(
     release: &AllowedIgvm,
     environment: &Environment,
+    now_unix_ms: i64,
 ) -> Result<VerifiedRelease, Error> {
     let policy = &release.launch_policy;
     let signature = &release.stogas_signature;
@@ -369,18 +1020,18 @@ fn verify_release(
     payload.extend_from_slice(canonical.as_bytes());
     verify_ed25519(key, &payload, &signature.signature).map_err(Error::Release)?;
 
-    let attestation = release
+    let attestation_value = release
         .github_in_toto
         .first()
         .ok_or_else(|| Error::Release("GitHub attestation is absent".into()))?;
     let attestation_bytes =
-        serde_json::to_vec(attestation).map_err(|error| Error::Release(error.to_string()))?;
+        serde_json::to_vec(attestation_value).map_err(|error| Error::Release(error.to_string()))?;
     let policy_digest = hex::encode(Sha256::digest(canonical.as_bytes()));
     let workflow_identity = format!(
         "https://github.com/StogasAI/gateway/.github/workflows/gateway-igvm-release.yml@refs/tags/{}",
         policy.release_tag
     );
-    verify_github_attestation(
+    let verified_attestation = verify_github_attestation(
         &attestation_bytes,
         &[
             Subject {
@@ -400,14 +1051,27 @@ fn verify_release(
             predicate_type: "https://slsa.dev/provenance/v1".into(),
             require_github_hosted: true,
         },
+        now_unix_ms,
     )
     .map_err(|error| Error::Release(error.to_string()))?;
+    let github_integrated_time_unix_ms = verified_attestation
+        .integrated_time
+        .checked_mul(1000)
+        .ok_or_else(|| Error::Release("GitHub integration time overflows".into()))?;
 
     Ok(VerifiedRelease {
+        github_integrated_time_unix_ms,
         igvm_sha256: policy.igvm_sha256.clone(),
+        launch: policy.launch.clone(),
+        launch_policy_sha256: policy_digest,
         measurement: policy.measurement.clone(),
         release_tag: policy.release_tag.clone(),
+        sequence: policy.sequence,
         source_commit: policy.source.commit.clone(),
+        source_repository: policy.source.repository.clone(),
+        source_tree: policy.source.tree.clone(),
+        stogas_signing_key_id: signature.key_id.clone(),
+        vcpu_count: policy.vcpu_count,
     })
 }
 
@@ -418,7 +1082,6 @@ fn verify_node(
     now_unix_ms: i64,
     launch_policies: &BTreeMap<&str, &LaunchPolicy>,
     amd_stacks: &BTreeMap<String, AmdCollateralStack>,
-    rounds: &mut BTreeMap<String, u64>,
 ) -> Result<VerifiedNode, Error> {
     let launch_policy = launch_policies
         .get(node.release_measurement.as_str())
@@ -450,23 +1113,19 @@ fn verify_node(
         )));
     }
     let quote_verified_at = parse_time(&node.quote_verified_at)?;
-    validate_node_evidence_time(
-        &node.node_id,
-        node.report_data.drand.round,
-        quote_verified_at,
-        bundle_expires_at,
-        now_unix_ms,
-    )?;
-    let round = node.report_data.drand.round;
-    if rounds
-        .get(&node.node_id)
-        .is_some_and(|prior| round < *prior)
-    {
-        return Err(Error::Rollback(format!(
-            "{} drand round regressed",
+    if quote_verified_at > bundle_created_at {
+        return Err(Error::Node(format!(
+            "{} quote verification time is later than bundle creation",
             node.node_id
         )));
     }
+    let drand_round_time_unix_ms = validate_node_evidence_time(
+        &node.node_id,
+        node.report_data.drand.round,
+        quote_verified_at,
+        now_unix_ms,
+    )?;
+    let round = node.report_data.drand.round;
     verify_quicknet(&node.report_data.drand)?;
     let amd_stack = amd_stacks
         .get(&amd_platform_key(&node.chip_id, &node.reported_tcb))
@@ -478,11 +1137,16 @@ fn verify_node(
         bundle_expires_at,
         amd_stack,
     )?;
-    rounds.insert(node.node_id.clone(), round);
     Ok(VerifiedNode {
         accepted_cert_sha256: node.report_data.accepted_cert_sha256.clone(),
+        drand_round: round,
+        drand_round_time_unix_ms,
+        evidence_age_ms: now_unix_ms.saturating_sub(drand_round_time_unix_ms).max(0),
         node_id: node.node_id.clone(),
+        quote_verified_at_unix_ms: quote_verified_at,
         region: node.region.clone(),
+        report_data: node.report_data.clone(),
+        report_data_sha512: node.report_data_sha512.clone(),
         release_measurement: node.release_measurement.clone(),
         tls_spki_sha256: node.report_data.tls_spki_sha256.clone(),
     })
@@ -580,6 +1244,45 @@ fn verified_amd_stacks(
         ));
     }
     Ok(stacks)
+}
+
+fn exact_amd_stack(
+    rows: &[VendorCollateral],
+    chip_id: &str,
+    reported_tcb: &str,
+    valid_from: i64,
+    valid_until: i64,
+) -> Result<AmdCollateralStack, Error> {
+    let (common, vceks) = parse_amd_collateral(rows, valid_from, valid_until)?;
+    let platform_key = amd_platform_key(chip_id, reported_tcb);
+    let vek = vceks
+        .get(&platform_key)
+        .ok_or_else(|| Error::Node("AMD collateral has no exact VCEK evidence".into()))?;
+    let get_common = |kind: &str| {
+        common
+            .get(&(vek.ca_product_name.clone(), kind.to_owned()))
+            .ok_or_else(|| Error::Node(format!("AMD collateral has no matching {kind} evidence")))
+    };
+    let ark = get_common("ark")?;
+    let ask = get_common("ask")?;
+    let crl = get_common("crl")?;
+    let used = BTreeSet::from([
+        vek.sha256.as_str(),
+        ark.sha256.as_str(),
+        ask.sha256.as_str(),
+        crl.sha256.as_str(),
+    ]);
+    if used.len() != rows.len() {
+        return Err(Error::InvalidBundle(
+            "AMD collateral admission contains duplicate or unused evidence".into(),
+        ));
+    }
+    Ok(AmdCollateralStack {
+        ark: ark.der.clone(),
+        ask: ask.der.clone(),
+        crl: crl.der.clone(),
+        vek: vek.der.clone(),
+    })
 }
 
 fn parse_amd_collateral(
@@ -688,23 +1391,13 @@ fn validate_node_evidence_time(
     node_id: &str,
     drand_round: u64,
     quote_verified_at: i64,
-    bundle_expires_at: i64,
     now_unix_ms: i64,
-) -> Result<(), Error> {
+) -> Result<i64, Error> {
     if quote_verified_at > now_unix_ms + MAX_CLOCK_SKEW_MS {
         return Err(Error::Node(format!(
             "{node_id} quote verification time is in the future"
         )));
     }
-    let identity_deadline = quote_verified_at
-        .checked_add(CLIENT_QUOTE_WINDOW_MS)
-        .ok_or_else(|| Error::Node(format!("{node_id} quote deadline overflows")))?;
-    if bundle_expires_at > identity_deadline {
-        return Err(Error::Node(format!(
-            "bundle outlives {node_id} verified identity"
-        )));
-    }
-
     let round_offset = i64::try_from(drand_round.saturating_sub(1))
         .map_err(|_| Error::Node("drand round is too large".into()))?;
     let round_time_ms = round_offset
@@ -722,7 +1415,7 @@ fn validate_node_evidence_time(
             "{node_id} drand round was stale when the quote was verified"
         )));
     }
-    Ok(())
+    Ok(round_time_ms)
 }
 
 fn verify_quicknet(beacon: &DrandBeacon) -> Result<(), Error> {
@@ -755,6 +1448,44 @@ fn verify_quicknet_signature(beacon: &DrandBeacon, signature: &[u8]) -> Result<(
     Ok(())
 }
 
+fn decode_snp_report(quote_value: &str, node_id: &str) -> Result<Vec<u8>, Error> {
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct QuoteEnvelope {
+        #[serde(default)]
+        auxblob: Option<String>,
+        #[serde(default)]
+        manifestblob: Option<String>,
+        provider: String,
+        report: String,
+        schema: String,
+    }
+
+    let quote_json = URL_SAFE_NO_PAD
+        .decode(quote_value)
+        .map_err(|_| Error::Node(format!("{node_id} quote encoding is invalid")))?;
+    let quote: QuoteEnvelope = serde_json::from_slice(&quote_json)
+        .map_err(|_| Error::Node(format!("{node_id} quote is not an AMD SEV-SNP quote")))?;
+    if quote.schema != "stogas.sev-snp-quote-envelope.v1"
+        || quote.provider != "sev_guest"
+        || quote.manifestblob.is_some()
+    {
+        return Err(Error::Node(format!(
+            "{node_id} quote envelope is unsupported"
+        )));
+    }
+    let _ = quote.auxblob;
+    let report = URL_SAFE_NO_PAD
+        .decode(&quote.report)
+        .map_err(|_| Error::Node(format!("{node_id} SNP report encoding is invalid")))?;
+    if report.len() != 0x4a0 {
+        return Err(Error::Node(format!(
+            "{node_id} SNP report has the wrong size"
+        )));
+    }
+    Ok(report)
+}
+
 #[cfg(feature = "snp")]
 fn verify_snp_node(
     node: &Node,
@@ -769,51 +1500,14 @@ fn verify_snp_node(
         parser::ByteParser,
     };
 
-    #[derive(serde::Deserialize)]
-    #[serde(deny_unknown_fields)]
-    struct QuoteEnvelope {
-        #[serde(default)]
-        auxblob: Option<String>,
-        #[serde(default)]
-        manifestblob: Option<String>,
-        provider: String,
-        report: String,
-        schema: String,
-    }
-    let quote_json = URL_SAFE_NO_PAD
-        .decode(&node.quote)
-        .map_err(|_| Error::Node(format!("{} quote encoding is invalid", node.node_id)))?;
-    let quote: QuoteEnvelope = serde_json::from_slice(&quote_json)
-        .map_err(|error| Error::Node(format!("{} quote envelope: {error}", node.node_id)))?;
-    if quote.schema != "stogas.sev-snp-quote-envelope.v1"
-        || quote.provider != "sev_guest"
-        || quote.manifestblob.is_some()
-    {
-        return Err(Error::Node(format!(
-            "{} quote envelope is unsupported",
-            node.node_id
-        )));
-    }
-    let report_bytes = URL_SAFE_NO_PAD
-        .decode(&quote.report)
-        .map_err(|_| Error::Node(format!("{} SNP report encoding is invalid", node.node_id)))?;
-    if report_bytes.len() != 0x4a0 {
-        return Err(Error::Node(format!(
-            "{} SNP report has the wrong size",
-            node.node_id
-        )));
-    }
+    let report_bytes = decode_snp_report(&node.quote, &node.node_id)?;
     check_raw_report_bindings(node, policy, &report_bytes)?;
     let report = AttestationReport::from_bytes(&report_bytes)
         .map_err(|error| Error::Node(format!("{} SNP report: {error}", node.node_id)))?;
-
-    let _ = &quote.auxblob;
-    validate_amd_x509(
-        &collateral.ark,
-        &collateral.ask,
-        &collateral.vek,
-        &collateral.crl,
-        node,
+    verify_amd_collateral_stack(
+        collateral,
+        &node.chip_id,
+        &node.reported_tcb,
         bundle_created_at,
         bundle_expires_at,
     )?;
@@ -915,11 +1609,9 @@ fn check_raw_report_bindings(
 #[cfg(feature = "snp")]
 #[allow(clippy::similar_names)]
 fn validate_amd_x509(
-    ark_der: &[u8],
-    ask_der: &[u8],
-    vek_der: &[u8],
-    crl_der: &[u8],
-    node: &Node,
+    collateral: &AmdCollateralStack,
+    chip_id: &str,
+    reported_tcb: &str,
     bundle_created_at: i64,
     bundle_expires_at: i64,
 ) -> Result<(), Error> {
@@ -930,11 +1622,11 @@ fn validate_amd_x509(
         "32ab53a6ce5ec14926207396e5c475ae768a6a9831b7e860b5acf2e1c1dff222bc5a8bfc43eb5e06393189c1f246d880",
         "3475f08a9727f8ac9a1deaea5f2a2097aa59d64d05c2a678c229c873e6359d3a6926287a2a22cd5f88a385e333a2fcc5",
     ];
-    let (_, ark) = parse_x509_certificate(ark_der)
+    let (_, ark) = parse_x509_certificate(&collateral.ark)
         .map_err(|error| Error::Node(format!("AMD ARK: {error}")))?;
-    let (_, ask) = parse_x509_certificate(ask_der)
+    let (_, ask) = parse_x509_certificate(&collateral.ask)
         .map_err(|error| Error::Node(format!("AMD ASK: {error}")))?;
-    let (_, vek) = parse_x509_certificate(vek_der)
+    let (_, vek) = parse_x509_certificate(&collateral.vek)
         .map_err(|error| Error::Node(format!("AMD VEK: {error}")))?;
     for (label, cert) in [("ARK", &ark), ("ASK", &ask), ("VEK", &vek)] {
         if cert.validity().not_before.timestamp() * 1000 > bundle_created_at
@@ -953,8 +1645,8 @@ fn validate_amd_x509(
     {
         return Err(Error::Node("AMD certificate identity chain differs".into()));
     }
-    let (_, crl) =
-        parse_x509_crl(crl_der).map_err(|error| Error::Node(format!("AMD CRL: {error}")))?;
+    let (_, crl) = parse_x509_crl(&collateral.crl)
+        .map_err(|error| Error::Node(format!("AMD CRL: {error}")))?;
     if crl.tbs_cert_list.this_update.timestamp() * 1000 > bundle_created_at + MAX_CLOCK_SKEW_MS
         || crl
             .tbs_cert_list
@@ -977,7 +1669,38 @@ fn validate_amd_x509(
         return Err(Error::Node("AMD CRL issuer differs".into()));
     };
     verify_amd_crl_signature(&crl, crl_signer)?;
-    validate_vcek_extensions(&vek, node)
+    validate_vcek_extensions(&vek, chip_id, reported_tcb)
+}
+
+#[cfg(feature = "snp")]
+fn verify_amd_collateral_stack(
+    collateral: &AmdCollateralStack,
+    chip_id: &str,
+    reported_tcb: &str,
+    valid_from: i64,
+    valid_until: i64,
+) -> Result<(), Error> {
+    use sev::certs::snp::{Chain, Verifiable};
+    validate_amd_x509(collateral, chip_id, reported_tcb, valid_from, valid_until)?;
+    let chain = Chain::from_der(&collateral.ark, &collateral.ask, &collateral.vek)
+        .map_err(|error| Error::Node(format!("AMD chain: {error}")))?;
+    (&chain)
+        .verify()
+        .map_err(|error| Error::Node(format!("AMD chain signature: {error}")))?;
+    Ok(())
+}
+
+#[cfg(not(feature = "snp"))]
+fn verify_amd_collateral_stack(
+    _collateral: &AmdCollateralStack,
+    _chip_id: &str,
+    _reported_tcb: &str,
+    _valid_from: i64,
+    _valid_until: i64,
+) -> Result<(), Error> {
+    Err(Error::Node(
+        "AMD SNP verification is unavailable in this build".into(),
+    ))
 }
 
 #[cfg(feature = "snp")]
@@ -1008,10 +1731,11 @@ fn verify_amd_crl_signature(
 #[cfg(feature = "snp")]
 fn validate_vcek_extensions(
     vek: &x509_parser::certificate::X509Certificate<'_>,
-    node: &Node,
+    chip_id: &str,
+    reported_tcb: &str,
 ) -> Result<(), Error> {
-    let expected_tcb = hex::decode(&node.reported_tcb)
-        .map_err(|_| Error::Node("reported TCB is invalid".into()))?;
+    let expected_tcb =
+        hex::decode(reported_tcb).map_err(|_| Error::Node("reported TCB is invalid".into()))?;
     let expected = [
         expected_tcb[0],
         expected_tcb[1],
@@ -1043,7 +1767,7 @@ fn validate_vcek_extensions(
         .iter()
         .find(|extension| extension.oid.to_id_string() == "1.3.6.1.4.1.3704.1.4")
         .ok_or_else(|| Error::Node("AMD VCEK chip-id extension is absent".into()))?;
-    let chip = hex::decode(&node.chip_id).map_err(|_| Error::Node("chip id is invalid".into()))?;
+    let chip = hex::decode(chip_id).map_err(|_| Error::Node("chip id is invalid".into()))?;
     let certificate_chip = parse_der_octet_string(hwid.value).ok_or_else(|| {
         Error::Node(format!(
             "AMD VCEK chip id is malformed ({})",
@@ -1100,26 +1824,6 @@ fn validate_time(created: i64, expires: i64, ttl_ms: u64, now: i64) -> Result<()
         return Err(Error::InvalidBundle(format!(
             "bundle validity ({interval} ms) exceeds the {MAX_BUNDLE_VALIDITY_MS} ms policy"
         )));
-    }
-    Ok(())
-}
-
-fn validate_prior_state(
-    envelope: &BundleEnvelope,
-    now: i64,
-    prior: Option<&VerifierState>,
-) -> Result<(), Error> {
-    let Some(prior) = prior else {
-        return Ok(());
-    };
-    if prior.version != 1 {
-        return Err(Error::Rollback("unsupported state version".into()));
-    }
-    if envelope.body.sequence < prior.highest_bundle_sequence {
-        return Err(Error::Rollback("bundle sequence regressed".into()));
-    }
-    if now + MAX_CLOCK_ROLLBACK_MS < prior.highest_observed_time_unix_ms {
-        return Err(Error::Rollback("wall clock moved backwards".into()));
     }
     Ok(())
 }
@@ -1241,6 +1945,22 @@ fn canonical_report_data(report: &ReportData) -> Result<String, Error> {
 mod tests {
     use super::*;
 
+    fn quote_with_identity(chip: [u8; 64], measurement: [u8; 48], tcb: [u8; 8]) -> String {
+        let mut report = vec![0_u8; 0x4a0];
+        report[0x00..0x04].copy_from_slice(&2_u32.to_le_bytes());
+        report[0x90..0xc0].copy_from_slice(&measurement);
+        report[0x180..0x188].copy_from_slice(&tcb);
+        report[0x1a0..0x1e0].copy_from_slice(&chip);
+        URL_SAFE_NO_PAD.encode(
+            serde_json::to_vec(&serde_json::json!({
+                "provider": "sev_guest",
+                "report": URL_SAFE_NO_PAD.encode(report),
+                "schema": "stogas.sev-snp-quote-envelope.v1"
+            }))
+            .unwrap(),
+        )
+    }
+
     fn release_fixture() -> AllowedIgvm {
         AllowedIgvm {
             github_in_toto: vec![
@@ -1260,6 +1980,198 @@ mod tests {
         }
     }
 
+    #[test]
+    fn inspects_only_raw_snp_identity_needed_for_collateral_selection() {
+        let identity =
+            inspect_snp_quote(&quote_with_identity([0x11; 64], [0x22; 48], [0x33; 8])).unwrap();
+        assert_eq!(identity.chip_id, "11".repeat(64));
+        assert_eq!(identity.release_measurement, "22".repeat(48));
+        assert_eq!(identity.reported_tcb, "33".repeat(8));
+    }
+
+    #[test]
+    fn quote_inspection_rejects_noncanonical_envelopes_and_sizes() {
+        let extra_field = URL_SAFE_NO_PAD.encode(
+            serde_json::to_vec(&serde_json::json!({
+                "extra": true,
+                "provider": "sev_guest",
+                "report": URL_SAFE_NO_PAD.encode(vec![0_u8; 0x4a0]),
+                "schema": "stogas.sev-snp-quote-envelope.v1"
+            }))
+            .unwrap(),
+        );
+        assert!(inspect_snp_quote(&extra_field).is_err());
+
+        let short = URL_SAFE_NO_PAD.encode(
+            serde_json::to_vec(&serde_json::json!({
+                "provider": "sev_guest",
+                "report": URL_SAFE_NO_PAD.encode(vec![0_u8; 0x49f]),
+                "schema": "stogas.sev-snp-quote-envelope.v1"
+            }))
+            .unwrap(),
+        );
+        assert!(inspect_snp_quote(&short).is_err());
+    }
+
+    fn local_admission_fixture(now_unix_ms: i64) -> serde_json::Value {
+        let release = release_fixture().launch_policy;
+        let report_data = ReportData {
+            active_cert_sha256: "11".repeat(32),
+            accepted_cert_sha256: vec!["11".repeat(32)],
+            catalog_hash: "22".repeat(32),
+            drand: DrandBeacon {
+                chain_hash: DRAND_CHAIN_HASH.into(),
+                network: "quicknet".into(),
+                randomness: "33".repeat(32),
+                round: 1,
+                signature: "44".repeat(48),
+            },
+            ed25519_public_key: "local-ed25519".into(),
+            hpke_public_key: "local-hpke".into(),
+            schema: "stogas.node-report.v1".into(),
+            tls_spki_sha256: "55".repeat(32),
+        };
+        let report_data_sha512 = hex::encode(Sha512::digest(
+            canonical_report_data(&report_data).unwrap().as_bytes(),
+        ));
+        let generated_at = DateTime::<Utc>::from_timestamp_millis(now_unix_ms)
+            .unwrap()
+            .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        let quote = URL_SAFE_NO_PAD.encode(
+            serde_json::to_vec(&serde_json::json!({
+                "attester_mode": "mock",
+                "quote_generated_at": generated_at,
+                "report_data_sha512": report_data_sha512,
+                "schema": "stogas.local-mock-quote.v1"
+            }))
+            .unwrap(),
+        );
+        serde_json::json!({
+            "attester_mode": "mock",
+            "heartbeat": {
+                "cert_expires_at": "2026-08-01T00:00:00.000Z",
+                "health": { "ready": true, "secret_versions": {} },
+                "node_id": "local-node",
+                "observed_at": generated_at,
+                "quote": quote,
+                "quote_generated_at": generated_at,
+                "report_data": report_data,
+                "report_data_sha512": report_data_sha512
+            },
+            "launch_policies": [release],
+            "region": "local",
+            "trusted_platforms": [{
+                "chip_id": "66".repeat(64),
+                "reported_tcb": "00".repeat(8)
+            }]
+        })
+    }
+
+    #[test]
+    fn local_mock_admission_uses_the_rust_boundary_without_claiming_amd_trust() {
+        let now = 1_784_246_400_000;
+        let request = local_admission_fixture(now);
+        let output =
+            verify_local_heartbeat_admission(&serde_json::to_vec(&request).unwrap(), now).unwrap();
+        assert_eq!(output.node.chip_id, "66".repeat(64));
+        assert_eq!(output.node.reported_tcb, "00".repeat(8));
+        assert_eq!(output.verified.evidence_age_ms, 0);
+
+        for mutation in [
+            "/heartbeat/report_data_sha512",
+            "/heartbeat/quote_generated_at",
+            "/heartbeat/observed_at",
+        ] {
+            let mut invalid = request.clone();
+            *invalid.pointer_mut(mutation).unwrap() = Value::String("invalid".into());
+            assert!(
+                verify_local_heartbeat_admission(&serde_json::to_vec(&invalid).unwrap(), now)
+                    .is_err(),
+                "accepted mutated local admission field {mutation}"
+            );
+        }
+
+        let mut legacy_verifier = request.clone();
+        legacy_verifier["heartbeat"]["quote_verifier_jwt"] = Value::String("untrusted.jwt".into());
+        assert!(
+            verify_local_heartbeat_admission(&serde_json::to_vec(&legacy_verifier).unwrap(), now)
+                .is_err(),
+            "accepted retired verifier JWT metadata"
+        );
+
+        let mut ambiguous = request;
+        ambiguous["trusted_platforms"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({
+                "chip_id": "77".repeat(64),
+                "reported_tcb": "00".repeat(8)
+            }));
+        assert!(
+            verify_local_heartbeat_admission(&serde_json::to_vec(&ambiguous).unwrap(), now)
+                .unwrap_err()
+                .to_string()
+                .contains("exactly one platform")
+        );
+    }
+
+    #[test]
+    fn local_software_snp_signature_path_rejects_report_and_reserved_byte_mutations() {
+        use p384::{
+            ecdsa::{SigningKey, signature::hazmat::PrehashSigner as _},
+            pkcs8::EncodePublicKey as _,
+        };
+        use sha2::Sha384;
+
+        let signing_key = SigningKey::from_bytes((&[0x42_u8; 48]).into()).unwrap();
+        let mut report = vec![0_u8; 0x4a0];
+        let digest = Sha384::digest(&report[..0x2a0]);
+        let signature: p384::ecdsa::Signature = signing_key.sign_prehash(&digest).unwrap();
+        let raw = signature.to_bytes();
+        for index in 0..48 {
+            report[0x2a0 + index] = raw[47 - index];
+            report[0x2a0 + 72 + index] = raw[95 - index];
+        }
+        let public_key = STANDARD.encode(
+            signing_key
+                .verifying_key()
+                .to_public_key_der()
+                .unwrap()
+                .as_bytes(),
+        );
+
+        verify_local_raw_report_signature(&report, Some(&public_key)).unwrap();
+        let mut signed_mutation = report.clone();
+        signed_mutation[0x50] ^= 1;
+        assert!(verify_local_raw_report_signature(&signed_mutation, Some(&public_key)).is_err());
+        let mut reserved_mutation = report;
+        reserved_mutation[0x2a0 + 48] = 1;
+        assert!(verify_local_raw_report_signature(&reserved_mutation, Some(&public_key)).is_err());
+    }
+
+    #[test]
+    fn pinned_quicknet_vector_rejects_round_randomness_and_signature_mutations() {
+        let vector = DrandBeacon {
+            chain_hash: DRAND_CHAIN_HASH.into(),
+            network: "quicknet".into(),
+            randomness: "b71151f3a4a15822dbe07915b282f5c90edd9da0e2cc410099d6fc392654f8dd"
+                .into(),
+            round: 30_051_238,
+            signature: "b79a809ed952e5b7def6f8494b8a909728b80f8d17d6d47f05ab1d43e1cc5391d9ab9ce77b871dc69bc4523db77d2f5c".into(),
+        };
+        verify_quicknet(&vector).unwrap();
+
+        let mut wrong_round = vector.clone();
+        wrong_round.round += 1;
+        assert!(verify_quicknet(&wrong_round).is_err());
+        let mut wrong_randomness = vector.clone();
+        wrong_randomness.randomness = "00".repeat(32);
+        assert!(verify_quicknet(&wrong_randomness).is_err());
+        let mut wrong_signature = vector;
+        wrong_signature.signature.replace_range(..2, "00");
+        assert!(verify_quicknet(&wrong_signature).is_err());
+    }
+
     fn resign_release(release: &mut AllowedIgvm) -> Environment {
         use ed25519_dalek::{Signer as _, SigningKey, pkcs8::EncodePublicKey as _};
 
@@ -1272,8 +2184,6 @@ mod tests {
         release.stogas_signature.signature =
             URL_SAFE_NO_PAD.encode(signing_key.sign(&payload).to_bytes());
         Environment {
-            name: "test".into(),
-            fleet_keys: BTreeMap::new(),
             release_keys: BTreeMap::from([(
                 "test-release-key".into(),
                 STANDARD.encode(
@@ -1284,7 +2194,7 @@ mod tests {
                         .as_bytes(),
                 ),
             )]),
-            require_nodes: false,
+            max_node_evidence_age_ms: DEFAULT_NODE_EVIDENCE_AGE_MS,
         }
     }
 
@@ -1297,16 +2207,27 @@ mod tests {
     #[test]
     fn verifies_real_release_only_when_stogas_and_github_bind_the_same_policy() {
         let release = release_fixture();
-        let verified = verify_release(&release, &Environment::staging_legacy()).unwrap();
+        let verified = verify_release(&release, &Environment::stogas(), 1_784_246_400_000).unwrap();
         assert_eq!(verified.igvm_sha256, release.launch_policy.igvm_sha256);
         assert_eq!(verified.measurement, release.launch_policy.measurement);
+    }
+
+    #[test]
+    fn release_approval_boundary_is_strict_and_uses_the_complete_verifier() {
+        let release = serde_json::to_vec(&release_fixture()).unwrap();
+        let verified = verify_release_approval(&release, 1_784_246_400_000).unwrap();
+        assert_eq!(verified.release_tag, "v0.0.1");
+
+        let duplicate = br#"{"github_in_toto":[],"github_in_toto":[]}"#;
+        assert!(verify_release_approval(duplicate, 1_784_246_400_000).is_err());
     }
 
     #[test]
     fn rejects_invalid_stogas_release_signature_before_accepting_github_evidence() {
         let mut release = release_fixture();
         release.stogas_signature.signature = URL_SAFE_NO_PAD.encode([0_u8; 64]);
-        let error = verify_release(&release, &Environment::staging_legacy()).unwrap_err();
+        let error =
+            verify_release(&release, &Environment::stogas(), 1_784_246_400_000).unwrap_err();
         assert!(error.to_string().contains("release verification failed"));
     }
 
@@ -1321,7 +2242,7 @@ mod tests {
             let mut release = release_fixture();
             mutate(&mut release);
             let environment = resign_release(&mut release);
-            let error = verify_release(&release, &environment).unwrap_err();
+            let error = verify_release(&release, &environment, 1_784_246_400_000).unwrap_err();
             assert!(error.to_string().contains("Sigstore"));
         }
     }
@@ -1336,16 +2257,18 @@ mod tests {
     }
 
     #[test]
-    fn retained_quote_uses_original_drand_freshness_and_forward_identity_deadline() {
+    fn accepts_a_historical_proof_that_was_fresh_when_control_admitted_it() {
         let round = 1_000_000_u64;
         let round_time = (DRAND_GENESIS_SECONDS
             + i64::try_from(round - 1).unwrap() * DRAND_PERIOD_SECONDS)
             * 1000;
         let quote_verified_at = round_time + DRAND_MAX_AGE_AT_QUOTE_VERIFICATION_MS;
-        let now = quote_verified_at + 23 * 60 * 60 * 1000;
-        let expires = quote_verified_at + CLIENT_QUOTE_WINDOW_MS;
+        let now = round_time + DEFAULT_NODE_EVIDENCE_AGE_MS;
 
-        validate_node_evidence_time("node", round, quote_verified_at, expires, now).unwrap();
+        assert_eq!(
+            validate_node_evidence_time("node", round, quote_verified_at, now).unwrap(),
+            round_time
+        );
     }
 
     #[test]
@@ -1355,35 +2278,13 @@ mod tests {
             + i64::try_from(round - 1).unwrap() * DRAND_PERIOD_SECONDS)
             * 1000;
         let quote_verified_at = round_time + DRAND_MAX_AGE_AT_QUOTE_VERIFICATION_MS + 1;
-        let error = validate_node_evidence_time(
-            "node",
-            round,
-            quote_verified_at,
-            quote_verified_at + MAX_BUNDLE_VALIDITY_MS,
-            quote_verified_at,
-        )
-        .unwrap_err();
+        let error =
+            validate_node_evidence_time("node", round, quote_verified_at, quote_verified_at)
+                .unwrap_err();
         assert!(
             error
                 .to_string()
                 .contains("stale when the quote was verified")
         );
-    }
-
-    #[test]
-    fn rejects_bundle_past_verified_identity_deadline() {
-        let round = 1_000_000_u64;
-        let round_time = (DRAND_GENESIS_SECONDS
-            + i64::try_from(round - 1).unwrap() * DRAND_PERIOD_SECONDS)
-            * 1000;
-        let error = validate_node_evidence_time(
-            "node",
-            round,
-            round_time,
-            round_time + CLIENT_QUOTE_WINDOW_MS + 1,
-            round_time + CLIENT_QUOTE_WINDOW_MS - 1,
-        )
-        .unwrap_err();
-        assert!(error.to_string().contains("verified identity"));
     }
 }

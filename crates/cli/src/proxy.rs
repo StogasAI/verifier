@@ -19,19 +19,22 @@ use sha2::{Digest as _, Sha256};
 use std::{
     fmt,
     net::SocketAddr,
-    path::{Path, PathBuf},
     sync::Arc,
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
-use stogas_verifier::{
-    Environment, VerificationOutput, VerifiedNode, VerifierState, verify_bundle,
-};
+use stogas_verifier::{Environment, VerificationOutput, VerifiedNode, Verifier};
 use tokio::sync::{Mutex, RwLock};
 use url::Url;
 
 const MAX_BUNDLE_BYTES: usize = 16 * 1024 * 1024;
 const MAX_REQUEST_BYTES: usize = 16 * 1024 * 1024;
-const REFRESH_RETRY: Duration = Duration::from_secs(5);
+const MIN_REFRESH_RETRY_SECONDS: u64 = 4;
+const MAX_REFRESH_RETRY_SECONDS: u64 = 8;
+const MIN_BUNDLE_REFRESH_LEAD_SECONDS: i64 = 30;
+const MAX_BUNDLE_REFRESH_LEAD_SECONDS: i64 = 60;
+const MIN_NODE_REFRESH_LEAD_SECONDS: i64 = 15;
+const MAX_NODE_REFRESH_LEAD_SECONDS: i64 = 30;
+const SHARED_CACHE_MAX_AGE_SECONDS: i64 = 10;
 
 pub struct ServeConfig {
     bundle_url: Url,
@@ -39,7 +42,6 @@ pub struct ServeConfig {
     listen: SocketAddr,
     expected_host: String,
     environment: Environment,
-    state_path: PathBuf,
 }
 
 impl ServeConfig {
@@ -48,7 +50,6 @@ impl ServeConfig {
         upstream: &str,
         listen: &str,
         environment: Environment,
-        state_path: PathBuf,
     ) -> Result<Self> {
         let bundle_url = secure_bundle_url(bundle_url)?;
         let upstream = secure_base_url(upstream, "upstream URL")?;
@@ -62,7 +63,6 @@ impl ServeConfig {
             listen,
             expected_host: listen.to_string(),
             environment,
-            state_path,
         })
     }
 }
@@ -103,49 +103,20 @@ struct ActiveBundle {
 
 struct ProxyState {
     active: RwLock<Arc<ActiveBundle>>,
-    clock: SecureClock,
     config: Arc<ServeConfig>,
     refresh_lock: Mutex<()>,
-}
-
-#[derive(Clone)]
-struct SecureClock {
-    monotonic_start: Instant,
-    wall_at_start_ms: i64,
-}
-
-impl SecureClock {
-    fn capture() -> Self {
-        Self {
-            monotonic_start: Instant::now(),
-            wall_at_start_ms: wall_clock_ms(),
-        }
-    }
-
-    fn now_ms(&self) -> i64 {
-        effective_time_ms(
-            wall_clock_ms(),
-            self.wall_at_start_ms,
-            i64::try_from(self.monotonic_start.elapsed().as_millis()).unwrap_or(i64::MAX),
-        )
-    }
-}
-
-fn effective_time_ms(wall_now_ms: i64, wall_at_start_ms: i64, elapsed_ms: i64) -> i64 {
-    wall_now_ms.max(wall_at_start_ms.saturating_add(elapsed_ms))
+    verifier: Mutex<Verifier>,
 }
 
 pub async fn serve(config: ServeConfig) -> Result<()> {
     let config = Arc::new(config);
-    let clock = SecureClock::capture();
-    let prior = read_state(&config.state_path).await?;
-    let initial = fetch_active(&config, prior.as_ref(), clock.now_ms()).await?;
-    write_state(&config.state_path, &initial.output.next_state).await?;
+    let mut verifier = Verifier::default();
+    let initial = fetch_active(&config, wall_clock_ms(), &mut verifier).await?;
     let state = Arc::new(ProxyState {
         active: RwLock::new(Arc::new(initial)),
-        clock,
         config: Arc::clone(&config),
         refresh_lock: Mutex::new(()),
+        verifier: Mutex::new(verifier),
     });
     tokio::spawn(refresh_loop(Arc::clone(&state)));
 
@@ -163,25 +134,74 @@ async fn shutdown_signal() {
 
 async fn refresh_loop(state: Arc<ProxyState>) {
     loop {
-        let expires_at = state.active.read().await.output.bundle.expires_at_unix_ms;
-        let lead_seconds = rand::rng().random_range(60_i64..=75_i64);
-        let refresh_at = expires_at.saturating_sub(lead_seconds * 1000);
-        sleep_until_wall_clock(&state.clock, refresh_at).await;
+        let (trust_expires_at, refresh_at) = {
+            let active = state.active.read().await;
+            (
+                active_trust_deadline(active.as_ref()),
+                replacement_refresh_at(&active.output),
+            )
+        };
+        sleep_until_wall_clock(refresh_at).await;
 
         loop {
             if refresh_once(&state).await.is_ok() {
-                let new_expiry = state.active.read().await.output.bundle.expires_at_unix_ms;
-                if new_expiry > expires_at {
+                let new_trust_expiry = {
+                    let active = state.active.read().await;
+                    active_trust_deadline(active.as_ref())
+                };
+                if new_trust_expiry > trust_expires_at {
                     break;
                 }
             }
-            tokio::time::sleep(REFRESH_RETRY).await;
+            tokio::time::sleep(refresh_retry_delay()).await;
         }
     }
 }
 
-async fn sleep_until_wall_clock(clock: &SecureClock, deadline_ms: i64) {
-    let delay_ms = deadline_ms.saturating_sub(clock.now_ms());
+fn replacement_refresh_at(output: &VerificationOutput) -> i64 {
+    let bundle_lead_seconds =
+        rand::rng().random_range(MIN_BUNDLE_REFRESH_LEAD_SECONDS..=MAX_BUNDLE_REFRESH_LEAD_SECONDS);
+    let node_lead_seconds =
+        rand::rng().random_range(MIN_NODE_REFRESH_LEAD_SECONDS..=MAX_NODE_REFRESH_LEAD_SECONDS);
+    replacement_refresh_at_with_leads(output, bundle_lead_seconds, node_lead_seconds)
+}
+
+fn replacement_refresh_at_with_leads(
+    output: &VerificationOutput,
+    bundle_lead_seconds: i64,
+    node_lead_seconds: i64,
+) -> i64 {
+    let bundle_refresh_at = output
+        .bundle
+        .expires_at_unix_ms
+        .saturating_sub((bundle_lead_seconds + SHARED_CACHE_MAX_AGE_SECONDS) * 1000);
+    output
+        .bundle
+        .trust_expires_at_unix_ms
+        .map_or(bundle_refresh_at, |trust_expires_at| {
+            bundle_refresh_at.min(
+                trust_expires_at
+                    .saturating_sub((node_lead_seconds + SHARED_CACHE_MAX_AGE_SECONDS) * 1000),
+            )
+        })
+}
+
+fn active_trust_deadline(active: &ActiveBundle) -> i64 {
+    active
+        .output
+        .bundle
+        .trust_expires_at_unix_ms
+        .unwrap_or(i64::MIN)
+}
+
+fn refresh_retry_delay() -> Duration {
+    Duration::from_secs(
+        rand::rng().random_range(MIN_REFRESH_RETRY_SECONDS..=MAX_REFRESH_RETRY_SECONDS),
+    )
+}
+
+async fn sleep_until_wall_clock(deadline_ms: i64) {
+    let delay_ms = deadline_ms.saturating_sub(wall_clock_ms());
     if let Ok(delay) = u64::try_from(delay_ms) {
         tokio::time::sleep(Duration::from_millis(delay)).await;
     }
@@ -189,21 +209,17 @@ async fn sleep_until_wall_clock(clock: &SecureClock, deadline_ms: i64) {
 
 async fn refresh_once(state: &ProxyState) -> Result<()> {
     let _guard = state.refresh_lock.lock().await;
-    let prior = state.active.read().await.output.next_state.clone();
-    let candidate = fetch_active(&state.config, Some(&prior), state.clock.now_ms()).await?;
-    let current_sequence = state.active.read().await.output.bundle.sequence;
-    if candidate.output.bundle.sequence < current_sequence {
-        bail!("replacement bundle sequence regressed");
-    }
-    write_state(&state.config.state_path, &candidate.output.next_state).await?;
+    let mut verifier = state.verifier.lock().await;
+    let candidate = fetch_active(&state.config, wall_clock_ms(), &mut verifier).await?;
+    drop(verifier);
     *state.active.write().await = Arc::new(candidate);
     Ok(())
 }
 
 async fn fetch_active(
     config: &ServeConfig,
-    prior: Option<&VerifierState>,
     now_unix_ms: i64,
+    verifier: &mut Verifier,
 ) -> Result<ActiveBundle> {
     let fetcher = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
@@ -211,11 +227,12 @@ async fn fetch_active(
         .build()?;
     let response = fetcher
         .get(config.bundle_url.clone())
+        .header(reqwest::header::CACHE_CONTROL, "no-cache")
         .send()
         .await?
         .error_for_status()?;
     let bytes = bounded_response(response, MAX_BUNDLE_BYTES).await?;
-    let output = verify_bundle(&bytes, now_unix_ms, &config.environment, prior)?;
+    let output = verifier.verify_bundle(&bytes, now_unix_ms, &config.environment)?;
     let client = pinned_client(&output.bundle.nodes)?;
     Ok(ActiveBundle { output, client })
 }
@@ -269,10 +286,10 @@ async fn proxy_request_inner(
         return Err((StatusCode::NOT_FOUND, "only /v1/* is available"));
     }
     let active = state.active.read().await.clone();
-    if state.clock.now_ms() >= active.output.bundle.expires_at_unix_ms {
+    if wall_clock_ms() >= active_trust_deadline(&active) {
         return Err((
             StatusCode::SERVICE_UNAVAILABLE,
-            "verified trust bundle expired",
+            "verified node trust expired",
         ));
     }
 
@@ -287,10 +304,10 @@ async fn proxy_request_inner(
                 .await
                 .map_err(|_| (StatusCode::BAD_GATEWAY, "upstream TLS verification failed"))?;
             let refreshed = state.active.read().await.clone();
-            if state.clock.now_ms() >= refreshed.output.bundle.expires_at_unix_ms {
+            if wall_clock_ms() >= active_trust_deadline(&refreshed) {
                 return Err((
                     StatusCode::SERVICE_UNAVAILABLE,
-                    "verified trust bundle expired",
+                    "verified node trust expired",
                 ));
             }
             send_upstream(state, &refreshed, &parts, body)
@@ -488,25 +505,6 @@ fn pinned_client_with_roots(
         .build()?)
 }
 
-async fn read_state(path: &Path) -> Result<Option<VerifierState>> {
-    match tokio::fs::read(path).await {
-        Ok(bytes) => Ok(Some(
-            serde_json::from_slice(&bytes).context("invalid verifier state")?,
-        )),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(error.into()),
-    }
-}
-
-async fn write_state(path: &Path, state: &VerifierState) -> Result<()> {
-    let parent = path.parent().context("state path has no parent")?;
-    tokio::fs::create_dir_all(parent).await?;
-    let temporary = path.with_extension(format!("tmp-{}", std::process::id()));
-    tokio::fs::write(&temporary, serde_json::to_vec(state)?).await?;
-    tokio::fs::rename(&temporary, path).await?;
-    Ok(())
-}
-
 fn wall_clock_ms() -> i64 {
     i64::try_from(
         SystemTime::now()
@@ -522,8 +520,18 @@ mod tests {
     use super::*;
     use rcgen::{BasicConstraints, CertificateParams, CertifiedIssuer, IsCa, KeyPair};
     use rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
+    use stogas_verifier::{DrandBeacon, ReportData};
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+    use tokio::sync::oneshot;
     use tokio_rustls::TlsAcceptor;
+
+    const STAGING_BUNDLE: &[u8] =
+        include_bytes!("../../verifier/tests/fixtures/staging-bundle-sequence-1927.json");
+    const STAGING_BUNDLE_VERIFIED_AT_MS: i64 = 1_784_414_117_082;
+
+    fn staging_bundle() -> (Vec<u8>, Environment) {
+        (STAGING_BUNDLE.to_vec(), Environment::stogas())
+    }
 
     struct TestCertificate {
         ca: CertificateDer<'static>,
@@ -551,8 +559,29 @@ mod tests {
             key: PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(leaf_key.serialize_der())),
             node: VerifiedNode {
                 accepted_cert_sha256: vec![cert_hash],
+                drand_round: 0,
+                drand_round_time_unix_ms: 0,
+                evidence_age_ms: 0,
                 node_id: "node".into(),
+                quote_verified_at_unix_ms: 0,
                 region: "test".into(),
+                report_data: ReportData {
+                    active_cert_sha256: "00".repeat(32),
+                    accepted_cert_sha256: vec!["00".repeat(32)],
+                    catalog_hash: "00".repeat(32),
+                    drand: DrandBeacon {
+                        chain_hash: String::new(),
+                        network: String::new(),
+                        randomness: String::new(),
+                        round: 0,
+                        signature: String::new(),
+                    },
+                    ed25519_public_key: String::new(),
+                    hpke_public_key: String::new(),
+                    schema: "stogas.node-report.v1".into(),
+                    tls_spki_sha256: spki_hash.clone(),
+                },
+                report_data_sha512: "00".repeat(64),
                 release_measurement: "00".repeat(48),
                 tls_spki_sha256: spki_hash,
             },
@@ -589,10 +618,89 @@ mod tests {
         address
     }
 
+    async fn capturing_tls_server(
+        certificate: TestCertificate,
+    ) -> (SocketAddr, oneshot::Receiver<Vec<u8>>) {
+        let config = rustls::ServerConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_no_client_auth()
+        .with_single_cert(certificate.chain, certificate.key)
+        .unwrap();
+        let acceptor = TlsAcceptor::from(Arc::new(config));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (request_tx, request_rx) = oneshot::channel();
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut stream = acceptor.accept(stream).await.unwrap();
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 1024];
+            loop {
+                let count = stream.read(&mut buffer).await.unwrap();
+                if count == 0 {
+                    break;
+                }
+                request.extend_from_slice(&buffer[..count]);
+                let Some(header_end) = request.windows(4).position(|value| value == b"\r\n\r\n")
+                else {
+                    continue;
+                };
+                let headers = String::from_utf8_lossy(&request[..header_end]);
+                let content_length = headers
+                    .lines()
+                    .find_map(|line| {
+                        line.split_once(':').and_then(|(name, value)| {
+                            name.eq_ignore_ascii_case("content-length")
+                                .then(|| value.trim().parse::<usize>().ok())
+                                .flatten()
+                        })
+                    })
+                    .unwrap_or(0);
+                if request.len() >= header_end + 4 + content_length {
+                    break;
+                }
+            }
+            let _ = request_tx.send(request);
+            stream
+                .write_all(
+                    b"HTTP/1.1 201 Created\r\nx-upstream: preserved\r\nconnection: close\r\ntransfer-encoding: chunked\r\n\r\n5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n",
+                )
+                .await
+                .unwrap();
+        });
+        (address, request_rx)
+    }
+
     fn roots(ca: CertificateDer<'static>) -> RootCertStore {
         let mut roots = RootCertStore::empty();
         roots.add(ca).unwrap();
         roots
+    }
+
+    fn proxy_state(
+        client: reqwest::Client,
+        upstream: &str,
+        bundle_url: &str,
+        expires_at_unix_ms: i64,
+    ) -> ProxyState {
+        let (bundle, environment) = staging_bundle();
+        let mut verifier = Verifier::default();
+        let mut output = verifier
+            .verify_bundle(&bundle, STAGING_BUNDLE_VERIFIED_AT_MS, &environment)
+            .unwrap();
+        output.bundle.expires_at_unix_ms = expires_at_unix_ms;
+        output.bundle.trust_expires_at_unix_ms = Some(expires_at_unix_ms);
+        ProxyState {
+            active: RwLock::new(Arc::new(ActiveBundle { output, client })),
+            config: Arc::new(
+                ServeConfig::new(bundle_url, upstream, "127.0.0.1:8787", environment).unwrap(),
+            ),
+            refresh_lock: Mutex::new(()),
+            verifier: Mutex::new(verifier),
+        }
     }
 
     #[tokio::test]
@@ -611,6 +719,60 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn accepts_the_matching_certificate_in_either_rotation_slot() {
+        let certificate = test_certificate();
+        let ca = certificate.ca.clone();
+        let mut node = certificate.node.clone();
+        node.accepted_cert_sha256.insert(0, "11".repeat(32));
+        let address = tls_server(certificate, 1).await;
+        let client = pinned_client_with_roots(&[node], roots(ca)).unwrap();
+        let response = client
+            .get(format!("https://localhost:{}/v1/test", address.port()))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.bytes().await.unwrap(), "ok");
+    }
+
+    #[tokio::test]
+    async fn preserves_openai_request_response_and_chunked_body_bytes() {
+        let certificate = test_certificate();
+        let ca = certificate.ca.clone();
+        let node = certificate.node.clone();
+        let client = pinned_client_with_roots(&[node], roots(ca)).unwrap();
+        let (address, captured_request) = capturing_tls_server(certificate).await;
+        let state = proxy_state(
+            client,
+            &format!("https://localhost:{}", address.port()),
+            "https://evidence.example/bundles/latest.json",
+            i64::MAX,
+        );
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions?stream=true")
+            .header(header::HOST, "127.0.0.1:8787")
+            .header(header::AUTHORIZATION, "Bearer test-secret")
+            .header("x-stogas-test", "preserved")
+            .body(Body::from(r#"{"stream":true}"#))
+            .unwrap();
+
+        let response = proxy_request_inner(&state, request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+        assert_eq!(response.headers()["x-upstream"], "preserved");
+        assert!(!response.headers().contains_key(header::CONNECTION));
+        assert_eq!(
+            to_bytes(response.into_body(), 1024).await.unwrap(),
+            "hello world"
+        );
+
+        let request = String::from_utf8(captured_request.await.unwrap()).unwrap();
+        assert!(request.starts_with("POST /v1/chat/completions?stream=true HTTP/1.1\r\n"));
+        assert!(request.contains("authorization: Bearer test-secret\r\n"));
+        assert!(request.contains("x-stogas-test: preserved\r\n"));
+        assert!(request.ends_with(r#"{"stream":true}"#));
+    }
+
+    #[tokio::test]
     async fn rejects_valid_webpki_certificate_when_pin_is_not_trusted() {
         let certificate = test_certificate();
         let ca = certificate.ca.clone();
@@ -625,6 +787,79 @@ mod tests {
                 .await
                 .is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn rejects_browser_origin_bad_host_non_v1_path_and_expired_trust() {
+        let state = proxy_state(
+            reqwest::Client::new(),
+            "https://api.example",
+            "https://evidence.example/bundles/latest.json",
+            i64::MAX,
+        );
+        let request = |path: &str, host: &str, origin: Option<&str>| {
+            let mut request = Request::builder().uri(path).header(header::HOST, host);
+            if let Some(origin) = origin {
+                request = request.header(header::ORIGIN, origin);
+            }
+            request.body(Body::empty()).unwrap()
+        };
+
+        assert_eq!(
+            proxy_request_inner(
+                &state,
+                request("/v1/models", "127.0.0.1:8787", Some("https://example.com"))
+            )
+            .await
+            .unwrap_err()
+            .0,
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            proxy_request_inner(&state, request("/v1/models", "localhost:8787", None))
+                .await
+                .unwrap_err()
+                .0,
+            StatusCode::MISDIRECTED_REQUEST
+        );
+        assert_eq!(
+            proxy_request_inner(&state, request("/health", "127.0.0.1:8787", None))
+                .await
+                .unwrap_err()
+                .0,
+            StatusCode::NOT_FOUND
+        );
+
+        let expired = proxy_state(
+            reqwest::Client::new(),
+            "https://api.example",
+            "https://evidence.example/bundles/latest.json",
+            0,
+        );
+        assert_eq!(
+            proxy_request_inner(&expired, request("/v1/models", "127.0.0.1:8787", None))
+                .await
+                .unwrap_err()
+                .0,
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_refresh_keeps_the_active_bundle_untouched() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        drop(listener);
+        let state = proxy_state(
+            reqwest::Client::new(),
+            "https://api.example",
+            &format!("https://127.0.0.1:{}/bundles/latest.json", address.port()),
+            i64::MAX,
+        );
+        let before = state.active.read().await.output.bundle.sequence;
+
+        assert!(refresh_once(&state).await.is_err());
+        assert_eq!(state.active.read().await.output.bundle.sequence, before);
     }
 
     #[test]
@@ -652,8 +887,7 @@ mod tests {
                 "https://evidence.example",
                 "https://api.example",
                 "0.0.0.0:8787",
-                Environment::staging_legacy(),
-                PathBuf::from("state")
+                Environment::stogas(),
             )
             .is_err()
         );
@@ -665,9 +899,24 @@ mod tests {
     }
 
     #[test]
-    fn monotonic_time_prevents_wall_clock_rollback_from_extending_trust() {
-        assert_eq!(effective_time_ms(900, 1_000, 250), 1_250);
-        assert_eq!(effective_time_ms(1_500, 1_000, 250), 1_500);
-        assert_eq!(effective_time_ms(i64::MIN, i64::MAX - 1, 10), i64::MAX);
+    fn replacement_retry_delay_is_jittered_within_its_small_final_window() {
+        for _ in 0..100 {
+            let delay = refresh_retry_delay().as_secs();
+            assert!((MIN_REFRESH_RETRY_SECONDS..=MAX_REFRESH_RETRY_SECONDS).contains(&delay));
+        }
+    }
+
+    #[test]
+    fn replacement_fetch_uses_the_earliest_signed_or_node_trust_deadline() {
+        let (bundle, environment) = staging_bundle();
+        let mut output = Verifier::default()
+            .verify_bundle(&bundle, STAGING_BUNDLE_VERIFIED_AT_MS, &environment)
+            .unwrap();
+        output.bundle.expires_at_unix_ms = 1_000_000;
+        output.bundle.trust_expires_at_unix_ms = Some(800_000);
+        assert_eq!(replacement_refresh_at_with_leads(&output, 60, 30), 760_000);
+
+        output.bundle.trust_expires_at_unix_ms = Some(1_000_000);
+        assert_eq!(replacement_refresh_at_with_leads(&output, 60, 30), 930_000);
     }
 }

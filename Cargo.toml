@@ -1,9 +1,11 @@
 [workspace]
+exclude = ["fuzz"]
 members = [
   "bindings/python",
   "crates/cli",
   "crates/ffi",
   "crates/offline-sigstore",
+  "crates/offline-sigstore-wasm",
   "crates/verifier",
   "crates/wasm",
 ]
@@ -13,7 +15,7 @@ resolver = "2"
 version = "0.1.0-alpha.1"
 edition = "2024"
 rust-version = "1.97.1"
-license = "Apache-2.0"
+license-file = "LICENSE"
 repository = "https://github.com/StogasAI/verifier"
 
 [workspace.dependencies]
