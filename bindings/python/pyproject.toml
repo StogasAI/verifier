@@ -19,7 +19,7 @@ classifiers = [
 ]
 
 [project.urls]
-Documentation = "https://docs.stogas.ai/confidential-verification"
+Documentation = "https://stogas.ai/docs/confidential-verification"
 Issues = "https://github.com/StogasAI/verifier/issues"
 Repository = "https://github.com/StogasAI/verifier"
 

@@ -76,6 +76,8 @@ Both read the platform clock once. Neither fetches, schedules refreshes, persist
 
 Python wheels use PyO3's stable `abi3-py310` ABI. Go uses cgo. The native packages cover Linux x86-64/ARM64, macOS x86-64/ARM64, and Windows x86-64.
 
+Java 22+ and other JVM languages can use the Foreign Function & Memory API, .NET can use P/Invoke, Swift and Objective-C have native C interoperability, and Kotlin/Native can use `cinterop`. These are self-managed C ABI integrations rather than separate Stogas SDK implementations. See the [native integration guide](https://stogas.ai/docs/verifier-native-integrations) for the complete bridge matrix and memory-ownership contract.
+
 ## What is verified
 
 A trusted result means that:

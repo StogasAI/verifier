@@ -28,11 +28,11 @@ use url::Url;
 
 const MAX_BUNDLE_BYTES: usize = 16 * 1024 * 1024;
 const MAX_REQUEST_BYTES: usize = 16 * 1024 * 1024;
+const BUNDLE_FETCH_TIMEOUT_SECONDS: u64 = 10;
 const MIN_REFRESH_RETRY_SECONDS: u64 = 4;
 const MAX_REFRESH_RETRY_SECONDS: u64 = 8;
-const MIN_BUNDLE_REFRESH_LEAD_SECONDS: i64 = 30;
-const MAX_BUNDLE_REFRESH_LEAD_SECONDS: i64 = 60;
-const SHARED_CACHE_MAX_AGE_SECONDS: i64 = 10;
+const MIN_BUNDLE_REFRESH_LEAD_SECONDS: i64 = 40;
+const MAX_BUNDLE_REFRESH_LEAD_SECONDS: i64 = 70;
 
 pub struct ServeConfig {
     bundle_url: Url,
@@ -169,7 +169,7 @@ const fn replacement_refresh_at_with_lead(
     output
         .bundle
         .expires_at_unix_ms
-        .saturating_sub((bundle_lead_seconds + SHARED_CACHE_MAX_AGE_SECONDS) * 1000)
+        .saturating_sub(bundle_lead_seconds * 1000)
 }
 
 fn refresh_retry_delay() -> Duration {
@@ -201,7 +201,8 @@ async fn fetch_active(
 ) -> Result<ActiveBundle> {
     let fetcher = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
-        .timeout(Duration::from_secs(20))
+        .connect_timeout(Duration::from_secs(5))
+        .timeout(Duration::from_secs(BUNDLE_FETCH_TIMEOUT_SECONDS))
         .build()?;
     let response = fetcher
         .get(config.bundle_url.clone())
@@ -877,6 +878,14 @@ mod tests {
             .verify_bundle(&bundle, STAGING_BUNDLE_VERIFIED_AT_MS, &environment)
             .unwrap();
         output.bundle.expires_at_unix_ms = 1_000_000;
-        assert_eq!(replacement_refresh_at_with_lead(&output, 60), 930_000);
+        assert_eq!(replacement_refresh_at_with_lead(&output, 70), 930_000);
+        for _ in 0..100 {
+            let lead_seconds =
+                (output.bundle.expires_at_unix_ms - replacement_refresh_at(&output)) / 1000;
+            assert!(
+                (MIN_BUNDLE_REFRESH_LEAD_SECONDS..=MAX_BUNDLE_REFRESH_LEAD_SECONDS)
+                    .contains(&lead_seconds)
+            );
+        }
     }
 }
