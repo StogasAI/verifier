@@ -46,7 +46,7 @@ Nodes enter the returned trust set only when their evidence remains within the c
 
 ## SDK boundary
 
-SDKs verify caller-provided bytes and return verified releases, nodes, exclusions, and bundle timestamps. A reusable verifier caches immutable release verification in memory. Explicit-time methods support deterministic tests and audits.
+Client SDKs expose `Verifier`, `verify_bundle`, and `verify_bundle_at`. They verify caller-provided bytes and return verified releases, nodes, exclusions, and bundle timestamps. A reusable verifier caches immutable release verification in memory. Explicit-time methods support deterministic tests and audits. The Rust crate and dedicated JavaScript Worker entrypoint additionally expose the admission boundaries used by Stogas Control.
 
 SDKs do not fetch bundles, schedule background work, persist state, or replace an application's HTTP stack. Use `stogas-verify serve` when managed refresh and TLS pinning should be handled out of process. Browser APIs do not expose the peer certificate needed for connection pinning.
 

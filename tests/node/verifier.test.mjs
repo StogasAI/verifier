@@ -1,15 +1,6 @@
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
-import {
-	Verifier,
-	verify_local_heartbeat_admission,
-	verify_release_approval
-} from '@stogas/verifier';
-
-assert.throws(
-	() => verify_local_heartbeat_admission(new TextEncoder().encode('{'), 1),
-	/invalid bundle JSON/
-);
+import { Verifier, verify_bundle_at } from '@stogas/verifier';
 
 const verifier = new Verifier(60_000);
 assert.throws(
@@ -33,9 +24,5 @@ assert.equal(
 );
 fullVerifier.free();
 
-const release = JSON.parse(bundle).body.allowed_igvms[0];
-const verifiedRelease = verify_release_approval(
-	new TextEncoder().encode(JSON.stringify(release)),
-	1_784_414_117_082
-);
-assert.equal(verifiedRelease.release_tag, 'v0.0.1');
+const stateless = verify_bundle_at(bundle, 1_784_414_117_082);
+assert.equal(stateless.bundle.releases[0].release_tag, 'v0.0.1');

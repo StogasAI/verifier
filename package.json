@@ -19,6 +19,7 @@
 	},
 	"type": "module",
 	"files": [
+		"bindings/browser",
 		"bindings/node",
 		"bindings/wasm",
 		"pkg",
@@ -31,8 +32,8 @@
 			"import": "./bindings/node/node.js"
 		},
 		"./browser": {
-			"types": "./pkg/browser/stogas_verifier.d.ts",
-			"import": "./pkg/browser/stogas_verifier.js"
+			"types": "./bindings/browser/browser.d.ts",
+			"import": "./bindings/browser/browser.js"
 		},
 		"./worker": {
 			"types": "./bindings/wasm/worker.d.ts",
