@@ -871,7 +871,7 @@ mod tests {
     }
 
     #[test]
-    fn replacement_fetch_is_jittered_before_signed_bundle_expiry() {
+    fn replacement_fetch_is_jittered_before_verified_bundle_expiry() {
         let (bundle, environment) = staging_bundle();
         let mut output = Verifier::default()
             .verify_bundle(&bundle, STAGING_BUNDLE_VERIFIED_AT_MS, &environment)
