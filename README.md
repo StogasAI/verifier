@@ -18,7 +18,7 @@ Or run a verified loopback OpenAI-compatible endpoint:
 stogas-verify serve
 ```
 
-`serve` fetches a bundle before listening on `127.0.0.1:8787`, refreshes with jitter before signed bundle expiry, and atomically activates only a completely verified replacement. The upstream connection must pass normal WebPKI and hostname verification. Its certificate hash and SPKI must then match the same attested node.
+`serve` fetches a bundle before listening on `127.0.0.1:8787`, refreshes with jitter before verified bundle expiry, and atomically activates only a completely verified replacement. The upstream connection must pass normal WebPKI and hostname verification. Its certificate hash and SPKI must then match the same attested node.
 
 ## Packages
 
@@ -42,7 +42,7 @@ The complete verifier checks:
 - drand Quicknet identity, BLS signature, randomness, round time, and freshness;
 - bundle, certificate, collateral, and evidence deadlines.
 
-Nodes enter the returned trust set only when their evidence remains within the caller's freshness policy through signed bundle expiry. Older valid records are returned under `excluded_nodes`.
+Nodes enter the returned trust set only when their evidence remains within the caller's freshness policy through verified bundle expiry. Older valid records are returned under `excluded_nodes`.
 
 ## SDK boundary
 

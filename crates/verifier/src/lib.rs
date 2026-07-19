@@ -27,7 +27,7 @@ const DRAND_CHAIN_HASH: &str = "52db9ba70e0cc0f6eaf7803dd07447a1f5477735fd3f6617
 const DRAND_GENESIS_SECONDS: i64 = 1_692_803_367;
 const DRAND_PERIOD_SECONDS: i64 = 3;
 const DRAND_MAX_AGE_AT_QUOTE_VERIFICATION_MS: i64 = 2 * 60 * 1000;
-/// Maximum node-proof age permitted through the signed bundle expiry.
+/// Maximum node-proof age permitted through the verified bundle expiry.
 pub const DEFAULT_NODE_EVIDENCE_AGE_MS: i64 = 3 * 60 * 1000;
 /// Strictest supported nonzero node-evidence policy exposed by packaged adapters.
 pub const MIN_NODE_EVIDENCE_AGE_MS: i64 = 60 * 1000;
@@ -43,7 +43,7 @@ const STOGAS_RELEASE_PUBLIC_KEY_DER_BASE64: &str =
 pub struct Environment {
     /// Trusted Stogas release signing keys, keyed by key id, as base64 SPKI DER.
     pub release_keys: BTreeMap<String, String>,
-    /// Maximum node drand age permitted through the signed bundle expiry.
+    /// Maximum node drand age permitted through the verified bundle expiry.
     pub max_node_evidence_age_ms: i64,
 }
 
