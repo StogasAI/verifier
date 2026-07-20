@@ -122,7 +122,15 @@ fn verifies_real_staging_evidence_under_the_bundle_wide_freshness_invariant() {
     );
     assert_eq!(release.stogas_signing_key_id, "stogas-ed25519-stamp-v1");
     assert_eq!(release.launch_policy_sha256.len(), 64);
-    assert!(release.github_integrated_time_unix_ms > 0);
+    assert!(
+        release
+            .github_integrated_time_unix_ms
+            .is_some_and(|time| time > 0)
+    );
+    assert!(matches!(
+        release.provenance,
+        stogas_verifier::ReleaseProvenance::Github
+    ));
     assert_eq!(output.bundle.nodes.len(), 1);
     assert!(output.bundle.excluded_nodes.is_empty());
     assert_eq!(

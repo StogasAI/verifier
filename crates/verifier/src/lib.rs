@@ -1074,7 +1074,7 @@ fn verify_release(
             &policy_digest,
         )?;
     let github_integrated_time_unix_ms = if staging_development_provenance {
-        0
+        None
     } else {
         let workflow_identity = format!(
             "https://github.com/StogasAI/gateway/.github/workflows/gateway-igvm-release.yml@refs/tags/{}",
@@ -1103,10 +1103,12 @@ fn verify_release(
             now_unix_ms,
         )
         .map_err(|error| Error::Release(error.to_string()))?;
-        verified_attestation
-            .integrated_time
-            .checked_mul(1000)
-            .ok_or_else(|| Error::Release("GitHub integration time overflows".into()))?
+        Some(
+            verified_attestation
+                .integrated_time
+                .checked_mul(1000)
+                .ok_or_else(|| Error::Release("GitHub integration time overflows".into()))?,
+        )
     };
 
     Ok(VerifiedRelease {
@@ -1115,6 +1117,11 @@ fn verify_release(
         launch: policy.launch.clone(),
         launch_policy_sha256: policy_digest,
         measurement: policy.measurement.clone(),
+        provenance: if staging_development_provenance {
+            ReleaseProvenance::Staging
+        } else {
+            ReleaseProvenance::Github
+        },
         release_tag: policy.release_tag.clone(),
         sequence: policy.sequence,
         source_commit: policy.source.commit.clone(),
@@ -2350,7 +2357,8 @@ mod tests {
         })];
 
         let verified = verify_release(&release, &environment, 1_784_246_400_000).unwrap();
-        assert_eq!(verified.github_integrated_time_unix_ms, 0);
+        assert!(verified.github_integrated_time_unix_ms.is_none());
+        assert!(matches!(verified.provenance, ReleaseProvenance::Staging));
 
         environment.allow_staging_development_provenance = false;
         assert!(verify_release(&release, &environment, 1_784_246_400_000).is_err());
