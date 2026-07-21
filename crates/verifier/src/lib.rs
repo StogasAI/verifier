@@ -22,18 +22,18 @@ use thiserror::Error;
 pub const MAX_INPUT_BYTES: usize = 16 * 1024 * 1024;
 const MAX_NODES: usize = 1_024;
 const MAX_VENDOR_COLLATERAL: usize = 4_096;
-const MAX_BUNDLE_VALIDITY_MS: i64 = 3 * 60 * 1000;
+const MAX_BUNDLE_VALIDITY_MS: i64 = 15 * 60 * 1000;
 const MAX_CLOCK_SKEW_MS: i64 = 60_000;
 const DRAND_CHAIN_HASH: &str = "52db9ba70e0cc0f6eaf7803dd07447a1f5477735fd3f661792ba94600c84e971";
 const DRAND_GENESIS_SECONDS: i64 = 1_692_803_367;
 const DRAND_PERIOD_SECONDS: i64 = 3;
 const DRAND_MAX_AGE_AT_QUOTE_VERIFICATION_MS: i64 = 2 * 60 * 1000;
-/// Maximum node-proof age permitted through the verified bundle expiry.
-pub const DEFAULT_NODE_EVIDENCE_AGE_MS: i64 = 3 * 60 * 1000;
+/// Default maximum node-proof age at the signed bundle creation time.
+pub const DEFAULT_NODE_EVIDENCE_AGE_MS: i64 = 2 * 60 * 1000;
 /// Strictest supported nonzero node-evidence policy exposed by packaged adapters.
 pub const MIN_NODE_EVIDENCE_AGE_MS: i64 = 60 * 1000;
 /// Longest node-evidence policy supported by the verifier.
-pub const MAX_NODE_EVIDENCE_AGE_MS: i64 = DEFAULT_NODE_EVIDENCE_AGE_MS;
+pub const MAX_NODE_EVIDENCE_AGE_MS: i64 = 15 * 60 * 1000;
 const AMD_COLLATERAL_VALIDITY_MS: i64 = 24 * 60 * 60 * 1000;
 const STOGAS_RELEASE_KEY_ID: &str = "stogas-ed25519-stamp-v1";
 const STOGAS_RELEASE_PUBLIC_KEY_DER_BASE64: &str =
@@ -69,7 +69,7 @@ struct StagingDevelopmentSubject {
 pub struct Environment {
     /// Trusted Stogas release signing keys, keyed by key id, as base64 SPKI DER.
     pub release_keys: BTreeMap<String, String>,
-    /// Maximum node drand age permitted through the verified bundle expiry.
+    /// Maximum node drand age permitted at the signed bundle creation time.
     pub max_node_evidence_age_ms: i64,
     allow_staging_development_provenance: bool,
 }
@@ -382,12 +382,6 @@ pub fn verify_heartbeat_admission(
         &policies,
         &amd_stacks,
     )?;
-    if request
-        .last_drand_round
-        .is_some_and(|round| verified.drand_round < round)
-    {
-        return Err(Error::Replay("heartbeat drand round regressed".into()));
-    }
     Ok(VerifiedAdmission { node, verified })
 }
 
@@ -448,11 +442,6 @@ pub fn verify_local_heartbeat_admission(
     };
 
     let (drand_round_time_unix_ms, evidence_age_ms) = if request.attester_mode == "sev-snp" {
-        if let Some(prior) = request.last_drand_round
-            && node.report_data.drand.round < prior
-        {
-            return Err(Error::Replay("local drand round regressed".into()));
-        }
         let round_time = validate_node_evidence_time(
             &node.node_id,
             node.report_data.drand.round,
@@ -852,14 +841,14 @@ fn verify_and_partition_nodes(
         if verified
             .drand_round_time_unix_ms
             .saturating_add(max_node_evidence_age_ms)
-            < expires_at
+            < created_at
         {
             excluded.push(ExcludedNode {
                 drand_round: verified.drand_round,
                 drand_round_time_unix_ms: verified.drand_round_time_unix_ms,
                 evidence_age_ms: verified.evidence_age_ms,
                 node_id: verified.node_id,
-                reason: "attested node evidence does not remain fresh through bundle expiry".into(),
+                reason: "attested node evidence was not fresh when the bundle was created".into(),
             });
         } else {
             nodes.push(verified);

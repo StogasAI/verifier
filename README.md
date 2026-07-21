@@ -23,12 +23,22 @@ stogas-verify serve
 
 Point any OpenAI-compatible client at `http://127.0.0.1:8787/v1`. The proxy:
 
-- keeps the evidence bundle current until its verified expiry;
+- polls and verifies the latest evidence bundle every 60 seconds by default;
 - performs normal WebPKI and hostname verification;
 - requires the certificate and public-key hashes from the same attested gateway;
 - forwards `/v1/*` requests and streaming responses without installing a local CA.
 
 `serve` is a native application. It is the right choice when the calling application cannot perform TLS pinning itself.
+
+Browser applications can opt in one exact origin:
+
+```console
+stogas-verify serve --browser-origin https://app.example.com
+```
+
+The CLI prints a capability-protected base URL for that browser session. It handles CORS and local-network preflights without allowing other origins or forwarding local access headers upstream.
+
+Use `--bundle-refresh-seconds` to select 10 to 840 seconds. The proxy also fetches before the hard bundle expiry, so a long interval cannot skip the final replacement window.
 
 ### Verify a file
 
@@ -52,7 +62,7 @@ const result = verifier.verify_bundle(new Uint8Array(await response.arrayBuffer(
 console.log(result.bundle.nodes);
 ```
 
-Browser code imports `@stogas/verifier/browser` and calls its default WebAssembly initializer once. Browser `fetch` does not expose the peer certificate, so a browser SDK can verify bundle evidence but cannot provide the CLI proxy's pre-request TLS pinning.
+Browser code imports `@stogas/verifier/browser` and calls its default WebAssembly initializer once. Browser `fetch` does not expose the peer certificate, so direct browser verification cannot provide pre-request TLS pinning. Use the CLI's explicit browser mode when an existing browser client needs a pinned connection.
 
 The client API has two forms:
 
@@ -86,7 +96,7 @@ A trusted result means that:
 - the independent Stogas release signature authorizes those same launch-policy bytes;
 - each trusted gateway presents a valid AMD SEV-SNP report for an authorized launch measurement;
 - the report binds that gateway's TLS, certificate-rotation, response-signing, and encryption keys;
-- AMD revocation data, certificates, drand freshness, and the bundle itself remain valid through bundle expiry.
+- AMD revocation data, certificates, and the bundle remain valid through bundle expiry; node drand freshness is evaluated at signed bundle creation under the caller's one-to-fifteen-minute policy.
 
 Cryptographically valid records that do not satisfy the selected freshness window are returned under `excluded_nodes`; they are never added to the trusted node set.
 

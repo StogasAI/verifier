@@ -3,7 +3,7 @@ use axum::{
     Router,
     body::{Body, Bytes, to_bytes},
     extract::{Request, State},
-    http::{HeaderName, StatusCode, header},
+    http::{HeaderName, HeaderValue, Method, StatusCode, header},
     response::Response,
     routing::any,
 };
@@ -40,6 +40,13 @@ pub struct ServeConfig {
     listen: SocketAddr,
     expected_host: String,
     environment: Environment,
+    bundle_refresh_interval: Duration,
+    browser: Option<BrowserAccess>,
+}
+
+struct BrowserAccess {
+    origin: String,
+    capability: String,
 }
 
 impl ServeConfig {
@@ -48,6 +55,8 @@ impl ServeConfig {
         upstream: &str,
         listen: &str,
         environment: Environment,
+        bundle_refresh_interval: Duration,
+        browser_origin: Option<&str>,
     ) -> Result<Self> {
         let bundle_url = secure_bundle_url(bundle_url)?;
         let upstream = secure_base_url(upstream, "upstream URL")?;
@@ -55,14 +64,58 @@ impl ServeConfig {
         if !listen.ip().is_loopback() {
             bail!("serve listener must use a loopback address");
         }
+        let browser = match browser_origin {
+            Some(origin) => Some(BrowserAccess {
+                origin: secure_browser_origin(origin)?,
+                capability: browser_capability(),
+            }),
+            None => None,
+        };
         Ok(Self {
             bundle_url,
             upstream,
             listen,
             expected_host: listen.to_string(),
             environment,
+            bundle_refresh_interval,
+            browser,
         })
     }
+
+    fn base_url(&self) -> String {
+        self.browser.as_ref().map_or_else(
+            || format!("http://{}/v1", self.expected_host),
+            |browser| format!("http://{}/{}/v1", self.expected_host, browser.capability),
+        )
+    }
+}
+
+fn secure_browser_origin(value: &str) -> Result<String> {
+    let url = Url::parse(value).context("invalid browser origin")?;
+    let loopback_http = url.scheme() == "http"
+        && url.host_str().is_some_and(|host| {
+            host.eq_ignore_ascii_case("localhost")
+                || host
+                    .parse::<std::net::IpAddr>()
+                    .is_ok_and(|address| address.is_loopback())
+        });
+    if (url.scheme() != "https" && !loopback_http)
+        || url.host_str().is_none()
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+        || !matches!(url.path(), "" | "/")
+    {
+        bail!("browser origin must be an HTTPS origin or an HTTP loopback origin");
+    }
+    Ok(url.origin().ascii_serialization())
+}
+
+fn browser_capability() -> String {
+    let mut bytes = [0_u8; 32];
+    rand::rng().fill(&mut bytes);
+    hex::encode(bytes)
 }
 
 fn secure_base_url(value: &str, label: &str) -> Result<Url> {
@@ -120,6 +173,7 @@ pub async fn serve(config: ServeConfig) -> Result<()> {
 
     let app = Router::new().fallback(any(proxy_request)).with_state(state);
     let listener = tokio::net::TcpListener::bind(config.listen).await?;
+    println!("OpenAI base URL: {}", config.base_url());
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
         .await?;
@@ -132,44 +186,50 @@ async fn shutdown_signal() {
 
 async fn refresh_loop(state: Arc<ProxyState>) {
     loop {
-        let (bundle_expires_at, refresh_at) = {
+        let refresh_at = {
             let active = state.active.read().await;
-            (
-                active.output.bundle.expires_at_unix_ms,
-                replacement_refresh_at(&active.output),
+            replacement_refresh_at(
+                &active.output,
+                wall_clock_ms(),
+                state.config.bundle_refresh_interval,
             )
         };
         sleep_until_wall_clock(refresh_at).await;
 
         loop {
             if refresh_once(&state).await.is_ok() {
-                let new_bundle_expiry = {
-                    let active = state.active.read().await;
-                    active.output.bundle.expires_at_unix_ms
-                };
-                if new_bundle_expiry > bundle_expires_at {
-                    break;
-                }
+                break;
             }
             tokio::time::sleep(refresh_retry_delay()).await;
         }
     }
 }
 
-fn replacement_refresh_at(output: &VerificationOutput) -> i64 {
+fn replacement_refresh_at(
+    output: &VerificationOutput,
+    now_unix_ms: i64,
+    refresh_interval: Duration,
+) -> i64 {
     let bundle_lead_seconds =
         rand::rng().random_range(MIN_BUNDLE_REFRESH_LEAD_SECONDS..=MAX_BUNDLE_REFRESH_LEAD_SECONDS);
-    replacement_refresh_at_with_lead(output, bundle_lead_seconds)
+    replacement_refresh_at_with_lead(output, now_unix_ms, refresh_interval, bundle_lead_seconds)
 }
 
-const fn replacement_refresh_at_with_lead(
+fn replacement_refresh_at_with_lead(
     output: &VerificationOutput,
+    now_unix_ms: i64,
+    refresh_interval: Duration,
     bundle_lead_seconds: i64,
 ) -> i64 {
-    output
+    let interval_ms = i64::try_from(refresh_interval.as_millis()).unwrap_or(i64::MAX);
+    let scheduled = now_unix_ms.saturating_add(interval_ms);
+    let expiry_refresh = output
         .bundle
         .expires_at_unix_ms
-        .saturating_sub(bundle_lead_seconds * 1000)
+        .saturating_sub(bundle_lead_seconds * 1000);
+    scheduled
+        .min(expiry_refresh)
+        .max(now_unix_ms.saturating_add(1_000))
 }
 
 fn refresh_retry_delay() -> Duration {
@@ -236,23 +296,25 @@ async fn bounded_response(response: reqwest::Response, limit: usize) -> Result<V
 }
 
 async fn proxy_request(State(state): State<Arc<ProxyState>>, request: Request) -> Response<Body> {
-    match proxy_request_inner(&state, request).await {
+    let browser_origin = allowed_browser_origin(&state.config, request.headers());
+    let mut response = match proxy_request_inner(&state, request).await {
         Ok(response) => response,
         Err((status, message)) => Response::builder()
             .status(status)
             .header(header::CONTENT_TYPE, "text/plain; charset=utf-8")
             .body(Body::from(message))
             .unwrap_or_else(|_| Response::new(Body::empty())),
+    };
+    if let Some(origin) = browser_origin {
+        add_browser_response_headers(&mut response, origin);
     }
+    response
 }
 
 async fn proxy_request_inner(
     state: &ProxyState,
     request: Request,
 ) -> Result<Response<Body>, (StatusCode, &'static str)> {
-    if request.headers().contains_key(header::ORIGIN) {
-        return Err((StatusCode::FORBIDDEN, "browser origins are not accepted"));
-    }
     if request
         .headers()
         .get(header::HOST)
@@ -261,7 +323,20 @@ async fn proxy_request_inner(
     {
         return Err((StatusCode::MISDIRECTED_REQUEST, "invalid Host header"));
     }
-    if !request.uri().path().starts_with("/v1/") {
+
+    let origin = request.headers().get(header::ORIGIN);
+    let browser = match (origin, &state.config.browser) {
+        (Some(origin), Some(browser)) if origin.to_str().ok() == Some(browser.origin.as_str()) => {
+            Some(browser)
+        }
+        (Some(_), _) => return Err((StatusCode::FORBIDDEN, "browser origin is not allowed")),
+        (None, _) => None,
+    };
+    let upstream_path = routed_path(request.uri().path(), browser)?.to_owned();
+    if request.method() == Method::OPTIONS && browser.is_some() {
+        return browser_preflight(&request);
+    }
+    if !upstream_path.starts_with("/v1/") {
         return Err((StatusCode::NOT_FOUND, "only /v1/* is available"));
     }
     let active = state.active.read().await.clone();
@@ -273,7 +348,7 @@ async fn proxy_request_inner(
     let body = to_bytes(body, MAX_REQUEST_BYTES)
         .await
         .map_err(|_| (StatusCode::PAYLOAD_TOO_LARGE, "request body is too large"))?;
-    send_upstream(state, &active, &parts, body)
+    send_upstream(state, &active, &parts, &upstream_path, body)
         .await
         .map_err(|error| {
             if error.is_connect() {
@@ -284,18 +359,119 @@ async fn proxy_request_inner(
         })
 }
 
+fn routed_path<'a>(
+    path: &'a str,
+    browser: Option<&BrowserAccess>,
+) -> Result<&'a str, (StatusCode, &'static str)> {
+    let Some(browser) = browser else {
+        return Ok(path);
+    };
+    let prefix = format!("/{}", browser.capability);
+    path.strip_prefix(&prefix)
+        .filter(|path| path.starts_with("/v1/"))
+        .ok_or((StatusCode::NOT_FOUND, "invalid browser base URL"))
+}
+
+fn browser_preflight(request: &Request) -> Result<Response<Body>, (StatusCode, &'static str)> {
+    let method = request
+        .headers()
+        .get(header::ACCESS_CONTROL_REQUEST_METHOD)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| Method::from_bytes(value.as_bytes()).ok())
+        .ok_or((StatusCode::BAD_REQUEST, "invalid browser preflight"))?;
+    if !matches!(
+        method,
+        Method::GET | Method::HEAD | Method::POST | Method::PUT | Method::PATCH | Method::DELETE
+    ) {
+        return Err((
+            StatusCode::METHOD_NOT_ALLOWED,
+            "browser method is not allowed",
+        ));
+    }
+    if let Some(headers) = request
+        .headers()
+        .get(header::ACCESS_CONTROL_REQUEST_HEADERS)
+    {
+        let headers = headers
+            .to_str()
+            .map_err(|_| (StatusCode::BAD_REQUEST, "invalid browser preflight"))?;
+        if headers.len() > 2_048
+            || headers.split(',').any(|name| {
+                let name = name.trim();
+                name.is_empty()
+                    || HeaderName::from_bytes(name.as_bytes()).is_err()
+                    || matches!(
+                        name.to_ascii_lowercase().as_str(),
+                        "cookie" | "host" | "origin"
+                    )
+            })
+        {
+            return Err((StatusCode::BAD_REQUEST, "invalid browser preflight"));
+        }
+    }
+
+    let mut response = Response::builder()
+        .status(StatusCode::NO_CONTENT)
+        .header(
+            header::ACCESS_CONTROL_ALLOW_METHODS,
+            "GET, HEAD, POST, PUT, PATCH, DELETE, OPTIONS",
+        )
+        .header(header::ACCESS_CONTROL_MAX_AGE, "600");
+    if let Some(headers) = request
+        .headers()
+        .get(header::ACCESS_CONTROL_REQUEST_HEADERS)
+    {
+        response = response.header(header::ACCESS_CONTROL_ALLOW_HEADERS, headers);
+    }
+    if request
+        .headers()
+        .get("access-control-request-private-network")
+        == Some(&HeaderValue::from_static("true"))
+    {
+        response = response.header("access-control-allow-private-network", "true");
+    }
+    Ok(response
+        .body(Body::empty())
+        .unwrap_or_else(|_| Response::new(Body::empty())))
+}
+
+fn allowed_browser_origin<'a>(
+    config: &'a ServeConfig,
+    headers: &axum::http::HeaderMap,
+) -> Option<&'a str> {
+    let browser = config.browser.as_ref()?;
+    (headers.get(header::ORIGIN)?.to_str().ok()? == browser.origin)
+        .then_some(browser.origin.as_str())
+}
+
+fn add_browser_response_headers(response: &mut Response<Body>, origin: &str) {
+    if let Ok(origin) = HeaderValue::from_str(origin) {
+        response
+            .headers_mut()
+            .insert(header::ACCESS_CONTROL_ALLOW_ORIGIN, origin);
+        response
+            .headers_mut()
+            .append(header::VARY, HeaderValue::from_static("Origin"));
+    }
+}
+
 async fn send_upstream(
     state: &ProxyState,
     active: &ActiveBundle,
     parts: &axum::http::request::Parts,
+    upstream_path: &str,
     body: Bytes,
 ) -> reqwest::Result<Response<Body>> {
     let mut url = state.config.upstream.clone();
-    url.set_path(parts.uri.path());
+    url.set_path(upstream_path);
     url.set_query(parts.uri.query());
     let mut request = active.client.request(parts.method.clone(), url);
     for (name, value) in &parts.headers {
-        if !is_hop_by_hop(name) && name != header::HOST && name != header::CONTENT_LENGTH {
+        if !is_hop_by_hop(name)
+            && !is_local_browser_header(name)
+            && name != header::HOST
+            && name != header::CONTENT_LENGTH
+        {
             request = request.header(name, value);
         }
     }
@@ -305,13 +481,17 @@ async fn send_upstream(
     let stream = upstream.bytes_stream();
     let mut response = Response::builder().status(status);
     for (name, value) in &headers {
-        if !is_hop_by_hop(name) {
+        if !is_hop_by_hop(name) && !name.as_str().starts_with("access-control-") {
             response = response.header(name, value);
         }
     }
     Ok(response
         .body(Body::from_stream(stream))
         .unwrap_or_else(|_| Response::new(Body::empty())))
+}
+
+fn is_local_browser_header(name: &HeaderName) -> bool {
+    name == header::ORIGIN || name.as_str().starts_with("access-control-")
 }
 
 fn is_hop_by_hop(name: &HeaderName) -> bool {
@@ -652,6 +832,16 @@ mod tests {
         bundle_url: &str,
         expires_at_unix_ms: i64,
     ) -> ProxyState {
+        proxy_state_with_browser(client, upstream, bundle_url, expires_at_unix_ms, None)
+    }
+
+    fn proxy_state_with_browser(
+        client: reqwest::Client,
+        upstream: &str,
+        bundle_url: &str,
+        expires_at_unix_ms: i64,
+        browser_origin: Option<&str>,
+    ) -> ProxyState {
         let (bundle, environment) = staging_bundle();
         let mut verifier = Verifier::default();
         let mut output = verifier
@@ -661,7 +851,15 @@ mod tests {
         ProxyState {
             active: RwLock::new(Arc::new(ActiveBundle { output, client })),
             config: Arc::new(
-                ServeConfig::new(bundle_url, upstream, "127.0.0.1:8787", environment).unwrap(),
+                ServeConfig::new(
+                    bundle_url,
+                    upstream,
+                    "127.0.0.1:8787",
+                    environment,
+                    Duration::from_mins(1),
+                    browser_origin,
+                )
+                .unwrap(),
             ),
             refresh_lock: Mutex::new(()),
             verifier: Mutex::new(verifier),
@@ -738,6 +936,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn browser_request_strips_local_routing_and_cors_headers_before_upstream() {
+        let certificate = test_certificate();
+        let ca = certificate.ca.clone();
+        let node = certificate.node.clone();
+        let client = pinned_client_with_roots(&[node], roots(ca)).unwrap();
+        let (address, captured_request) = capturing_tls_server(certificate).await;
+        let state = Arc::new(proxy_state_with_browser(
+            client,
+            &format!("https://localhost:{}", address.port()),
+            "https://evidence.example/bundles/latest.json",
+            i64::MAX,
+            Some("https://client.example"),
+        ));
+        let capability = state.config.browser.as_ref().unwrap().capability.clone();
+        let request = Request::builder()
+            .method(Method::POST)
+            .uri(format!("/{capability}/v1/chat/completions?stream=true"))
+            .header(header::HOST, "127.0.0.1:8787")
+            .header(header::ORIGIN, "https://client.example")
+            .header(header::AUTHORIZATION, "Bearer test-secret")
+            .body(Body::from(r#"{"stream":true}"#))
+            .unwrap();
+
+        let response = proxy_request(State(Arc::clone(&state)), request).await;
+        assert_eq!(response.status(), StatusCode::CREATED);
+        assert_eq!(
+            response.headers()[header::ACCESS_CONTROL_ALLOW_ORIGIN],
+            "https://client.example"
+        );
+
+        let request = String::from_utf8(captured_request.await.unwrap()).unwrap();
+        assert!(request.starts_with("POST /v1/chat/completions?stream=true HTTP/1.1\r\n"));
+        assert!(!request.contains("origin:"));
+        assert!(!request.contains(&capability));
+    }
+
+    #[tokio::test]
     async fn rejects_valid_webpki_certificate_when_pin_is_not_trusted() {
         let certificate = test_certificate();
         let ca = certificate.ca.clone();
@@ -811,6 +1046,70 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn browser_access_requires_exact_origin_and_capability_and_handles_preflight() {
+        let state = proxy_state_with_browser(
+            reqwest::Client::new(),
+            "https://api.example",
+            "https://evidence.example/bundles/latest.json",
+            i64::MAX,
+            Some("https://client.example"),
+        );
+        let capability = &state.config.browser.as_ref().unwrap().capability;
+        let path = format!("/{capability}/v1/chat/completions");
+        let preflight = Request::builder()
+            .method(Method::OPTIONS)
+            .uri(&path)
+            .header(header::HOST, "127.0.0.1:8787")
+            .header(header::ORIGIN, "https://client.example")
+            .header(header::ACCESS_CONTROL_REQUEST_METHOD, "POST")
+            .header(
+                header::ACCESS_CONTROL_REQUEST_HEADERS,
+                "authorization, content-type",
+            )
+            .header("access-control-request-private-network", "true")
+            .body(Body::empty())
+            .unwrap();
+        let response = proxy_request_inner(&state, preflight).await.unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        assert_eq!(
+            response.headers()["access-control-allow-private-network"],
+            "true"
+        );
+        assert_eq!(
+            response.headers()[header::ACCESS_CONTROL_ALLOW_HEADERS],
+            "authorization, content-type"
+        );
+
+        let wrong_capability = Request::builder()
+            .uri("/wrong/v1/models")
+            .header(header::HOST, "127.0.0.1:8787")
+            .header(header::ORIGIN, "https://client.example")
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(
+            proxy_request_inner(&state, wrong_capability)
+                .await
+                .unwrap_err()
+                .0,
+            StatusCode::NOT_FOUND
+        );
+
+        let wrong_origin = Request::builder()
+            .uri(path)
+            .header(header::HOST, "127.0.0.1:8787")
+            .header(header::ORIGIN, "https://attacker.example")
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(
+            proxy_request_inner(&state, wrong_origin)
+                .await
+                .unwrap_err()
+                .0,
+            StatusCode::FORBIDDEN
+        );
+    }
+
+    #[tokio::test]
     async fn failed_refresh_keeps_the_active_bundle_untouched() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
@@ -853,6 +1152,8 @@ mod tests {
                 "https://api.example",
                 "0.0.0.0:8787",
                 Environment::stogas(),
+                Duration::from_mins(1),
+                None,
             )
             .is_err()
         );
@@ -861,6 +1162,20 @@ mod tests {
         assert!(secure_base_url("https://api.example/path", "upstream URL").is_err());
         assert!(secure_bundle_url("https://evidence.example/bundles/latest.json").is_ok());
         assert!(secure_bundle_url("https://evidence.example/latest.json?redirect=1").is_err());
+        assert_eq!(
+            secure_browser_origin("https://client.example/").unwrap(),
+            "https://client.example"
+        );
+        assert_eq!(
+            secure_browser_origin("http://127.0.0.1:5173").unwrap(),
+            "http://127.0.0.1:5173"
+        );
+        assert_eq!(
+            secure_browser_origin("http://localhost:5173").unwrap(),
+            "http://localhost:5173"
+        );
+        assert!(secure_browser_origin("http://client.example").is_err());
+        assert!(secure_browser_origin("https://client.example/path").is_err());
     }
 
     #[test]
@@ -872,16 +1187,20 @@ mod tests {
     }
 
     #[test]
-    fn replacement_fetch_is_jittered_before_verified_bundle_expiry() {
+    fn replacement_fetch_uses_the_interval_or_the_safe_expiry_lead() {
         let (bundle, environment) = staging_bundle();
         let mut output = Verifier::default()
             .verify_bundle(&bundle, STAGING_BUNDLE_VERIFIED_AT_MS, &environment)
             .unwrap();
         output.bundle.expires_at_unix_ms = 1_000_000;
-        assert_eq!(replacement_refresh_at_with_lead(&output, 70), 930_000);
+        assert_eq!(
+            replacement_refresh_at_with_lead(&output, 100_000, Duration::from_mins(1), 70,),
+            160_000
+        );
         for _ in 0..100 {
-            let lead_seconds =
-                (output.bundle.expires_at_unix_ms - replacement_refresh_at(&output)) / 1000;
+            let lead_seconds = (output.bundle.expires_at_unix_ms
+                - replacement_refresh_at(&output, 100_000, Duration::from_mins(15)))
+                / 1000;
             assert!(
                 (MIN_BUNDLE_REFRESH_LEAD_SECONDS..=MAX_BUNDLE_REFRESH_LEAD_SECONDS)
                     .contains(&lead_seconds)

@@ -13,12 +13,12 @@ use stogas_verifier::{
 };
 use wasm_bindgen::prelude::*;
 
-const DEFAULT_NODE_EVIDENCE_AGE_MS_F64: f64 = 180_000.0;
+const DEFAULT_NODE_EVIDENCE_AGE_MS_F64: f64 = 120_000.0;
 const MIN_NODE_EVIDENCE_AGE_MS_F64: f64 = 60_000.0;
-const MAX_NODE_EVIDENCE_AGE_MS_F64: f64 = 180_000.0;
-const _: () = assert!(DEFAULT_NODE_EVIDENCE_AGE_MS == 180_000);
+const MAX_NODE_EVIDENCE_AGE_MS_F64: f64 = 900_000.0;
+const _: () = assert!(DEFAULT_NODE_EVIDENCE_AGE_MS == 120_000);
 const _: () = assert!(MIN_NODE_EVIDENCE_AGE_MS == 60_000);
-const _: () = assert!(MAX_NODE_EVIDENCE_AGE_MS == 180_000);
+const _: () = assert!(MAX_NODE_EVIDENCE_AGE_MS == 900_000);
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -89,7 +89,7 @@ fn verifier_environment(max_node_age_ms: f64, staging: bool) -> Result<Environme
         || !(MIN_NODE_EVIDENCE_AGE_MS_F64..=MAX_NODE_EVIDENCE_AGE_MS_F64).contains(&max_node_age_ms)
     {
         return Err(JsError::new(
-            "max_node_age_ms must be an integer between 60000 and 180000",
+            "max_node_age_ms must be an integer between 60000 and 900000",
         ));
     }
     let mut environment = if staging {

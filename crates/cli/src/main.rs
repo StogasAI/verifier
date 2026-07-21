@@ -3,7 +3,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 use std::{
     io::Read as _,
     path::PathBuf,
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use stogas_verifier::{Environment, VerificationOutput, verify_bundle};
 
@@ -34,8 +34,8 @@ enum Command {
         /// Exact Unix time in milliseconds, for tests and auditing only.
         #[arg(long, hide = true)]
         now_unix_ms: Option<i64>,
-        /// Maximum age node evidence may reach by bundle expiry.
-        #[arg(long, default_value_t = 3, value_parser = clap::value_parser!(u16).range(1..=3))]
+        /// Maximum age of node evidence at signed bundle creation.
+        #[arg(long, default_value_t = 2, value_parser = clap::value_parser!(u16).range(1..=15))]
         max_node_age_minutes: u16,
     },
     /// Run the verified loopback proxy.
@@ -48,9 +48,15 @@ enum Command {
         listen: String,
         #[arg(long, value_enum, default_value_t = Target::Production)]
         target: Target,
-        /// Maximum age node evidence may reach by bundle expiry.
-        #[arg(long, default_value_t = 3, value_parser = clap::value_parser!(u16).range(1..=3))]
+        /// Maximum age of node evidence at signed bundle creation.
+        #[arg(long, default_value_t = 2, value_parser = clap::value_parser!(u16).range(1..=15))]
         max_node_age_minutes: u16,
+        /// How often to fetch and verify the latest bundle.
+        #[arg(long, default_value_t = 60, value_parser = clap::value_parser!(u16).range(10..=840))]
+        bundle_refresh_seconds: u16,
+        /// Allow one browser origin and print a capability-protected browser base URL.
+        #[arg(long)]
+        browser_origin: Option<String>,
     },
 }
 
@@ -92,8 +98,19 @@ async fn main() -> Result<()> {
             listen,
             target,
             max_node_age_minutes,
+            bundle_refresh_seconds,
+            browser_origin,
         } => {
-            serve(bundle_url, upstream, listen, target, max_node_age_minutes).await?;
+            serve(
+                bundle_url,
+                upstream,
+                listen,
+                target,
+                max_node_age_minutes,
+                bundle_refresh_seconds,
+                browser_origin,
+            )
+            .await?;
         }
     }
     Ok(())
@@ -114,6 +131,8 @@ async fn serve(
     listen: String,
     target: Target,
     max_node_age_minutes: u16,
+    bundle_refresh_seconds: u16,
+    browser_origin: Option<String>,
 ) -> Result<()> {
     let expected_default = match target {
         Target::Staging => STAGING_BUNDLE_URL,
@@ -127,6 +146,8 @@ async fn serve(
         &upstream,
         &listen,
         environment(target, max_node_age_minutes),
+        Duration::from_secs(u64::from(bundle_refresh_seconds)),
+        browser_origin.as_deref(),
     )?)
     .await
 }

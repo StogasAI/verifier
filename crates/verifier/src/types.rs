@@ -119,8 +119,6 @@ pub struct HeartbeatCandidate {
 pub struct AdmissionRequest {
     pub heartbeat: HeartbeatCandidate,
     pub launch_policies: Vec<LaunchPolicy>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub last_drand_round: Option<u64>,
     pub region: String,
     pub trusted_chip_ids: Vec<String>,
     pub vendor_collateral: Vec<VendorCollateral>,
@@ -138,8 +136,6 @@ pub struct LocalAdmissionRequest {
     pub amd_report_signing_public_key: Option<String>,
     pub heartbeat: HeartbeatCandidate,
     pub launch_policies: Vec<LaunchPolicy>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub last_drand_round: Option<u64>,
     pub region: String,
     pub trusted_platforms: Vec<TrustedPlatform>,
 }

@@ -29,14 +29,14 @@ import (
 	"unsafe"
 )
 
-const defaultMaxNodeAge = 3 * time.Minute
+const defaultMaxNodeAge = 2 * time.Minute
 
 // ErrClosed is returned after a verifier session has been closed.
 var ErrClosed = errors.New("stogas verifier is closed")
 
 // Options configures a verifier without moving security policy into Go.
 type Options struct {
-	// MaxNodeAge selects how old a proof may become by bundle expiry. Zero uses three minutes.
+	// MaxNodeAge selects how old a proof may be at signed bundle creation. Zero uses two minutes.
 	MaxNodeAge time.Duration
 }
 
@@ -46,7 +46,7 @@ type Verifier struct {
 	handle *C.StogasVerifier
 }
 
-// New constructs a verifier with the default three-minute node-freshness policy.
+// New constructs a verifier with the default two-minute node-freshness policy.
 func New() (*Verifier, error) {
 	return NewWithOptions(Options{})
 }
@@ -57,8 +57,8 @@ func NewWithOptions(options Options) (*Verifier, error) {
 	if maxAge == 0 {
 		maxAge = defaultMaxNodeAge
 	}
-	if maxAge%time.Millisecond != 0 || maxAge < time.Minute || maxAge > 3*time.Minute {
-		return nil, fmt.Errorf("max node age must be between one and three minutes in whole milliseconds")
+	if maxAge%time.Millisecond != 0 || maxAge < time.Minute || maxAge > 15*time.Minute {
+		return nil, fmt.Errorf("max node age must be between one and fifteen minutes in whole milliseconds")
 	}
 	handle := C.stogas_verifier_new(C.int64_t(maxAge.Milliseconds()))
 	if handle == nil {

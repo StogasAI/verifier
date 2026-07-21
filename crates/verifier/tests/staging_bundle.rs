@@ -301,43 +301,47 @@ fn enforces_bundle_time_and_resource_policy() {
     let mut too_long = fixture();
     let created_at = unix_ms(&too_long, "/body/created_at");
     too_long["body"]["expires_at"] = Value::String(
-        DateTime::from_timestamp_millis(created_at + 180_001)
+        DateTime::from_timestamp_millis(created_at + 900_001)
             .unwrap()
             .to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
     );
-    too_long["body"]["ttl_ms"] = Value::from(180_001);
+    too_long["body"]["ttl_ms"] = Value::from(900_001);
     let (too_long, environment) = checksummed_fixture(too_long);
     assert!(
         Verifier::default()
             .verify_bundle(&too_long, VERIFIED_AT_UNIX_MS, &environment)
             .unwrap_err()
             .to_string()
-            .contains("exceeds the 180000 ms policy")
+            .contains("exceeds the 900000 ms policy")
     );
 }
 
 #[test]
-fn stricter_callers_exclude_nodes_that_would_age_out_before_bundle_expiry() {
-    let (bundle, mut environment) = checksummed_fixture(fixture());
-    let baseline = Verifier::default()
-        .verify_bundle(&bundle, VERIFIED_AT_UNIX_MS, &environment)
-        .unwrap();
-    let freshness_deadline = baseline.bundle.nodes[0].drand_round_time_unix_ms + 60_000;
+fn stricter_callers_exclude_nodes_that_were_stale_at_bundle_creation() {
+    let mut value = fixture();
+    let created_at = unix_ms(&value, "/body/created_at") + 61_000;
+    value["body"]["created_at"] = Value::String(
+        DateTime::from_timestamp_millis(created_at)
+            .unwrap()
+            .to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+    );
+    value["body"]["ttl_ms"] = Value::from(unix_ms(&value, "/body/expires_at") - created_at);
+    let (bundle, mut environment) = checksummed_fixture(value);
     environment.max_node_evidence_age_ms = 60_000;
     let output = Verifier::default()
-        .verify_bundle(&bundle, freshness_deadline, &environment)
+        .verify_bundle(&bundle, created_at, &environment)
         .unwrap();
     assert!(output.bundle.nodes.is_empty());
     assert_eq!(output.bundle.excluded_nodes.len(), 1);
     assert!(
         output.bundle.excluded_nodes[0]
             .reason
-            .contains("bundle expiry")
+            .contains("bundle was created")
     );
 }
 
 #[test]
-fn nodes_must_remain_fresh_through_bundle_expiry() {
+fn extending_bundle_expiry_does_not_weaken_the_creation_time_freshness_policy() {
     let (bundle, environment) = checksummed_fixture(fixture());
     let baseline = Verifier::default()
         .verify_bundle(&bundle, VERIFIED_AT_UNIX_MS, &environment)
@@ -355,14 +359,9 @@ fn nodes_must_remain_fresh_through_bundle_expiry() {
         unix_ms(&extended, "/body/expires_at") - unix_ms(&extended, "/body/created_at"),
     );
     let (extended, environment) = checksummed_fixture(extended);
-    let excluded = Verifier::default()
+    let verified = Verifier::default()
         .verify_bundle(&extended, VERIFIED_AT_UNIX_MS, &environment)
         .unwrap();
-    assert!(excluded.bundle.nodes.is_empty());
-    assert_eq!(excluded.bundle.excluded_nodes.len(), 1);
-    assert!(
-        excluded.bundle.excluded_nodes[0]
-            .reason
-            .contains("bundle expiry")
-    );
+    assert_eq!(verified.bundle.nodes.len(), 1);
+    assert!(verified.bundle.excluded_nodes.is_empty());
 }

@@ -46,7 +46,7 @@ pub const extern "C" fn stogas_verifier_abi_version() -> u32 {
 
 /// Construct a verifier session.
 ///
-/// `max_node_age_ms` must be between one and three minutes. A null result means the argument was
+/// `max_node_age_ms` must be between one and fifteen minutes. A null result means the argument was
 /// invalid or allocation failed. The session is safe to call concurrently; each verification is
 /// serialized.
 #[unsafe(no_mangle)]

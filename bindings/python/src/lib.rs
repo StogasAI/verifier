@@ -77,7 +77,7 @@ fn verify_bundle_with_time<'py>(
 fn verifier_environment(max_node_age_ms: i64) -> PyResult<Environment> {
     if !(MIN_NODE_EVIDENCE_AGE_MS..=MAX_NODE_EVIDENCE_AGE_MS).contains(&max_node_age_ms) {
         return Err(PyValueError::new_err(
-            "max_node_age_ms must be between 60000 and 180000",
+            "max_node_age_ms must be between 60000 and 900000",
         ));
     }
     let mut environment = Environment::stogas();
