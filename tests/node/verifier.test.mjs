@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { Verifier, verify_bundle } from '@stogas/verifier';
 
-const verifier = new Verifier(60_000);
+const verifier = new Verifier();
 assert.throws(
 	() => verifier.verify_bundle(new TextEncoder().encode('{"body":')),
 	/invalid bundle JSON/

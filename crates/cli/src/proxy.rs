@@ -705,6 +705,7 @@ mod tests {
             key: PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(leaf_key.serialize_der())),
             node: VerifiedNode {
                 accepted_cert_sha256: vec![cert_hash],
+                chip_id: "00".repeat(64),
                 drand_round: 0,
                 drand_round_time_unix_ms: 0,
                 evidence_age_ms: 0,
@@ -729,6 +730,7 @@ mod tests {
                 },
                 report_data_sha512: "00".repeat(64),
                 release_measurement: "00".repeat(48),
+                reported_tcb: "0000000000000000".into(),
                 tls_spki_sha256: spki_hash,
             },
         }

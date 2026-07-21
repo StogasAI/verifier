@@ -3,7 +3,7 @@ import type { Verifier as CoreVerifier } from '../../pkg/browser/stogas_verifier
 export { default, verify_bundle } from '../../pkg/browser/stogas_verifier.js';
 
 export declare class Verifier {
-	constructor(maxNodeAgeMs?: number | null, staging?: boolean);
+	constructor(staging?: boolean);
 	verify_bundle(bundle: Uint8Array): ReturnType<CoreVerifier['verify_bundle']>;
 	free(): void;
 }

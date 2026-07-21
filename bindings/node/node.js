@@ -13,8 +13,8 @@ export { verify_bundle };
 export class Verifier {
 	#core;
 
-	constructor(maxNodeAgeMs) {
-		this.#core = new CoreVerifier(maxNodeAgeMs);
+	constructor() {
+		this.#core = new CoreVerifier();
 	}
 
 	verify_bundle(bundle) {

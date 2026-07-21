@@ -12,8 +12,8 @@ typedef struct StogasVerifier StogasVerifier;
 
 uint32_t stogas_verifier_abi_version(void);
 
-/* Returns NULL unless max_node_age_ms is between 60000 and 900000. */
-StogasVerifier *stogas_verifier_new(int64_t max_node_age_ms);
+/* Returns NULL only when allocation fails. */
+StogasVerifier *stogas_verifier_new(void);
 
 /* The caller must not free a session while another thread is using it. */
 void stogas_verifier_free(StogasVerifier *verifier);

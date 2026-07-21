@@ -2,10 +2,7 @@
 
 use pyo3::{exceptions::PyValueError, prelude::*, types::PyBytes};
 use std::time::{SystemTime, UNIX_EPOCH};
-use stogas_verifier::{
-    DEFAULT_NODE_EVIDENCE_AGE_MS, Environment, MAX_NODE_EVIDENCE_AGE_MS, MIN_NODE_EVIDENCE_AGE_MS,
-    Verifier as CoreVerifier, verify_bundle as verify_core_bundle,
-};
+use stogas_verifier::{Environment, Verifier as CoreVerifier, verify_bundle as verify_core_bundle};
 
 #[pyclass(name = "Verifier")]
 struct PythonVerifier {
@@ -16,13 +13,11 @@ struct PythonVerifier {
 #[pymethods]
 impl PythonVerifier {
     #[new]
-    fn new(max_node_age_ms: Option<i64>) -> PyResult<Self> {
-        let environment =
-            verifier_environment(max_node_age_ms.unwrap_or(DEFAULT_NODE_EVIDENCE_AGE_MS))?;
-        Ok(Self {
+    fn new() -> Self {
+        Self {
             core: CoreVerifier::default(),
-            environment,
-        })
+            environment: Environment::stogas(),
+        }
     }
 
     fn verify_bundle<'py>(
@@ -72,17 +67,6 @@ fn verify_bundle_with_time<'py>(
     let output = verify_core_bundle(bundle, now_unix_ms, &Environment::stogas())
         .map_err(|error| PyValueError::new_err(error.to_string()))?;
     json_bytes(py, &output)
-}
-
-fn verifier_environment(max_node_age_ms: i64) -> PyResult<Environment> {
-    if !(MIN_NODE_EVIDENCE_AGE_MS..=MAX_NODE_EVIDENCE_AGE_MS).contains(&max_node_age_ms) {
-        return Err(PyValueError::new_err(
-            "max_node_age_ms must be between 60000 and 900000",
-        ));
-    }
-    let mut environment = Environment::stogas();
-    environment.max_node_evidence_age_ms = max_node_age_ms;
-    Ok(environment)
 }
 
 fn json_bytes<'py, T: serde::Serialize>(

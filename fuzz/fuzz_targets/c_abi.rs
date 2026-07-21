@@ -16,7 +16,7 @@ fuzz_target!(|data: &[u8]| {
     } else {
         data
     };
-    let session = stogas_verifier_new(180_000);
+    let session = stogas_verifier_new();
     if session.is_null() {
         return;
     }

@@ -34,9 +34,6 @@ enum Command {
         /// Exact Unix time in milliseconds, for tests and auditing only.
         #[arg(long, hide = true)]
         now_unix_ms: Option<i64>,
-        /// Maximum age of node evidence at signed bundle creation.
-        #[arg(long, default_value_t = 2, value_parser = clap::value_parser!(u16).range(1..=15))]
-        max_node_age_minutes: u16,
     },
     /// Run the verified loopback proxy.
     Serve {
@@ -48,9 +45,6 @@ enum Command {
         listen: String,
         #[arg(long, value_enum, default_value_t = Target::Production)]
         target: Target,
-        /// Maximum age of node evidence at signed bundle creation.
-        #[arg(long, default_value_t = 2, value_parser = clap::value_parser!(u16).range(1..=15))]
-        max_node_age_minutes: u16,
         /// How often to fetch and verify the latest bundle.
         #[arg(long, default_value_t = 60, value_parser = clap::value_parser!(u16).range(10..=840))]
         bundle_refresh_seconds: u16,
@@ -74,7 +68,6 @@ async fn main() -> Result<()> {
             json,
             target,
             now_unix_ms,
-            max_node_age_minutes,
         } => {
             let bytes = if bundle.as_os_str() == "-" {
                 let mut input = Vec::new();
@@ -88,7 +81,7 @@ async fn main() -> Result<()> {
             let output = verify_bundle(
                 &bytes,
                 now_unix_ms.unwrap_or_else(wall_clock_ms),
-                &environment(target, max_node_age_minutes),
+                &environment(target),
             )?;
             print_output(&output, json)?;
         }
@@ -97,7 +90,6 @@ async fn main() -> Result<()> {
             upstream,
             listen,
             target,
-            max_node_age_minutes,
             bundle_refresh_seconds,
             browser_origin,
         } => {
@@ -106,7 +98,6 @@ async fn main() -> Result<()> {
                 upstream,
                 listen,
                 target,
-                max_node_age_minutes,
                 bundle_refresh_seconds,
                 browser_origin,
             )
@@ -116,13 +107,11 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-fn environment(target: Target, max_node_age_minutes: u16) -> Environment {
-    let mut environment = match target {
+fn environment(target: Target) -> Environment {
+    match target {
         Target::Staging => Environment::staging(),
         Target::Production => Environment::stogas(),
-    };
-    environment.max_node_evidence_age_ms = i64::from(max_node_age_minutes) * 60 * 1000;
-    environment
+    }
 }
 
 async fn serve(
@@ -130,7 +119,6 @@ async fn serve(
     upstream: String,
     listen: String,
     target: Target,
-    max_node_age_minutes: u16,
     bundle_refresh_seconds: u16,
     browser_origin: Option<String>,
 ) -> Result<()> {
@@ -145,7 +133,7 @@ async fn serve(
         &bundle_url,
         &upstream,
         &listen,
-        environment(target, max_node_age_minutes),
+        environment(target),
         Duration::from_secs(u64::from(bundle_refresh_seconds)),
         browser_origin.as_deref(),
     )?)

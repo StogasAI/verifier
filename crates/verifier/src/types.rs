@@ -242,6 +242,7 @@ pub struct VerifiedRelease {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct VerifiedNode {
     pub accepted_cert_sha256: Vec<String>,
+    pub chip_id: String,
     pub drand_round: u64,
     pub drand_round_time_unix_ms: i64,
     pub evidence_age_ms: i64,
@@ -251,6 +252,7 @@ pub struct VerifiedNode {
     pub report_data: ReportData,
     pub report_data_sha512: String,
     pub release_measurement: String,
+    pub reported_tcb: String,
     pub tls_spki_sha256: String,
 }
 

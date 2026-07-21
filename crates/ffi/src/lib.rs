@@ -9,12 +9,10 @@ use serde::Serialize;
 use std::{
     ffi::{CString, c_char},
     panic::{AssertUnwindSafe, catch_unwind},
-    ptr, slice,
+    slice,
     sync::Mutex,
 };
-use stogas_verifier::{
-    Environment, MAX_NODE_EVIDENCE_AGE_MS, MIN_NODE_EVIDENCE_AGE_MS, VerificationOutput, Verifier,
-};
+use stogas_verifier::{Environment, VerificationOutput, Verifier};
 
 /// ABI version implemented by this library and its public header.
 pub const STOGAS_VERIFIER_ABI_VERSION: u32 = 1;
@@ -46,20 +44,14 @@ pub const extern "C" fn stogas_verifier_abi_version() -> u32 {
 
 /// Construct a verifier session.
 ///
-/// `max_node_age_ms` must be between one and fifteen minutes. A null result means the argument was
-/// invalid or allocation failed. The session is safe to call concurrently; each verification is
-/// serialized.
+/// A null result means allocation failed. The session is safe to call concurrently; each
+/// verification is serialized.
 #[unsafe(no_mangle)]
-pub extern "C" fn stogas_verifier_new(max_node_age_ms: i64) -> *mut StogasVerifier {
-    if !(MIN_NODE_EVIDENCE_AGE_MS..=MAX_NODE_EVIDENCE_AGE_MS).contains(&max_node_age_ms) {
-        return ptr::null_mut();
-    }
-    let mut environment = Environment::stogas();
-    environment.max_node_evidence_age_ms = max_node_age_ms;
+pub extern "C" fn stogas_verifier_new() -> *mut StogasVerifier {
     Box::into_raw(Box::new(StogasVerifier {
         session: Mutex::new(VerifierSession {
             core: Verifier::default(),
-            environment,
+            environment: Environment::stogas(),
         }),
     }))
 }
@@ -211,24 +203,25 @@ mod tests {
     }
 
     #[test]
-    fn rejects_invalid_constructor_policy() {
-        assert!(stogas_verifier_new(0).is_null());
-        assert!(stogas_verifier_new(25).is_null());
-    }
-
-    #[test]
     fn rejects_null_and_oversized_inputs_without_panicking() {
-        let verifier = stogas_verifier_new(3 * 60 * 1000);
+        let verifier = stogas_verifier_new();
         assert!(!verifier.is_null());
         // SAFETY: verifier is live for this synchronous call.
-        let null = unsafe { take_json(stogas_verifier_verify_bundle(verifier, ptr::null(), 1, 0)) };
+        let null = unsafe {
+            take_json(stogas_verifier_verify_bundle(
+                verifier,
+                std::ptr::null(),
+                1,
+                0,
+            ))
+        };
         assert_eq!(null["ok"], false);
         assert_eq!(null["error"], "bundle pointer is null");
         // SAFETY: the length is rejected before the pointer is read.
         let oversized = unsafe {
             take_json(stogas_verifier_verify_bundle(
                 verifier,
-                ptr::null(),
+                std::ptr::null(),
                 stogas_verifier::MAX_INPUT_BYTES + 1,
                 0,
             ))
@@ -243,7 +236,7 @@ mod tests {
     fn verifies_the_shared_real_staging_bundle_through_the_c_abi() {
         let bundle =
             include_bytes!("../../verifier/tests/fixtures/staging-bundle-sequence-1927.json");
-        let verifier = stogas_verifier_new(3 * 60 * 1000);
+        let verifier = stogas_verifier_new();
         assert!(!verifier.is_null());
         // SAFETY: the session and fixture bytes remain live for this synchronous call.
         let response = unsafe {

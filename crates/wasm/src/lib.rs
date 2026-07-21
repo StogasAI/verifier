@@ -3,8 +3,7 @@
 use serde::{Deserialize, Serialize};
 use stogas_offline_sigstore::{GithubPolicy, Subject, verify_github_attestation};
 use stogas_verifier::{
-    DEFAULT_NODE_EVIDENCE_AGE_MS, Environment, MAX_NODE_EVIDENCE_AGE_MS, MIN_NODE_EVIDENCE_AGE_MS,
-    Verifier as CoreVerifier, inspect_snp_quote as inspect_quote,
+    Environment, Verifier as CoreVerifier, inspect_snp_quote as inspect_quote,
     verify_amd_collateral_admission as verify_amd_collateral, verify_bundle as verify_core_bundle,
     verify_heartbeat_admission as verify_admission,
     verify_local_heartbeat_admission as verify_local_admission,
@@ -12,13 +11,6 @@ use stogas_verifier::{
     verify_staging_release_approval as verify_staging_release,
 };
 use wasm_bindgen::prelude::*;
-
-const DEFAULT_NODE_EVIDENCE_AGE_MS_F64: f64 = 120_000.0;
-const MIN_NODE_EVIDENCE_AGE_MS_F64: f64 = 60_000.0;
-const MAX_NODE_EVIDENCE_AGE_MS_F64: f64 = 900_000.0;
-const _: () = assert!(DEFAULT_NODE_EVIDENCE_AGE_MS == 120_000);
-const _: () = assert!(MIN_NODE_EVIDENCE_AGE_MS == 60_000);
-const _: () = assert!(MAX_NODE_EVIDENCE_AGE_MS == 900_000);
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -36,21 +28,18 @@ pub struct WasmVerifier {
 
 #[wasm_bindgen(js_class = Verifier)]
 impl WasmVerifier {
-    /// Construct a verifier with an optional node-freshness policy.
-    ///
-    /// # Errors
-    ///
-    /// Returns a JavaScript error when the freshness policy is invalid.
+    /// Construct a verifier for production or staging evidence.
     #[wasm_bindgen(constructor)]
-    #[allow(clippy::needless_pass_by_value)]
-    pub fn new(max_node_age_ms: Option<f64>, staging: Option<bool>) -> Result<Self, JsError> {
-        Ok(Self {
+    #[must_use]
+    pub fn new(staging: Option<bool>) -> Self {
+        Self {
             core: CoreVerifier::default(),
-            environment: verifier_environment(
-                max_node_age_ms.unwrap_or(DEFAULT_NODE_EVIDENCE_AGE_MS_F64),
-                staging.unwrap_or(false),
-            )?,
-        })
+            environment: if staging.unwrap_or(false) {
+                Environment::staging()
+            } else {
+                Environment::stogas()
+            },
+        }
     }
 
     /// Verify with one captured browser wall-clock value.
@@ -81,26 +70,6 @@ fn to_js_value<T: Serialize>(value: &T) -> Result<JsValue, JsError> {
     value
         .serialize(&serde_wasm_bindgen::Serializer::json_compatible())
         .map_err(|error| JsError::new(&error.to_string()))
-}
-
-fn verifier_environment(max_node_age_ms: f64, staging: bool) -> Result<Environment, JsError> {
-    if !max_node_age_ms.is_finite()
-        || max_node_age_ms.fract() != 0.0
-        || !(MIN_NODE_EVIDENCE_AGE_MS_F64..=MAX_NODE_EVIDENCE_AGE_MS_F64).contains(&max_node_age_ms)
-    {
-        return Err(JsError::new(
-            "max_node_age_ms must be an integer between 60000 and 900000",
-        ));
-    }
-    let mut environment = if staging {
-        Environment::staging()
-    } else {
-        Environment::stogas()
-    };
-    #[allow(clippy::cast_possible_truncation)]
-    let milliseconds = max_node_age_ms as i64;
-    environment.max_node_evidence_age_ms = milliseconds;
-    Ok(environment)
 }
 
 /// Verify a bundle using one captured platform wall-clock value.

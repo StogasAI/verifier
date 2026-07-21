@@ -8,16 +8,9 @@ import (
 	"os"
 	"strings"
 	"testing"
-	"time"
 )
 
 const stagingBundleNowUnixMS int64 = 1_784_414_117_082
-
-func TestRejectsInvalidOptions(t *testing.T) {
-	if _, err := NewWithOptions(Options{MaxNodeAge: 25 * time.Hour}); err == nil {
-		t.Fatal("expected invalid freshness policy to fail")
-	}
-}
 
 func TestRejectsMalformedBundle(t *testing.T) {
 	verifier, err := New()

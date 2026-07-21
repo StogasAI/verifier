@@ -23,17 +23,13 @@ pub const MAX_INPUT_BYTES: usize = 16 * 1024 * 1024;
 const MAX_NODES: usize = 1_024;
 const MAX_VENDOR_COLLATERAL: usize = 4_096;
 const MAX_BUNDLE_VALIDITY_MS: i64 = 15 * 60 * 1000;
+const MAX_BUNDLE_AGE_MS: i64 = 3 * 60 * 1000;
 const MAX_CLOCK_SKEW_MS: i64 = 60_000;
 const DRAND_CHAIN_HASH: &str = "52db9ba70e0cc0f6eaf7803dd07447a1f5477735fd3f661792ba94600c84e971";
 const DRAND_GENESIS_SECONDS: i64 = 1_692_803_367;
 const DRAND_PERIOD_SECONDS: i64 = 3;
 const DRAND_MAX_AGE_AT_QUOTE_VERIFICATION_MS: i64 = 2 * 60 * 1000;
-/// Default maximum node-proof age at the signed bundle creation time.
-pub const DEFAULT_NODE_EVIDENCE_AGE_MS: i64 = 2 * 60 * 1000;
-/// Strictest supported nonzero node-evidence policy exposed by packaged adapters.
-pub const MIN_NODE_EVIDENCE_AGE_MS: i64 = 60 * 1000;
-/// Longest node-evidence policy supported by the verifier.
-pub const MAX_NODE_EVIDENCE_AGE_MS: i64 = 15 * 60 * 1000;
+const MAX_NODE_EVIDENCE_AGE_MS: i64 = 2 * 60 * 1000;
 const AMD_COLLATERAL_VALIDITY_MS: i64 = 24 * 60 * 60 * 1000;
 const STOGAS_RELEASE_KEY_ID: &str = "stogas-ed25519-stamp-v1";
 const STOGAS_RELEASE_PUBLIC_KEY_DER_BASE64: &str =
@@ -69,13 +65,11 @@ struct StagingDevelopmentSubject {
 pub struct Environment {
     /// Trusted Stogas release signing keys, keyed by key id, as base64 SPKI DER.
     pub release_keys: BTreeMap<String, String>,
-    /// Maximum node drand age permitted at the signed bundle creation time.
-    pub max_node_evidence_age_ms: i64,
     allow_staging_development_provenance: bool,
 }
 
 impl Environment {
-    /// Standard Stogas trust roots and node-freshness policy.
+    /// Standard Stogas trust roots and freshness policy.
     #[must_use]
     pub fn stogas() -> Self {
         let release_keys = BTreeMap::from([(
@@ -84,7 +78,6 @@ impl Environment {
         )]);
         Self {
             release_keys,
-            max_node_evidence_age_ms: DEFAULT_NODE_EVIDENCE_AGE_MS,
             allow_staging_development_provenance: false,
         }
     }
@@ -463,6 +456,7 @@ pub fn verify_local_heartbeat_admission(
 
     let verified = VerifiedNode {
         accepted_cert_sha256: node.report_data.accepted_cert_sha256.clone(),
+        chip_id: node.chip_id.clone(),
         drand_round: node.report_data.drand.round,
         drand_round_time_unix_ms,
         evidence_age_ms,
@@ -472,6 +466,7 @@ pub fn verify_local_heartbeat_admission(
         report_data: node.report_data.clone(),
         report_data_sha512: node.report_data_sha512.clone(),
         release_measurement: node.release_measurement.clone(),
+        reported_tcb: node.reported_tcb.clone(),
         tls_spki_sha256: node.report_data.tls_spki_sha256.clone(),
     };
     Ok(VerifiedAdmission { node, verified })
@@ -747,13 +742,6 @@ fn verify_bundle_inner(
     let envelope: BundleEnvelope =
         serde_json::from_value(value).map_err(|error| Error::InvalidBundle(error.to_string()))?;
     validate_shape(&envelope)?;
-    if !(MIN_NODE_EVIDENCE_AGE_MS..=MAX_NODE_EVIDENCE_AGE_MS)
-        .contains(&environment.max_node_evidence_age_ms)
-    {
-        return Err(Error::InvalidBundle(
-            "node evidence age policy is outside the supported range".into(),
-        ));
-    }
     verify_envelope(&envelope, &signed_body)?;
 
     let created_at = parse_time(&envelope.body.created_at)?;
@@ -797,7 +785,6 @@ fn verify_bundle_inner(
         created_at,
         expires_at,
         now_unix_ms,
-        environment.max_node_evidence_age_ms,
         &launch_policies,
         &amd_stacks,
     )?;
@@ -823,7 +810,6 @@ fn verify_and_partition_nodes(
     created_at: i64,
     expires_at: i64,
     now_unix_ms: i64,
-    max_node_evidence_age_ms: i64,
     launch_policies: &BTreeMap<&str, &LaunchPolicy>,
     amd_stacks: &BTreeMap<String, AmdCollateralStack>,
 ) -> Result<(Vec<VerifiedNode>, Vec<ExcludedNode>), Error> {
@@ -840,7 +826,7 @@ fn verify_and_partition_nodes(
         )?;
         if verified
             .drand_round_time_unix_ms
-            .saturating_add(max_node_evidence_age_ms)
+            .saturating_add(MAX_NODE_EVIDENCE_AGE_MS)
             < created_at
         {
             excluded.push(ExcludedNode {
@@ -1243,6 +1229,7 @@ fn verify_node(
     )?;
     Ok(VerifiedNode {
         accepted_cert_sha256: node.report_data.accepted_cert_sha256.clone(),
+        chip_id: node.chip_id.clone(),
         drand_round: round,
         drand_round_time_unix_ms,
         evidence_age_ms: now_unix_ms.saturating_sub(drand_round_time_unix_ms).max(0),
@@ -1252,6 +1239,7 @@ fn verify_node(
         report_data: node.report_data.clone(),
         report_data_sha512: node.report_data_sha512.clone(),
         release_measurement: node.release_measurement.clone(),
+        reported_tcb: node.reported_tcb.clone(),
         tls_spki_sha256: node.report_data.tls_spki_sha256.clone(),
     })
 }
@@ -1912,6 +1900,11 @@ fn validate_time(created: i64, expires: i64, ttl_ms: u64, now: i64) -> Result<()
             "creation time is in the future".into(),
         ));
     }
+    if created < now - MAX_BUNDLE_AGE_MS {
+        return Err(Error::InvalidBundle(
+            "bundle was created more than three minutes ago".into(),
+        ));
+    }
     if expires <= now || expires <= created {
         return Err(Error::InvalidBundle(
             "bundle is expired or has an invalid interval".into(),
@@ -1921,7 +1914,7 @@ fn validate_time(created: i64, expires: i64, ttl_ms: u64, now: i64) -> Result<()
     let declared_ttl = i64::try_from(ttl_ms).unwrap_or(i64::MAX);
     if interval != declared_ttl {
         return Err(Error::InvalidBundle(format!(
-            "bundle interval ({interval} ms) differs from signed ttl_ms ({declared_ttl} ms)"
+            "bundle interval ({interval} ms) differs from ttl_ms ({declared_ttl} ms)"
         )));
     }
     if interval > MAX_BUNDLE_VALIDITY_MS {
@@ -2298,7 +2291,6 @@ mod tests {
                         .as_bytes(),
                 ),
             )]),
-            max_node_evidence_age_ms: DEFAULT_NODE_EVIDENCE_AGE_MS,
             allow_staging_development_provenance: false,
         }
     }
@@ -2399,7 +2391,7 @@ mod tests {
             + i64::try_from(round - 1).unwrap() * DRAND_PERIOD_SECONDS)
             * 1000;
         let quote_verified_at = round_time + DRAND_MAX_AGE_AT_QUOTE_VERIFICATION_MS;
-        let now = round_time + DEFAULT_NODE_EVIDENCE_AGE_MS;
+        let now = round_time + MAX_NODE_EVIDENCE_AGE_MS;
 
         assert_eq!(
             validate_node_evidence_time("node", round, quote_verified_at, now).unwrap(),

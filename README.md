@@ -96,9 +96,9 @@ A trusted result means that:
 - the independent Stogas release signature authorizes those same launch-policy bytes;
 - each trusted gateway presents a valid AMD SEV-SNP report for an authorized launch measurement;
 - the report binds that gateway's TLS, certificate-rotation, response-signing, and encryption keys;
-- AMD revocation data, certificates, and the bundle remain valid through bundle expiry; node drand freshness is evaluated at signed bundle creation under the caller's one-to-fifteen-minute policy.
+- the bundle was created within three minutes, each trusted gateway's drand evidence was no more than two minutes older, and the bundle remains valid for no more than 15 minutes.
 
-Cryptographically valid records that do not satisfy the selected freshness window are returned under `excluded_nodes`; they are never added to the trusted node set.
+Older valid records are returned under `excluded_nodes`; they are never added to the trusted node set.
 
 ## Sigstore support
 

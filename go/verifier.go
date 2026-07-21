@@ -13,7 +13,7 @@ package verifier
 #include <stddef.h>
 #include <stdint.h>
 typedef struct StogasVerifier StogasVerifier;
-StogasVerifier *stogas_verifier_new(int64_t max_node_age_ms);
+StogasVerifier *stogas_verifier_new(void);
 void stogas_verifier_free(StogasVerifier *verifier);
 char *stogas_verifier_verify_bundle(const StogasVerifier *verifier, const uint8_t *bundle, size_t bundle_len, int64_t now_unix_ms);
 void stogas_verifier_string_free(char *value);
@@ -29,16 +29,8 @@ import (
 	"unsafe"
 )
 
-const defaultMaxNodeAge = 2 * time.Minute
-
 // ErrClosed is returned after a verifier session has been closed.
 var ErrClosed = errors.New("stogas verifier is closed")
-
-// Options configures a verifier without moving security policy into Go.
-type Options struct {
-	// MaxNodeAge selects how old a proof may be at signed bundle creation. Zero uses two minutes.
-	MaxNodeAge time.Duration
-}
 
 // Verifier caches already-verified immutable release evidence in memory.
 type Verifier struct {
@@ -46,23 +38,11 @@ type Verifier struct {
 	handle *C.StogasVerifier
 }
 
-// New constructs a verifier with the default two-minute node-freshness policy.
+// New constructs a verifier with the Stogas freshness policy.
 func New() (*Verifier, error) {
-	return NewWithOptions(Options{})
-}
-
-// NewWithOptions constructs a verifier with an optional freshness policy.
-func NewWithOptions(options Options) (*Verifier, error) {
-	maxAge := options.MaxNodeAge
-	if maxAge == 0 {
-		maxAge = defaultMaxNodeAge
-	}
-	if maxAge%time.Millisecond != 0 || maxAge < time.Minute || maxAge > 15*time.Minute {
-		return nil, fmt.Errorf("max node age must be between one and fifteen minutes in whole milliseconds")
-	}
-	handle := C.stogas_verifier_new(C.int64_t(maxAge.Milliseconds()))
+	handle := C.stogas_verifier_new()
 	if handle == nil {
-		return nil, errors.New("native verifier rejected max node age")
+		return nil, errors.New("native verifier allocation failed")
 	}
 	return &Verifier{handle: handle}, nil
 }

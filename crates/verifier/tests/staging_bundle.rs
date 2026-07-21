@@ -314,20 +314,36 @@ fn enforces_bundle_time_and_resource_policy() {
             .to_string()
             .contains("exceeds the 900000 ms policy")
     );
+
+    let mut stale = fixture();
+    let created_at = unix_ms(&stale, "/body/created_at");
+    stale["body"]["expires_at"] = Value::String(
+        DateTime::from_timestamp_millis(created_at + 900_000)
+            .unwrap()
+            .to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+    );
+    stale["body"]["ttl_ms"] = Value::from(900_000);
+    let (stale, environment) = checksummed_fixture(stale);
+    assert!(
+        Verifier::default()
+            .verify_bundle(&stale, created_at + 180_001, &environment)
+            .unwrap_err()
+            .to_string()
+            .contains("more than three minutes ago")
+    );
 }
 
 #[test]
-fn stricter_callers_exclude_nodes_that_were_stale_at_bundle_creation() {
+fn excludes_nodes_more_than_two_minutes_older_than_bundle_creation() {
     let mut value = fixture();
-    let created_at = unix_ms(&value, "/body/created_at") + 61_000;
+    let created_at = unix_ms(&value, "/body/created_at") + 121_000;
     value["body"]["created_at"] = Value::String(
         DateTime::from_timestamp_millis(created_at)
             .unwrap()
             .to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
     );
     value["body"]["ttl_ms"] = Value::from(unix_ms(&value, "/body/expires_at") - created_at);
-    let (bundle, mut environment) = checksummed_fixture(value);
-    environment.max_node_evidence_age_ms = 60_000;
+    let (bundle, environment) = checksummed_fixture(value);
     let output = Verifier::default()
         .verify_bundle(&bundle, created_at, &environment)
         .unwrap();
