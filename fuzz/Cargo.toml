@@ -41,5 +41,12 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "e2ee_client"
+path = "fuzz_targets/e2ee_client.rs"
+test = false
+doc = false
+bench = false
+
 [workspace]
 members = ["."]

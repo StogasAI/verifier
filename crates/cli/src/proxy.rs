@@ -19,12 +19,17 @@ use sha2::{Digest as _, Sha256};
 use std::{
     fmt,
     net::SocketAddr,
-    sync::Arc,
+    sync::{Arc, mpsc::SyncSender},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
-use stogas_verifier::{Environment, VerificationOutput, VerifiedNode, Verifier};
-use tokio::sync::{Mutex, RwLock};
+use stogas_verifier::{
+    Environment, VerificationOutput, VerifiedNode, Verifier,
+    e2ee::{Recipient, recipients_from_verified_bundle},
+};
+use tokio::sync::{Mutex, RwLock, oneshot};
 use url::Url;
+
+use crate::{SecurityMode, e2ee};
 
 const MAX_BUNDLE_BYTES: usize = 16 * 1024 * 1024;
 const MAX_REQUEST_BYTES: usize = 16 * 1024 * 1024;
@@ -36,12 +41,28 @@ const MAX_BUNDLE_REFRESH_LEAD_SECONDS: i64 = 70;
 
 pub struct ServeConfig {
     bundle_url: Url,
+    bundle_fetcher: reqwest::Client,
+    upstream_client: reqwest::Client,
     upstream: Url,
     listen: SocketAddr,
     expected_host: String,
+    control_capability: String,
     environment: Environment,
     bundle_refresh_interval: Duration,
+    security: SecurityMode,
     browser: Option<BrowserAccess>,
+    client_capability: Option<String>,
+}
+
+pub struct ServeConfigInput<'a> {
+    pub bundle_url: &'a str,
+    pub upstream: &'a str,
+    pub listen: &'a str,
+    pub environment: Environment,
+    pub bundle_refresh_interval: Duration,
+    pub security: SecurityMode,
+    pub browser_origin: Option<&'a str>,
+    pub protect_loopback_path: bool,
 }
 
 struct BrowserAccess {
@@ -50,43 +71,66 @@ struct BrowserAccess {
 }
 
 impl ServeConfig {
-    pub(crate) fn new(
-        bundle_url: &str,
-        upstream: &str,
-        listen: &str,
-        environment: Environment,
-        bundle_refresh_interval: Duration,
-        browser_origin: Option<&str>,
-    ) -> Result<Self> {
-        let bundle_url = secure_bundle_url(bundle_url)?;
-        let upstream = secure_base_url(upstream, "upstream URL")?;
-        let listen: SocketAddr = listen.parse().context("invalid listen address")?;
+    pub fn new(input: ServeConfigInput<'_>) -> Result<Self> {
+        let bundle_url = secure_bundle_url(input.bundle_url)?;
+        let bundle_fetcher = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .connect_timeout(Duration::from_secs(5))
+            .timeout(Duration::from_secs(BUNDLE_FETCH_TIMEOUT_SECONDS))
+            .build()?;
+        let upstream_client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .connect_timeout(Duration::from_secs(5))
+            .build()?;
+        let upstream = secure_base_url(input.upstream, "upstream URL")?;
+        let listen: SocketAddr = input.listen.parse().context("invalid listen address")?;
         if !listen.ip().is_loopback() {
             bail!("serve listener must use a loopback address");
         }
-        let browser = match browser_origin {
+        let browser = match input.browser_origin {
             Some(origin) => Some(BrowserAccess {
                 origin: secure_browser_origin(origin)?,
-                capability: browser_capability(),
+                capability: random_capability(),
             }),
             None => None,
         };
         Ok(Self {
             bundle_url,
+            bundle_fetcher,
+            upstream_client,
             upstream,
             listen,
             expected_host: listen.to_string(),
-            environment,
-            bundle_refresh_interval,
+            control_capability: random_capability(),
+            environment: input.environment,
+            bundle_refresh_interval: input.bundle_refresh_interval,
+            security: input.security,
             browser,
+            client_capability: input.protect_loopback_path.then(random_capability),
         })
     }
 
     fn base_url(&self) -> String {
-        self.browser.as_ref().map_or_else(
+        let capability = self
+            .browser
+            .as_ref()
+            .map(|browser| browser.capability.as_str())
+            .or(self.client_capability.as_deref());
+        capability.map_or_else(
             || format!("http://{}/v1", self.expected_host),
-            |browser| format!("http://{}/{}/v1", self.expected_host, browser.capability),
+            |capability| format!("http://{}/{capability}/v1", self.expected_host),
         )
+    }
+
+    fn refresh_url(&self) -> String {
+        format!(
+            "http://{}/_stogas/{}/refresh",
+            self.expected_host, self.control_capability
+        )
+    }
+
+    fn refresh_path(&self) -> String {
+        format!("/_stogas/{}/refresh", self.control_capability)
     }
 }
 
@@ -112,7 +156,7 @@ fn secure_browser_origin(value: &str) -> Result<String> {
     Ok(url.origin().ascii_serialization())
 }
 
-fn browser_capability() -> String {
+fn random_capability() -> String {
     let mut bytes = [0_u8; 32];
     rand::rng().fill(&mut bytes);
     hex::encode(bytes)
@@ -150,6 +194,22 @@ fn secure_bundle_url(value: &str) -> Result<Url> {
 struct ActiveBundle {
     output: VerificationOutput,
     client: reqwest::Client,
+    recipients: Vec<Recipient>,
+    version: BundleVersion,
+}
+
+#[derive(Clone)]
+struct BundleVersion {
+    etag: Option<String>,
+    sha256: [u8; 32],
+}
+
+enum BundleFetch {
+    Changed {
+        bytes: Vec<u8>,
+        version: BundleVersion,
+    },
+    Unchanged,
 }
 
 struct ProxyState {
@@ -162,7 +222,10 @@ struct ProxyState {
 pub async fn serve(config: ServeConfig) -> Result<()> {
     let config = Arc::new(config);
     let mut verifier = Verifier::default();
-    let initial = fetch_active(&config, wall_clock_ms(), &mut verifier).await?;
+    let BundleFetch::Changed { bytes, version } = fetch_bundle(&config, None).await? else {
+        unreachable!("an initial bundle fetch cannot be unchanged");
+    };
+    let initial = activate_bundle(&config, &bytes, version, wall_clock_ms(), &mut verifier)?;
     let state = Arc::new(ProxyState {
         active: RwLock::new(Arc::new(initial)),
         config: Arc::clone(&config),
@@ -174,8 +237,71 @@ pub async fn serve(config: ServeConfig) -> Result<()> {
     let app = Router::new().fallback(any(proxy_request)).with_state(state);
     let listener = tokio::net::TcpListener::bind(config.listen).await?;
     println!("OpenAI base URL: {}", config.base_url());
+    println!("Bundle refresh URL: {}", config.refresh_url());
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
+        .await?;
+    Ok(())
+}
+
+pub struct EmbeddedEndpoints {
+    pub address: SocketAddr,
+    pub base_url: String,
+    pub refresh_path: String,
+}
+
+pub async fn serve_embedded(
+    mut config: ServeConfig,
+    shutdown: oneshot::Receiver<()>,
+    ready: SyncSender<Result<EmbeddedEndpoints, String>>,
+) -> Result<()> {
+    let listener = match tokio::net::TcpListener::bind(config.listen).await {
+        Ok(listener) => listener,
+        Err(error) => {
+            let _ = ready.send(Err(format!("could not bind managed transport: {error}")));
+            return Err(error.into());
+        }
+    };
+    let address = listener.local_addr()?;
+    config.listen = address;
+    config.expected_host = address.to_string();
+    let config = Arc::new(config);
+    let mut verifier = Verifier::default();
+    let initialized = async {
+        let BundleFetch::Changed { bytes, version } = fetch_bundle(&config, None).await? else {
+            unreachable!("an initial bundle fetch cannot be unchanged");
+        };
+        let initial = activate_bundle(&config, &bytes, version, wall_clock_ms(), &mut verifier)?;
+        let state = Arc::new(ProxyState {
+            active: RwLock::new(Arc::new(initial)),
+            config: Arc::clone(&config),
+            refresh_lock: Mutex::new(()),
+            verifier: Mutex::new(verifier),
+        });
+        tokio::spawn(refresh_loop(Arc::clone(&state)));
+        let app = Router::new().fallback(any(proxy_request)).with_state(state);
+        Ok::<_, anyhow::Error>(app)
+    }
+    .await;
+    let app = match initialized {
+        Ok(app) => app,
+        Err(error) => {
+            let _ = ready.send(Err(error.to_string()));
+            return Err(error);
+        }
+    };
+    let endpoints = EmbeddedEndpoints {
+        address,
+        base_url: config.base_url(),
+        refresh_path: config.refresh_path(),
+    };
+    if ready.send(Ok(endpoints)).is_err() {
+        return Ok(());
+    }
+    axum::serve(listener, app)
+        .with_graceful_shutdown(async {
+            let _ = shutdown.await;
+        })
         .await?;
     Ok(())
 }
@@ -227,6 +353,10 @@ fn replacement_refresh_at_with_lead(
         .bundle
         .expires_at_unix_ms
         .saturating_sub(bundle_lead_seconds * 1000);
+    if expiry_refresh <= now_unix_ms {
+        return now_unix_ms
+            .saturating_add(i64::try_from(MIN_REFRESH_RETRY_SECONDS * 1_000).unwrap_or(i64::MAX));
+    }
     scheduled
         .min(expiry_refresh)
         .max(now_unix_ms.saturating_add(1_000))
@@ -245,35 +375,83 @@ async fn sleep_until_wall_clock(deadline_ms: i64) {
     }
 }
 
-async fn refresh_once(state: &ProxyState) -> Result<()> {
+async fn refresh_once(state: &ProxyState) -> Result<bool> {
     let _guard = state.refresh_lock.lock().await;
+    let previous = state.active.read().await.version.clone();
+    let BundleFetch::Changed { bytes, version } =
+        fetch_bundle(&state.config, Some(&previous)).await?
+    else {
+        return Ok(false);
+    };
     let mut verifier = state.verifier.lock().await;
-    let candidate = fetch_active(&state.config, wall_clock_ms(), &mut verifier).await?;
+    let candidate = activate_bundle(
+        &state.config,
+        &bytes,
+        version,
+        wall_clock_ms(),
+        &mut verifier,
+    )?;
     drop(verifier);
     *state.active.write().await = Arc::new(candidate);
-    Ok(())
+    Ok(true)
 }
 
-async fn fetch_active(
+async fn fetch_bundle(
     config: &ServeConfig,
+    previous: Option<&BundleVersion>,
+) -> Result<BundleFetch> {
+    let mut request = config
+        .bundle_fetcher
+        .get(config.bundle_url.clone())
+        .header(reqwest::header::CACHE_CONTROL, "no-cache");
+    if let Some(etag) = previous.and_then(|version| version.etag.as_deref()) {
+        request = request.header(reqwest::header::IF_NONE_MATCH, etag);
+    }
+    let response = request.send().await?;
+    if response.status() == StatusCode::NOT_MODIFIED {
+        return Ok(BundleFetch::Unchanged);
+    }
+    let response = response.error_for_status()?;
+    let etag = response
+        .headers()
+        .get(reqwest::header::ETAG)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned);
+    let bytes = bounded_response(response, MAX_BUNDLE_BYTES).await?;
+    let sha256 = bundle_sha256(&bytes);
+    if previous.is_some_and(|version| version_matches(version, sha256)) {
+        return Ok(BundleFetch::Unchanged);
+    }
+    Ok(BundleFetch::Changed {
+        bytes,
+        version: BundleVersion { etag, sha256 },
+    })
+}
+
+fn bundle_sha256(bytes: &[u8]) -> [u8; 32] {
+    Sha256::digest(bytes).into()
+}
+
+fn version_matches(version: &BundleVersion, sha256: [u8; 32]) -> bool {
+    version.sha256 == sha256
+}
+
+fn activate_bundle(
+    config: &ServeConfig,
+    bytes: &[u8],
+    version: BundleVersion,
     now_unix_ms: i64,
     verifier: &mut Verifier,
 ) -> Result<ActiveBundle> {
-    let fetcher = reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
-        .connect_timeout(Duration::from_secs(5))
-        .timeout(Duration::from_secs(BUNDLE_FETCH_TIMEOUT_SECONDS))
-        .build()?;
-    let response = fetcher
-        .get(config.bundle_url.clone())
-        .header(reqwest::header::CACHE_CONTROL, "no-cache")
-        .send()
-        .await?
-        .error_for_status()?;
-    let bytes = bounded_response(response, MAX_BUNDLE_BYTES).await?;
-    let output = verifier.verify_bundle(&bytes, now_unix_ms, &config.environment)?;
+    let output = verifier.verify_bundle(bytes, now_unix_ms, &config.environment)?;
     let client = pinned_client(&output.bundle.nodes)?;
-    Ok(ActiveBundle { output, client })
+    let recipients = recipients_from_verified_bundle(&output)?;
+    Ok(ActiveBundle {
+        output,
+        client,
+        recipients,
+        version,
+    })
 }
 
 async fn bounded_response(response: reqwest::Response, limit: usize) -> Result<Vec<u8>> {
@@ -325,6 +503,29 @@ async fn proxy_request_inner(
     }
 
     let origin = request.headers().get(header::ORIGIN);
+    if request.uri().path() == state.config.refresh_path() {
+        if request.method() != Method::POST || origin.is_some() {
+            return Err((StatusCode::METHOD_NOT_ALLOWED, "invalid refresh request"));
+        }
+        let changed = refresh_once(state)
+            .await
+            .map_err(|_| (StatusCode::BAD_GATEWAY, "bundle refresh failed"))?;
+        if wall_clock_ms() >= state.active.read().await.output.bundle.expires_at_unix_ms {
+            return Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                "verified bundle remains expired",
+            ));
+        }
+        return Ok(Response::builder()
+            .status(if changed {
+                StatusCode::OK
+            } else {
+                StatusCode::NO_CONTENT
+            })
+            .header(header::CACHE_CONTROL, "no-store")
+            .body(Body::empty())
+            .unwrap_or_else(|_| Response::new(Body::empty())));
+    }
     let browser = match (origin, &state.config.browser) {
         (Some(origin), Some(browser)) if origin.to_str().ok() == Some(browser.origin.as_str()) => {
             Some(browser)
@@ -332,7 +533,12 @@ async fn proxy_request_inner(
         (Some(_), _) => return Err((StatusCode::FORBIDDEN, "browser origin is not allowed")),
         (None, _) => None,
     };
-    let upstream_path = routed_path(request.uri().path(), browser)?.to_owned();
+    let upstream_path = routed_path(
+        request.uri().path(),
+        browser,
+        state.config.client_capability.as_deref(),
+    )?
+    .to_owned();
     if request.method() == Method::OPTIONS && browser.is_some() {
         return browser_preflight(&request);
     }
@@ -340,7 +546,8 @@ async fn proxy_request_inner(
         return Err((StatusCode::NOT_FOUND, "only /v1/* is available"));
     }
     let active = state.active.read().await.clone();
-    if wall_clock_ms() >= active.output.bundle.expires_at_unix_ms {
+    let now_unix_ms = wall_clock_ms();
+    if now_unix_ms >= active.output.bundle.expires_at_unix_ms {
         return Err((StatusCode::SERVICE_UNAVAILABLE, "verified bundle expired"));
     }
 
@@ -348,10 +555,34 @@ async fn proxy_request_inner(
     let body = to_bytes(body, MAX_REQUEST_BYTES)
         .await
         .map_err(|_| (StatusCode::PAYLOAD_TOO_LARGE, "request body is too large"))?;
-    send_upstream(state, &active, &parts, &upstream_path, body)
+    if state.config.security != SecurityMode::Tls && is_inference_path(&upstream_path) {
+        let client = if state.config.security == SecurityMode::Both {
+            &active.client
+        } else {
+            &state.config.upstream_client
+        };
+        return e2ee::send(e2ee::RequestContext {
+            client,
+            upstream_origin: &state.config.upstream,
+            path: &upstream_path,
+            parts: &parts,
+            body,
+            bundle_sha256: &active.version.sha256,
+            recipients: &active.recipients,
+            now_unix_ms,
+        })
+        .await;
+    }
+
+    let client = if state.config.security == SecurityMode::E2ee {
+        &state.config.upstream_client
+    } else {
+        &active.client
+    };
+    send_upstream(client, &state.config.upstream, &parts, &upstream_path, body)
         .await
         .map_err(|error| {
-            if error.is_connect() {
+            if error.is_connect() && state.config.security != SecurityMode::E2ee {
                 (StatusCode::BAD_GATEWAY, "upstream TLS verification failed")
             } else {
                 (StatusCode::BAD_GATEWAY, "upstream request failed")
@@ -359,14 +590,22 @@ async fn proxy_request_inner(
         })
 }
 
+fn is_inference_path(path: &str) -> bool {
+    matches!(path, "/v1/chat/completions" | "/v1/responses")
+}
+
 fn routed_path<'a>(
     path: &'a str,
     browser: Option<&BrowserAccess>,
+    client_capability: Option<&str>,
 ) -> Result<&'a str, (StatusCode, &'static str)> {
-    let Some(browser) = browser else {
+    let capability = browser
+        .map(|browser| browser.capability.as_str())
+        .or(client_capability);
+    let Some(capability) = capability else {
         return Ok(path);
     };
-    let prefix = format!("/{}", browser.capability);
+    let prefix = format!("/{capability}");
     path.strip_prefix(&prefix)
         .filter(|path| path.starts_with("/v1/"))
         .ok_or((StatusCode::NOT_FOUND, "invalid browser base URL"))
@@ -456,16 +695,16 @@ fn add_browser_response_headers(response: &mut Response<Body>, origin: &str) {
 }
 
 async fn send_upstream(
-    state: &ProxyState,
-    active: &ActiveBundle,
+    client: &reqwest::Client,
+    upstream_origin: &Url,
     parts: &axum::http::request::Parts,
     upstream_path: &str,
     body: Bytes,
 ) -> reqwest::Result<Response<Body>> {
-    let mut url = state.config.upstream.clone();
+    let mut url = upstream_origin.clone();
     url.set_path(upstream_path);
     url.set_query(parts.uri.query());
-    let mut request = active.client.request(parts.method.clone(), url);
+    let mut request = client.request(parts.method.clone(), url);
     for (name, value) in &parts.headers {
         if !is_hop_by_hop(name)
             && !is_local_browser_header(name)
@@ -850,17 +1089,29 @@ mod tests {
             .verify_bundle(&bundle, STAGING_BUNDLE_VERIFIED_AT_MS, &environment)
             .unwrap();
         output.bundle.expires_at_unix_ms = expires_at_unix_ms;
+        let version = BundleVersion {
+            etag: None,
+            sha256: bundle_sha256(&bundle),
+        };
+        let recipients = recipients_from_verified_bundle(&output).unwrap();
         ProxyState {
-            active: RwLock::new(Arc::new(ActiveBundle { output, client })),
+            active: RwLock::new(Arc::new(ActiveBundle {
+                output,
+                client,
+                recipients,
+                version,
+            })),
             config: Arc::new(
-                ServeConfig::new(
+                ServeConfig::new(ServeConfigInput {
                     bundle_url,
                     upstream,
-                    "127.0.0.1:8787",
+                    listen: "127.0.0.1:8787",
                     environment,
-                    Duration::from_mins(1),
+                    bundle_refresh_interval: Duration::from_mins(1),
+                    security: SecurityMode::Tls,
                     browser_origin,
-                )
+                    protect_loopback_path: false,
+                })
                 .unwrap(),
             ),
             refresh_lock: Mutex::new(()),
@@ -1031,6 +1282,34 @@ mod tests {
                 .0,
             StatusCode::NOT_FOUND
         );
+        let refresh_path = state.config.refresh_path();
+        let refresh_get = Request::builder()
+            .uri(&refresh_path)
+            .header(header::HOST, "127.0.0.1:8787")
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(
+            proxy_request_inner(&state, refresh_get)
+                .await
+                .unwrap_err()
+                .0,
+            StatusCode::METHOD_NOT_ALLOWED
+        );
+        let browser_refresh = Request::builder()
+            .method(Method::POST)
+            .uri(&refresh_path)
+            .header(header::HOST, "127.0.0.1:8787")
+            .header(header::ORIGIN, "https://client.example")
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(
+            proxy_request_inner(&state, browser_refresh)
+                .await
+                .unwrap_err()
+                .0,
+            StatusCode::METHOD_NOT_ALLOWED
+        );
+        assert!(state.config.refresh_url().ends_with(&refresh_path));
 
         let expired = proxy_state(
             reqwest::Client::new(),
@@ -1149,14 +1428,16 @@ mod tests {
     #[test]
     fn rejects_non_loopback_listener_and_non_https_origins() {
         assert!(
-            ServeConfig::new(
-                "https://evidence.example",
-                "https://api.example",
-                "0.0.0.0:8787",
-                Environment::stogas(),
-                Duration::from_mins(1),
-                None,
-            )
+            ServeConfig::new(ServeConfigInput {
+                bundle_url: "https://evidence.example",
+                upstream: "https://api.example",
+                listen: "0.0.0.0:8787",
+                environment: Environment::stogas(),
+                bundle_refresh_interval: Duration::from_mins(1),
+                security: SecurityMode::Tls,
+                browser_origin: None,
+                protect_loopback_path: false,
+            })
             .is_err()
         );
         assert!(secure_base_url("http://api.example", "upstream URL").is_err());
@@ -1208,5 +1489,19 @@ mod tests {
                     .contains(&lead_seconds)
             );
         }
+        assert_eq!(
+            replacement_refresh_at_with_lead(&output, 950_000, Duration::from_secs(1), 70),
+            954_000
+        );
+    }
+
+    #[test]
+    fn identical_bundle_bytes_reuse_the_active_verification() {
+        let version = BundleVersion {
+            etag: Some("\"bundle-etag\"".into()),
+            sha256: bundle_sha256(b"same bundle"),
+        };
+        assert!(version_matches(&version, bundle_sha256(b"same bundle")));
+        assert!(!version_matches(&version, bundle_sha256(b"new bundle")));
     }
 }

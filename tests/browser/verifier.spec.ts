@@ -198,7 +198,7 @@ test('verifies a real full staging bundle with networking disabled', async ({ pa
 			const api = (
 				globalThis as typeof globalThis & {
 					stogasVerifierBindings: {
-						Verifier: new (maxNodeAgeMs?: number) => {
+						Verifier: new () => {
 							free(): void;
 							verify_bundle(bundle: Uint8Array): {
 								bundle: { nodes: unknown[]; releases: unknown[]; sequence: number };
@@ -207,7 +207,7 @@ test('verifies a real full staging bundle with networking disabled', async ({ pa
 					};
 				}
 			).stogasVerifierBindings;
-			const verifier = new api.Verifier(180_000);
+			const verifier = new api.Verifier();
 			try {
 				const output = verifier.verify_bundle(new TextEncoder().encode(fixture));
 				return {
@@ -237,6 +237,77 @@ test('verifies a real full staging bundle with networking disabled', async ({ pa
 		releases: 1,
 		sequence: 1927
 	});
+	expect(requests).toEqual([]);
+});
+
+test('seals browser inference to every member of the active verified bundle', async ({ page }) => {
+	const requests = await initialize(page);
+	const fixture = await readFile(STAGING_BUNDLE_FIXTURE, 'utf8');
+	const result = await page.evaluate(
+		({ fixture, now }) => {
+			const platformNow = Date.now;
+			Date.now = () => now;
+			const api = (
+				globalThis as typeof globalThis & {
+					stogasVerifierBindings: {
+						Verifier: new () => {
+							free(): void;
+							seal_e2ee_request(
+								path: string,
+								apiKey: string,
+								body: Uint8Array,
+								accept?: string
+							): {
+								body: Uint8Array;
+								free(): void;
+								request_id: string;
+								transcript_sha256: string;
+							};
+							verify_bundle(bundle: Uint8Array): unknown;
+						};
+					};
+				}
+			).stogasVerifierBindings;
+			const verifier = new api.Verifier();
+			try {
+				verifier.verify_bundle(new TextEncoder().encode(fixture));
+				const encrypted = verifier.seal_e2ee_request(
+					'/v1/responses',
+					'sk-never-outer',
+					new TextEncoder().encode('{"model":"gpt-5","input":"never-outer"}'),
+					'application/json'
+				);
+				try {
+					const text = new TextDecoder().decode(encrypted.body);
+					const envelope = JSON.parse(text).stogas_e2ee;
+					return {
+						containsAPIKey: text.includes('sk-never-outer'),
+						containsPrompt: text.includes('never-outer'),
+						recipients: envelope.recipients.length,
+						requestID: encrypted.request_id,
+						transcriptSHA256: encrypted.transcript_sha256,
+						version: envelope.version
+					};
+				} finally {
+					encrypted.free();
+				}
+			} finally {
+				verifier.free();
+				Date.now = platformNow;
+			}
+		},
+		{ fixture, now: STAGING_BUNDLE_NOW_UNIX_MS }
+	);
+	expect(result).toMatchObject({
+		containsAPIKey: false,
+		containsPrompt: false,
+		recipients: 1,
+		version: 1
+	});
+	expect(result.requestID).toMatch(
+		/^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/
+	);
+	expect(result.transcriptSHA256).toMatch(/^[0-9a-f]{64}$/);
 	expect(requests).toEqual([]);
 });
 

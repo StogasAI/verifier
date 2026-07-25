@@ -1,6 +1,6 @@
 [package]
 name = "stogas-verifier-python"
-description = "Python bindings for stogas-verifier"
+description = "Python bindings for the Stogas SDK"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -16,6 +16,7 @@ pyo3 = { version = "0.26.0", features = ["abi3-py310", "extension-module"] }
 serde_json.workspace = true
 serde.workspace = true
 stogas-verifier = { path = "../../crates/verifier" }
+stogas-sdk = { package = "stogas", path = "../../crates/cli" }
 
 [lints]
 workspace = true

@@ -1,12 +1,11 @@
-import { readFileSync } from 'node:fs';
+import wasmModule from '../../pkg/browser/stogas_verifier_bg.wasm';
 import {
 	Verifier as CoreVerifier,
 	initSync,
 	verify_bundle
 } from '../../pkg/browser/stogas_verifier.js';
 
-const wasm = readFileSync(new URL('../../pkg/browser/stogas_verifier_bg.wasm', import.meta.url));
-initSync({ module: wasm });
+initSync({ module: wasmModule });
 
 export { verify_bundle };
 export { StogasTransport } from '../browser/browser.js';

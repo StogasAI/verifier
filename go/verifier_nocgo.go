@@ -13,6 +13,39 @@ var ErrNativeLibraryUnavailable = errors.New("stogas verifier requires cgo and a
 // ErrClosed is retained across cgo build modes for stable error handling.
 var ErrClosed = errors.New("stogas verifier is closed")
 
+// ErrTransportClosed is retained across cgo build modes for stable error handling.
+var ErrTransportClosed = errors.New("stogas transport is closed")
+
+// TransportOptions mirrors the cgo SDK surface.
+type TransportOptions struct {
+	Staging                      bool
+	Security                     string
+	BundleRefreshIntervalSeconds uint16
+	BaseURL                      string
+	BundleURL                    string
+}
+
+// Transport is unavailable without cgo.
+type Transport struct{}
+
+// NewTransport reports that the packaged native SDK is unavailable.
+func NewTransport(TransportOptions) (*Transport, error) {
+	return nil, ErrNativeLibraryUnavailable
+}
+
+// BaseURL reports that the packaged native SDK is unavailable.
+func (*Transport) BaseURL() (string, error) {
+	return "", ErrNativeLibraryUnavailable
+}
+
+// RefreshBundle reports that the packaged native SDK is unavailable.
+func (*Transport) RefreshBundle() (bool, error) {
+	return false, ErrNativeLibraryUnavailable
+}
+
+// Close is a no-op for an unavailable transport.
+func (*Transport) Close() error { return nil }
+
 // Verifier is unavailable without cgo.
 type Verifier struct{}
 
@@ -21,6 +54,16 @@ func New() (*Verifier, error) { return nil, ErrNativeLibraryUnavailable }
 
 // VerifyBundle reports that the packaged native verifier is unavailable.
 func (*Verifier) VerifyBundle([]byte) (json.RawMessage, error) {
+	return nil, ErrNativeLibraryUnavailable
+}
+
+// VerifyResponseProof reports that the packaged native verifier is unavailable.
+func (*Verifier) VerifyResponseProof([]byte, []byte, []byte, string) (json.RawMessage, error) {
+	return nil, ErrNativeLibraryUnavailable
+}
+
+// VerifyHistoricalResponseProof reports that the packaged native verifier is unavailable.
+func (*Verifier) VerifyHistoricalResponseProof([]byte, []byte, []byte, []byte, string) (json.RawMessage, error) {
 	return nil, ErrNativeLibraryUnavailable
 }
 

@@ -1,0 +1,39 @@
+{
+  "schema": "stogas.e2ee.interop.v1",
+  "now_unix_ms": 1800000000000,
+  "node_private_key_hex": "0000000000000000000000000000000000000000000000000000000000000001",
+  "request": {
+    "stogas_e2ee": {
+      "version": 1,
+      "request_id": "018f4f70-7c88-7b9a-baf8-31a93d2cf613",
+      "bundle_sha256": "1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef",
+      "expires_at_ms": 1800000060000,
+      "recipients": [
+        {
+          "key_id": "aYvqY9xEo0RmP_FCmuoQhC3ye2uZHvJYZrLGwCzcxb4",
+          "encapsulated_key": "BC6EFw3jBldOOwVXfXrwTiuOFg9Jcru98NRznuHadeW3e418vv4q3zl6XwGoPS2hMUCbz3qgpZGBpTaGdWF3oa0",
+          "wrapped_key": "oTQh6EebyhRrL-8uriXEPNbbvdhXeLgzvE-Z7S5bXU3bGKw7BhTdjEsHPXwRY4g-"
+        }
+      ],
+      "ciphertext": "YLS6v4uQc3F29TjHZjwNGYOPJIyzVBQ_3j7ZtD7cg9uIHTzZxWz-Kkf0_NsrV31bNR7J5Y2aWFY74xvpF6T58MfcAZt6Dsw7EQ7rpA3ZVMY2MpJKSd3zzajQEKi6AUW_RT_b3OpCeZ86EeT0yKFUkkUJ2NhaM9xjEmAb1mYDwA9NLcXnR3ehYMSi364l4G4sDhkp1tt7uw"
+    }
+  },
+  "expected_inner": {
+    "api_key": "sk-stogas-interop",
+    "accept": "application/json",
+    "return_extra_fields": "provider",
+    "body": {
+      "model": "gpt-5",
+      "input": "interop"
+    }
+  },
+  "response_metadata": {
+    "status": 418,
+    "content_type": "application/json",
+    "headers": {
+      "X-Stogas-Test": "interop"
+    }
+  },
+  "response_body_base64": "eyJ2ZXJpZmllZCI6InJ1c3QtZ28ifQ",
+  "response_base64": "U1RHRQECAAAAAAAAAAAAAABmiFGtD3PV0zYO-GdZEFtNZuyP2C7iIW4lrZ32a6AINZA0Ziy31jt-r_XweJvQTgHuSrj9BWo-mpWpxR962srzgwujD2ONvjXNYsqNH3QsvmRoW54ZUfQF1ap_FrN2z5x1XnKhAEeZAQAAAAAAAAABAAAAJogscZh6YpMq_z0mbhf1HWb684Tp4Hf9HiE_JZQj6oxCTemq0mnsAwAAAAAAAAACAAAAEP3myZB7R6qkCr5oWr2Cuf0"
+}

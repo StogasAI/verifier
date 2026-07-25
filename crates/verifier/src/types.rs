@@ -111,6 +111,7 @@ pub struct HeartbeatCandidate {
     pub quote_generated_at: String,
     pub report_data: ReportData,
     pub report_data_sha512: String,
+    pub signature: String,
 }
 
 /// Deterministic inputs for verifying one Control heartbeat admission.
@@ -218,6 +219,7 @@ pub struct VerifiedAmdCollateral {
 #[serde(rename_all = "snake_case")]
 pub enum ReleaseProvenance {
     Github,
+    #[cfg(feature = "staging")]
     Staging,
 }
 
@@ -279,4 +281,44 @@ pub struct VerifiedBundle {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct VerificationOutput {
     pub bundle: VerifiedBundle,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct NodeLedgerRecord {
+    pub admitted_at: String,
+    pub admission: NodeLedgerAdmission,
+    pub certificate_history: Vec<NodeLedgerCertificate>,
+    pub generation_id: String,
+    pub release: AllowedIgvm,
+    pub schema: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct NodeLedgerCertificate {
+    pub first_observed_at: String,
+    pub sha256: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct NodeLedgerAdmission {
+    pub cert_expires_at: String,
+    pub chip_id: String,
+    pub collateral: Vec<VendorCollateral>,
+    pub quote: String,
+    pub quote_verified_at: String,
+    pub region: String,
+    pub report_data: ReportData,
+    pub report_data_sha512: String,
+    pub reported_tcb: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct VerifiedNodeLedgerRecord {
+    pub admitted_at_unix_ms: i64,
+    pub generation_id: String,
+    pub node: VerifiedNode,
+    pub release: VerifiedRelease,
 }

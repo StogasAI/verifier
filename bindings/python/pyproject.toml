@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "stogas-verifier"
-description = "Offline verifier for Stogas confidential-gateway trust bundles"
+description = "Stogas SDK for verified confidential AI connections and evidence"
 requires-python = ">=3.10"
 dynamic = ["version"]
 license = "Apache-2.0"
@@ -19,7 +19,7 @@ classifiers = [
 ]
 
 [project.urls]
-Documentation = "https://stogas.ai/docs/confidential-verification"
+Documentation = "https://stogas.ai/docs/verification"
 Issues = "https://github.com/StogasAI/verifier/issues"
 Repository = "https://github.com/StogasAI/verifier"
 

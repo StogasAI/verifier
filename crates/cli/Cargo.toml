@@ -1,6 +1,11 @@
 [package]
-name = "stogas-verify"
-description = "Offline Stogas bundle verifier and loopback proxy"
+name = "stogas"
+description = "The Stogas SDK for verified confidential AI connections"
+readme = "../../README.md"
+homepage = "https://github.com/StogasAI/verifier"
+documentation = "https://docs.rs/stogas"
+keywords = ["confidential-computing", "sev-snp", "openai", "e2ee"]
+categories = ["api-bindings", "authentication", "cryptography"]
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -11,9 +16,17 @@ repository.workspace = true
 name = "stogas-verify"
 path = "src/main.rs"
 
+[lib]
+name = "stogas"
+path = "src/lib.rs"
+
+[features]
+staging = ["stogas-verifier/staging"]
+
 [dependencies]
 anyhow = "1.0.99"
 axum = "0.8.4"
+base64.workspace = true
 clap = { version = "4.5.47", features = ["derive"] }
 futures-util = "0.3.31"
 hex.workspace = true
@@ -23,7 +36,7 @@ rustls = { version = "0.23.32", default-features = false, features = ["ring", "s
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
-stogas-verifier = { path = "../verifier" }
+stogas-verifier = { path = "../verifier", version = "0.1.0-alpha.1" }
 tokio = { version = "1.47.1", features = ["fs", "io-util", "macros", "net", "rt-multi-thread", "signal", "time"] }
 url = "2.5.7"
 webpki-roots = "1.0.2"

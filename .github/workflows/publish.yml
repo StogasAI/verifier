@@ -158,3 +158,12 @@ jobs:
             sleep 10
           done
           publish_if_absent stogas-verifier
+          for attempt in $(seq 1 30); do
+            cargo info "stogas-verifier@$version" --registry crates-io >/dev/null 2>&1 && break
+            if [ "$attempt" = 30 ]; then
+              echo 'stogas-verifier did not become visible on crates.io' >&2
+              exit 1
+            fi
+            sleep 10
+          done
+          publish_if_absent stogas

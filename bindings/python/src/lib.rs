@@ -2,12 +2,76 @@
 
 use pyo3::{exceptions::PyValueError, prelude::*, types::PyBytes};
 use std::time::{SystemTime, UNIX_EPOCH};
-use stogas_verifier::{Environment, Verifier as CoreVerifier, verify_bundle as verify_core_bundle};
+use stogas_sdk::{SecurityMode, Transport as ManagedTransport, TransportOptions};
+use stogas_verifier::{
+    Environment, HistoricalResponseProofInput, Verifier as CoreVerifier,
+    verify_bundle as verify_core_bundle,
+};
 
 #[pyclass(name = "Verifier")]
 struct PythonVerifier {
     core: CoreVerifier,
     environment: Environment,
+}
+
+#[pyclass(name = "Transport")]
+struct PythonTransport {
+    inner: Option<ManagedTransport>,
+}
+
+#[pymethods]
+impl PythonTransport {
+    #[new]
+    #[pyo3(signature = (
+        security = "tls",
+        bundle_refresh_interval_seconds = 300,
+        base_url = None,
+        bundle_url = None
+    ))]
+    fn new(
+        security: &str,
+        bundle_refresh_interval_seconds: u16,
+        base_url: Option<String>,
+        bundle_url: Option<String>,
+    ) -> PyResult<Self> {
+        let defaults = TransportOptions::default();
+        let options = TransportOptions {
+            security: match security {
+                "tls" => SecurityMode::Tls,
+                "e2ee" => SecurityMode::E2ee,
+                "both" => SecurityMode::Both,
+                _ => return Err(PyValueError::new_err("security must be tls, e2ee, or both")),
+            },
+            bundle_refresh_interval: std::time::Duration::from_secs(u64::from(
+                bundle_refresh_interval_seconds,
+            )),
+            base_url: base_url.unwrap_or(defaults.base_url),
+            bundle_url: bundle_url.unwrap_or(defaults.bundle_url),
+        };
+        let inner = ManagedTransport::start(&options)
+            .map_err(|error| PyValueError::new_err(error.to_string()))?;
+        Ok(Self { inner: Some(inner) })
+    }
+
+    #[getter]
+    fn base_url(&self) -> PyResult<&str> {
+        self.inner
+            .as_ref()
+            .map(ManagedTransport::base_url)
+            .ok_or_else(|| PyValueError::new_err("Stogas transport is closed"))
+    }
+
+    fn refresh_bundle(&self) -> PyResult<bool> {
+        self.inner
+            .as_ref()
+            .ok_or_else(|| PyValueError::new_err("Stogas transport is closed"))?
+            .refresh_bundle()
+            .map_err(|error| PyValueError::new_err(error.to_string()))
+    }
+
+    fn close(&mut self) {
+        self.inner.take();
+    }
 }
 
 #[pymethods]
@@ -26,6 +90,53 @@ impl PythonVerifier {
         bundle: &[u8],
     ) -> PyResult<Bound<'py, PyBytes>> {
         self.verify_bundle_with_time(py, bundle, wall_clock_ms()?)
+    }
+
+    #[pyo3(signature = (proof, request_body, response_body, e2ee_transcript_sha256=None))]
+    fn verify_response_proof<'py>(
+        &self,
+        py: Python<'py>,
+        proof: &[u8],
+        request_body: &[u8],
+        response_body: &[u8],
+        e2ee_transcript_sha256: Option<&str>,
+    ) -> PyResult<Bound<'py, PyBytes>> {
+        let output = self
+            .core
+            .verify_response_proof(
+                proof,
+                request_body,
+                response_body,
+                e2ee_transcript_sha256,
+                wall_clock_ms()?,
+            )
+            .map_err(|error| PyValueError::new_err(error.to_string()))?;
+        json_bytes(py, &output)
+    }
+
+    #[pyo3(signature = (proof, request_body, response_body, ledger, e2ee_transcript_sha256=None))]
+    fn verify_historical_response_proof<'py>(
+        &self,
+        py: Python<'py>,
+        proof: &[u8],
+        request_body: &[u8],
+        response_body: &[u8],
+        ledger: &[u8],
+        e2ee_transcript_sha256: Option<&str>,
+    ) -> PyResult<Bound<'py, PyBytes>> {
+        let output = self
+            .core
+            .verify_historical_response_proof(&HistoricalResponseProofInput {
+                proof_bytes: proof,
+                request_body,
+                response_body,
+                expected_e2ee_transcript_sha256: e2ee_transcript_sha256,
+                now_unix_ms: wall_clock_ms()?,
+                ledger_bytes: ledger,
+                environment: &self.environment,
+            })
+            .map_err(|error| PyValueError::new_err(error.to_string()))?;
+        json_bytes(py, &output)
     }
 }
 
@@ -81,5 +192,6 @@ fn json_bytes<'py, T: serde::Serialize>(
 #[pymodule]
 fn _stogas_verifier(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<PythonVerifier>()?;
+    module.add_class::<PythonTransport>()?;
     module.add_function(wrap_pyfunction!(verify_bundle, module)?)
 }

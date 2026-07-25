@@ -77,7 +77,7 @@ jobs:
           targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32
       - name: Build CLI and C ABI
-        run: cargo build --locked --release --target ${{ matrix.target }} --package stogas-verify --package stogas-verifier-ffi
+        run: cargo build --locked --release --target ${{ matrix.target }} --package stogas --package stogas-verifier-ffi
       - name: Exercise the exact release CLI
         shell: bash
         run: |
@@ -332,6 +332,10 @@ jobs:
           cargo package --locked --no-verify \
             --config 'patch.crates-io.stogas-offline-sigstore.path="crates/offline-sigstore"' \
             --package stogas-verifier
+          cargo package --locked --no-verify \
+            --config 'patch.crates-io.stogas-offline-sigstore.path="crates/offline-sigstore"' \
+            --config 'patch.crates-io.stogas-verifier.path="crates/verifier"' \
+            --package stogas
           for package in target/package/*.crate; do
             license_path="$(tar -tzf "$package" | awk '/\/LICENSE$/ { print; exit }')"
             test -n "$license_path"

@@ -2,7 +2,10 @@ use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use chrono::DateTime;
 use serde_json::Value;
 use sha2::{Digest as _, Sha256};
-use stogas_verifier::{Environment, MAX_INPUT_BYTES, Verifier, verify_amd_collateral_admission};
+use stogas_verifier::{
+    Environment, MAX_INPUT_BYTES, Verifier, verify_amd_collateral_admission,
+    verify_node_ledger_record,
+};
 
 const BUNDLE: &[u8] = include_bytes!("fixtures/staging-bundle-sequence-1927.json");
 const VERIFIED_AT_UNIX_MS: i64 = 1_784_414_117_082;
@@ -35,6 +38,64 @@ fn unix_ms(value: &Value, pointer: &str) -> i64 {
     DateTime::parse_from_rfc3339(value.pointer(pointer).unwrap().as_str().unwrap())
         .unwrap()
         .timestamp_millis()
+}
+
+fn ledger_fixture() -> Value {
+    let bundle = fixture();
+    let node = &bundle["body"]["nodes"][0];
+    serde_json::json!({
+        "admitted_at": node["quote_verified_at"],
+        "admission": {
+            "cert_expires_at": node["cert_expires_at"],
+            "chip_id": node["chip_id"],
+            "collateral": bundle["body"]["vendor_collateral"],
+            "quote": node["quote"],
+            "quote_verified_at": node["quote_verified_at"],
+            "region": node["region"],
+            "report_data": node["report_data"],
+            "report_data_sha512": node["report_data_sha512"],
+            "reported_tcb": node["reported_tcb"],
+        },
+        "certificate_history": [{
+            "first_observed_at": node["quote_verified_at"],
+            "sha256": node["report_data"]["active_cert_sha256"],
+        }],
+        "generation_id": node["node_id"],
+        "release": bundle["body"]["allowed_igvms"][0],
+        "schema": "stogas.node-ledger.v1",
+    })
+}
+
+#[test]
+fn verifies_an_immutable_historical_node_ledger_record() {
+    let record = ledger_fixture();
+    let verified = verify_node_ledger_record(
+        &serde_json::to_vec(&record).unwrap(),
+        &Environment::stogas(),
+    )
+    .unwrap();
+    assert_eq!(
+        verified.generation_id,
+        record["generation_id"].as_str().unwrap()
+    );
+    assert_eq!(
+        verified.node.report_data.ed25519_public_key,
+        record["admission"]["report_data"]["ed25519_public_key"]
+            .as_str()
+            .unwrap()
+    );
+
+    let mut wrong_generation = record;
+    wrong_generation["generation_id"] = Value::String("0".repeat(64));
+    assert!(
+        verify_node_ledger_record(
+            &serde_json::to_vec(&wrong_generation).unwrap(),
+            &Environment::stogas(),
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("generation id differs")
+    );
 }
 
 #[test]
@@ -353,6 +414,32 @@ fn excludes_nodes_more_than_two_minutes_older_than_bundle_creation() {
         output.bundle.excluded_nodes[0]
             .reason
             .contains("bundle was created")
+    );
+}
+
+#[test]
+fn node_freshness_is_anchored_to_bundle_creation_not_verifier_capture() {
+    let mut value = fixture();
+    let created_at = unix_ms(&value, "/body/created_at");
+    value["body"]["expires_at"] = Value::String(
+        DateTime::from_timestamp_millis(created_at + 900_000)
+            .unwrap()
+            .to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+    );
+    value["body"]["ttl_ms"] = Value::from(900_000);
+    let (bundle, environment) = checksummed_fixture(value);
+    let output = Verifier::default()
+        .verify_bundle(&bundle, created_at + 179_000, &environment)
+        .unwrap();
+
+    assert_eq!(output.bundle.nodes.len(), 1);
+    assert!(
+        output.bundle.nodes[0].evidence_age_ms <= 120_000,
+        "reported bundle evidence age must be anchored to bundle creation"
+    );
+    assert!(
+        created_at + 179_000 - output.bundle.nodes[0].drand_round_time_unix_ms > 120_000,
+        "the node must remain eligible even when it is more than two minutes old at capture time"
     );
 }
 

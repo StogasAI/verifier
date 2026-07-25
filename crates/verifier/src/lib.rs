@@ -3,6 +3,8 @@
 mod strict_json;
 mod types;
 
+pub mod e2ee;
+pub mod response_proof;
 pub use types::*;
 
 use base64::{
@@ -11,12 +13,22 @@ use base64::{
 };
 use chrono::{DateTime, Utc};
 use ed25519_dalek::{Signature as Ed25519Signature, VerifyingKey, pkcs8::DecodePublicKey};
+use p256::ecdsa::{
+    Signature as P256Signature, VerifyingKey as P256VerifyingKey, signature::Verifier as _,
+};
 use serde::Deserialize;
 use serde_json::Value;
 use sha2::{Digest, Sha256, Sha512};
 use std::collections::{BTreeMap, BTreeSet};
 use stogas_offline_sigstore::{GithubPolicy, Subject, verify_github_attestation};
 use thiserror::Error;
+use x509_parser::{
+    oid_registry::{OID_EC_P256, OID_KEY_TYPE_EC_PUBLIC_KEY, OID_SIG_ECDSA_WITH_SHA256},
+    prelude::{
+        FromDer as _, GeneralName, ParsedExtension, X509CertificationRequest,
+        X509CertificationRequestInfo,
+    },
+};
 
 /// Maximum serialized bundle or heartbeat-admission request accepted by public adapters.
 pub const MAX_INPUT_BYTES: usize = 16 * 1024 * 1024;
@@ -34,8 +46,12 @@ const AMD_COLLATERAL_VALIDITY_MS: i64 = 24 * 60 * 60 * 1000;
 const STOGAS_RELEASE_KEY_ID: &str = "stogas-ed25519-stamp-v1";
 const STOGAS_RELEASE_PUBLIC_KEY_DER_BASE64: &str =
     "MCowBQYDK2VwAyEAByVn3LvWVbf3YkokMZPvir70vcDu0nNflgXoM0Y8aQU=";
+#[cfg(feature = "staging")]
 const STAGING_PROVENANCE_TYPE: &str = "https://stogas.ai/attestations/staging-development/v1";
+const HEARTBEAT_SIGNATURE_DOMAIN: &[u8] = b"stogas.gateway-heartbeat.v1\0";
+const CSR_SIGNATURE_DOMAIN: &[u8] = b"stogas.gateway-csr-submission.v1\0";
 
+#[cfg(feature = "staging")]
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct StagingDevelopmentProvenance {
@@ -47,12 +63,14 @@ struct StagingDevelopmentProvenance {
     subject: Vec<StagingDevelopmentSubject>,
 }
 
+#[cfg(feature = "staging")]
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct StagingDevelopmentPredicate {
     environment: String,
 }
 
+#[cfg(feature = "staging")]
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct StagingDevelopmentSubject {
@@ -60,11 +78,25 @@ struct StagingDevelopmentSubject {
     name: String,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CertificateCsrVerificationRequest {
+    csr_der: String,
+    expected_common_name: Option<String>,
+    expected_dns_names: Vec<String>,
+    expected_tls_spki_sha256: String,
+    generation_id: String,
+    node_ed25519_public_key: String,
+    order_id: String,
+    signature: String,
+}
+
 /// Runtime-independent trust configuration.
 #[derive(Clone, Debug)]
 pub struct Environment {
     /// Trusted Stogas release signing keys, keyed by key id, as base64 SPKI DER.
     pub release_keys: BTreeMap<String, String>,
+    #[cfg(feature = "staging")]
     allow_staging_development_provenance: bool,
 }
 
@@ -78,15 +110,17 @@ impl Environment {
         )]);
         Self {
             release_keys,
+            #[cfg(feature = "staging")]
             allow_staging_development_provenance: false,
         }
     }
 
-    /// Staging trust policy. This accepts the explicit Stogas development-provenance statement in
-    /// place of GitHub provenance while retaining the signed launch-policy requirement.
+    #[cfg(feature = "staging")]
+    #[doc(hidden)]
     #[must_use]
     pub fn staging() -> Self {
         Self {
+            #[cfg(feature = "staging")]
             allow_staging_development_provenance: true,
             ..Self::stogas()
         }
@@ -110,6 +144,8 @@ pub enum Error {
     Node(String),
     #[error("heartbeat replay protection failed: {0}")]
     Replay(String),
+    #[error("response proof verification failed: {0}")]
+    ResponseProof(String),
 }
 
 /// Verifier with a bounded in-memory cache for immutable release evidence.
@@ -118,7 +154,26 @@ pub enum Error {
 /// GitHub or Stogas signature verification for new release bytes.
 #[derive(Debug, Default)]
 pub struct Verifier {
+    active_bundle: Option<VerificationOutput>,
     verified_releases: BTreeMap<String, VerifiedRelease>,
+}
+
+/// Exact bytes and trust context required to verify one historical response receipt.
+pub struct HistoricalResponseProofInput<'a> {
+    /// Compact response receipt bytes.
+    pub proof_bytes: &'a [u8],
+    /// Exact plaintext request body.
+    pub request_body: &'a [u8],
+    /// Exact plaintext response body.
+    pub response_body: &'a [u8],
+    /// Expected E2EE transcript hash when application encryption was used.
+    pub expected_e2ee_transcript_sha256: Option<&'a str>,
+    /// One captured verification wall-clock value.
+    pub now_unix_ms: i64,
+    /// Immutable node-admission ledger bytes.
+    pub ledger_bytes: &'a [u8],
+    /// Release and hardware trust policy.
+    pub environment: &'a Environment,
 }
 
 impl Verifier {
@@ -140,7 +195,55 @@ impl Verifier {
             &self.verified_releases,
         )?;
         self.verified_releases = next_cache;
+        self.active_bundle = Some(output.clone());
         Ok(output)
+    }
+
+    /// Verify one response receipt against the active verified bundle.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if no bundle has been accepted or any receipt, body, signature, node,
+    /// drand, or E2EE transcript binding differs.
+    pub fn verify_response_proof(
+        &self,
+        proof_bytes: &[u8],
+        request_body: &[u8],
+        response_body: &[u8],
+        expected_e2ee_transcript_sha256: Option<&str>,
+        now_unix_ms: i64,
+    ) -> Result<response_proof::VerifiedResponseProof, Error> {
+        let bundle = self.active_bundle.as_ref().ok_or_else(|| {
+            Error::ResponseProof("a bundle must be verified before a response proof".into())
+        })?;
+        response_proof::verify_with_bundle(
+            proof_bytes,
+            request_body,
+            response_body,
+            expected_e2ee_transcript_sha256,
+            now_unix_ms,
+            bundle,
+        )
+    }
+
+    /// Verify a response receipt and its immutable historical node ledger together.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when either cryptographic trust chain or their signing-key binding fails.
+    pub fn verify_historical_response_proof(
+        &self,
+        input: &HistoricalResponseProofInput<'_>,
+    ) -> Result<response_proof::VerifiedResponseProof, Error> {
+        response_proof::verify_with_ledger_bytes(
+            input.proof_bytes,
+            input.request_body,
+            input.response_body,
+            input.expected_e2ee_transcript_sha256,
+            input.now_unix_ms,
+            input.ledger_bytes,
+            input.environment,
+        )
     }
 }
 
@@ -180,12 +283,8 @@ pub fn verify_release_approval(
     verify_release(&release, &Environment::stogas(), now_unix_ms)
 }
 
-/// Verify one release authorization using the staging trust policy.
-///
-/// # Errors
-///
-/// Returns an error unless the release has a valid Stogas signature and either strict GitHub
-/// provenance or the exact staging-only development-provenance statement.
+#[cfg(feature = "staging")]
+#[doc(hidden)]
 pub fn verify_staging_release_approval(
     release_bytes: &[u8],
     now_unix_ms: i64,
@@ -198,6 +297,148 @@ pub fn verify_staging_release_approval(
     let release: AllowedIgvm =
         serde_json::from_value(value).map_err(|error| Error::InvalidBundle(error.to_string()))?;
     verify_release(&release, &Environment::staging(), now_unix_ms)
+}
+
+/// Verify one immutable historical node-admission ledger record.
+///
+/// Verification is anchored to the recorded admission time, so an expired certificate or AMD
+/// collateral does not invalidate evidence that was valid when Control admitted the generation.
+/// The generation id is independently re-derived from the quote-bound chip and TLS identities.
+///
+/// # Errors
+///
+/// Returns an error when the release provenance, SNP quote, AMD collateral, report data, drand
+/// evidence, or generation identity is invalid.
+pub fn verify_node_ledger_record(
+    record_bytes: &[u8],
+    environment: &Environment,
+) -> Result<VerifiedNodeLedgerRecord, Error> {
+    if record_bytes.len() > MAX_INPUT_BYTES {
+        return Err(Error::TooLarge);
+    }
+    let value = strict_json::from_slice(record_bytes)
+        .map_err(|error| Error::InvalidJson(error.to_string()))?;
+    let record: NodeLedgerRecord = serde_json::from_value(value)
+        .map_err(|error| Error::InvalidBundle(format!("invalid node ledger record: {error}")))?;
+    if record.schema != "stogas.node-ledger.v1" || !is_lower_hex(&record.generation_id, 32) {
+        return Err(Error::InvalidBundle(
+            "unsupported or invalid node ledger record".into(),
+        ));
+    }
+    let admitted_at = parse_time(&record.admitted_at)?;
+    if parse_time(&record.admission.quote_verified_at)? != admitted_at {
+        return Err(Error::InvalidBundle(
+            "node ledger admission timestamps differ".into(),
+        ));
+    }
+    if record.certificate_history.is_empty() || record.certificate_history.len() > 64 {
+        return Err(Error::InvalidBundle(
+            "node ledger certificate history is empty or too large".into(),
+        ));
+    }
+    validate_ledger_certificate_history(&record, admitted_at)?;
+    let release = verify_release(&record.release, environment, admitted_at)?;
+    let node = ledger_record_node(&record);
+    validate_node_shape(&node)?;
+    let generation_preimage = format!(
+        "{{\"chip_id\":\"{}\",\"tls_spki_sha256\":\"{}\"}}",
+        node.chip_id, node.report_data.tls_spki_sha256
+    );
+    let derived_generation_id = hex::encode(Sha256::digest(generation_preimage.as_bytes()));
+    if derived_generation_id != record.generation_id {
+        return Err(Error::Node(
+            "node ledger generation id differs from its attested identity".into(),
+        ));
+    }
+    let launch_policies = BTreeMap::from([(
+        record.release.launch_policy.measurement.as_str(),
+        &record.release.launch_policy,
+    )]);
+    let amd_stacks = verified_amd_stacks(
+        &record.admission.collateral,
+        std::slice::from_ref(&node),
+        admitted_at,
+        admitted_at,
+    )?;
+    let verified_node = verify_node(
+        &node,
+        admitted_at,
+        admitted_at,
+        admitted_at,
+        &launch_policies,
+        &amd_stacks,
+    )?;
+    Ok(VerifiedNodeLedgerRecord {
+        admitted_at_unix_ms: admitted_at,
+        generation_id: record.generation_id,
+        node: verified_node,
+        release,
+    })
+}
+
+fn validate_ledger_certificate_history(
+    record: &NodeLedgerRecord,
+    admitted_at: i64,
+) -> Result<(), Error> {
+    let mut certificate_hashes = BTreeSet::new();
+    let mut previous_certificate = None;
+    for certificate in &record.certificate_history {
+        if !is_lower_hex(&certificate.sha256, 32) {
+            return Err(Error::InvalidBundle(
+                "node ledger certificate history contains an invalid SHA-256".into(),
+            ));
+        }
+        let observed_at = parse_time(&certificate.first_observed_at)?;
+        if observed_at < admitted_at {
+            return Err(Error::InvalidBundle(
+                "node ledger certificate predates generation admission".into(),
+            ));
+        }
+        let ordering_key = (observed_at, certificate.sha256.as_str());
+        if previous_certificate.is_some_and(|previous| previous >= ordering_key) {
+            return Err(Error::InvalidBundle(
+                "node ledger certificate history is not canonically ordered".into(),
+            ));
+        }
+        previous_certificate = Some(ordering_key);
+        if !certificate_hashes.insert(certificate.sha256.as_str()) {
+            return Err(Error::InvalidBundle(
+                "node ledger certificate history contains a duplicate".into(),
+            ));
+        }
+    }
+    if record
+        .admission
+        .report_data
+        .accepted_cert_sha256
+        .iter()
+        .any(|certificate| !certificate_hashes.contains(certificate.as_str()))
+    {
+        return Err(Error::InvalidBundle(
+            "node ledger omits an admission certificate".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn ledger_record_node(record: &NodeLedgerRecord) -> Node {
+    Node {
+        cert_expires_at: record.admission.cert_expires_at.clone(),
+        chip_id: record.admission.chip_id.clone(),
+        health: NodeHealth {
+            last_quote_error: None,
+            ready: true,
+            secret_versions: BTreeMap::new(),
+        },
+        node_id: record.generation_id.clone(),
+        quote: record.admission.quote.clone(),
+        quote_verified_at: record.admission.quote_verified_at.clone(),
+        region: record.admission.region.clone(),
+        release_measurement: record.release.launch_policy.measurement.clone(),
+        reported_tcb: record.admission.reported_tcb.clone(),
+        report_data: record.admission.report_data.clone(),
+        report_data_sha512: record.admission.report_data_sha512.clone(),
+    }
 }
 
 /// Verify one exact AMD collateral stack before Control makes it active.
@@ -375,7 +616,210 @@ pub fn verify_heartbeat_admission(
         &policies,
         &amd_stacks,
     )?;
+    verify_heartbeat_candidate_signature(heartbeat, &heartbeat.report_data.ed25519_public_key)?;
     Ok(VerifiedAdmission { node, verified })
+}
+
+/// Verify a recognized generation heartbeat with its already-attested Ed25519 key.
+///
+/// This is the inexpensive authentication step between periodic full SNP verification
+/// checkpoints. The caller must source `public_key_b64url` from a previously verified generation,
+/// never from the untrusted heartbeat itself.
+///
+/// # Errors
+///
+/// Returns an error for malformed input, a malformed key/signature, or a changed signed field.
+pub fn verify_recognized_heartbeat_signature(
+    heartbeat_bytes: &[u8],
+    public_key_b64url: &str,
+) -> Result<(), Error> {
+    if heartbeat_bytes.len() > MAX_INPUT_BYTES {
+        return Err(Error::TooLarge);
+    }
+    let value = strict_json::from_slice(heartbeat_bytes)
+        .map_err(|error| Error::InvalidJson(error.to_string()))?;
+    let heartbeat: HeartbeatCandidate = serde_json::from_value(value)
+        .map_err(|error| Error::InvalidBundle(format!("invalid heartbeat: {error}")))?;
+    verify_heartbeat_candidate_signature(&heartbeat, public_key_b64url)
+}
+
+/// Verify a gateway CSR, its proof of possession, its exact requested identity, and the
+/// generation-key authorization over the submission.
+///
+/// # Errors
+///
+/// Returns an error unless the CSR is a complete canonical P-256/SHA-256 request whose SPKI,
+/// subject, and DNS SAN set exactly match Control's independently loaded certificate order.
+pub fn verify_certificate_csr_submission(request_bytes: &[u8]) -> Result<(), Error> {
+    if request_bytes.len() > MAX_INPUT_BYTES {
+        return Err(Error::TooLarge);
+    }
+    let value = strict_json::from_slice(request_bytes)
+        .map_err(|error| Error::InvalidJson(error.to_string()))?;
+    let request: CertificateCsrVerificationRequest =
+        serde_json::from_value(value).map_err(|error| {
+            Error::InvalidBundle(format!("invalid CSR verification request: {error}"))
+        })?;
+
+    let csr_der = URL_SAFE_NO_PAD
+        .decode(&request.csr_der)
+        .map_err(|_| Error::Node("certificate CSR is not base64url".into()))?;
+    if csr_der.is_empty() {
+        return Err(Error::Node("certificate CSR is empty".into()));
+    }
+    let mut authorization = Vec::with_capacity(160);
+    authorization.extend_from_slice(CSR_SIGNATURE_DOMAIN);
+    for field in [
+        request.generation_id.as_bytes(),
+        request.order_id.as_bytes(),
+        &Sha256::digest(&csr_der)[..],
+    ] {
+        append_transcript_field(&mut authorization, field)?;
+    }
+    verify_raw_ed25519(
+        &request.node_ed25519_public_key,
+        &authorization,
+        &request.signature,
+        "certificate CSR submission",
+    )?;
+
+    let (remaining, csr) = X509CertificationRequest::from_der(&csr_der)
+        .map_err(|_| Error::Node("certificate CSR is not valid DER".into()))?;
+    if !remaining.is_empty() || csr.as_raw().len() != csr_der.len() {
+        return Err(Error::Node("certificate CSR contains trailing data".into()));
+    }
+    verify_certificate_csr_key_and_signature(&csr, &request.expected_tls_spki_sha256)?;
+    verify_certificate_csr_subject(
+        &csr.certification_request_info,
+        request.expected_common_name.as_deref(),
+    )?;
+    verify_certificate_csr_dns_names(&csr, request.expected_dns_names)
+}
+
+fn verify_certificate_csr_key_and_signature(
+    csr: &X509CertificationRequest<'_>,
+    expected_tls_spki_sha256: &str,
+) -> Result<(), Error> {
+    if csr.signature_algorithm.algorithm != OID_SIG_ECDSA_WITH_SHA256 {
+        return Err(Error::Node(
+            "certificate CSR must use ECDSA with SHA-256".into(),
+        ));
+    }
+    let spki = &csr.certification_request_info.subject_pki;
+    if spki.algorithm.algorithm != OID_KEY_TYPE_EC_PUBLIC_KEY
+        || spki
+            .algorithm
+            .parameters()
+            .and_then(|parameters| parameters.as_oid().ok())
+            .as_ref()
+            != Some(&OID_EC_P256)
+    {
+        return Err(Error::Node(
+            "certificate CSR must contain a P-256 public key".into(),
+        ));
+    }
+    let verifying_key = P256VerifyingKey::from_sec1_bytes(&spki.subject_public_key.data)
+        .map_err(|_| Error::Node("certificate CSR P-256 public key is invalid".into()))?;
+    let signature = P256Signature::from_der(&csr.signature_value.data)
+        .map_err(|_| Error::Node("certificate CSR signature is not canonical DER".into()))?;
+    verifying_key
+        .verify(csr.certification_request_info.raw, &signature)
+        .map_err(|_| Error::Node("certificate CSR proof of possession is invalid".into()))?;
+
+    let derived_spki_sha256 = hex::encode(Sha256::digest(spki.raw));
+    if derived_spki_sha256 != expected_tls_spki_sha256 {
+        return Err(Error::Node(
+            "certificate CSR SPKI does not match the attested generation key".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn verify_certificate_csr_subject(
+    request_info: &X509CertificationRequestInfo<'_>,
+    expected_common_name: Option<&str>,
+) -> Result<(), Error> {
+    let common_names = request_info
+        .subject
+        .iter_common_name()
+        .map(|attribute| {
+            attribute
+                .as_str()
+                .map(str::to_owned)
+                .map_err(|_| Error::Node("certificate CSR common name is not UTF-8".into()))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let expected_common_names = expected_common_name.into_iter().collect::<Vec<_>>();
+    if common_names != expected_common_names {
+        return Err(Error::Node(
+            "certificate CSR common name differs from the certificate order".into(),
+        ));
+    }
+    let subject_attribute_count = request_info
+        .subject
+        .iter()
+        .flat_map(x509_parser::prelude::RelativeDistinguishedName::iter)
+        .count();
+    if subject_attribute_count != common_names.len() {
+        return Err(Error::Node(
+            "certificate CSR contains unexpected subject attributes".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn verify_certificate_csr_dns_names(
+    csr: &X509CertificationRequest<'_>,
+    expected_dns_names: Vec<String>,
+) -> Result<(), Error> {
+    let mut dns_names = BTreeSet::new();
+    let mut san_extensions = 0_u8;
+    let extensions = csr
+        .requested_extensions()
+        .ok_or_else(|| Error::Node("certificate CSR has no requested extensions".into()))?;
+    for extension in extensions {
+        match extension {
+            ParsedExtension::SubjectAlternativeName(san) => {
+                san_extensions = san_extensions.saturating_add(1);
+                for name in &san.general_names {
+                    let GeneralName::DNSName(name) = name else {
+                        return Err(Error::Node(
+                            "certificate CSR SANs must contain only DNS names".into(),
+                        ));
+                    };
+                    let normalized = name.trim().to_ascii_lowercase();
+                    if normalized.is_empty() || !dns_names.insert(normalized) {
+                        return Err(Error::Node(
+                            "certificate CSR contains an empty or duplicate DNS SAN".into(),
+                        ));
+                    }
+                }
+            }
+            _ => {
+                return Err(Error::Node(
+                    "certificate CSR contains an unexpected requested extension".into(),
+                ));
+            }
+        }
+    }
+    if san_extensions != 1 {
+        return Err(Error::Node(
+            "certificate CSR must contain exactly one DNS SAN extension".into(),
+        ));
+    }
+    let expected_dns_names = expected_dns_names
+        .into_iter()
+        .map(|name| name.trim().to_ascii_lowercase())
+        .collect::<BTreeSet<_>>();
+    if expected_dns_names.is_empty()
+        || expected_dns_names.len() != dns_names.len()
+        || expected_dns_names != dns_names
+    {
+        return Err(Error::Node(
+            "certificate CSR DNS SANs differ from the certificate order".into(),
+        ));
+    }
+    Ok(())
 }
 
 /// Verify one explicitly local Control heartbeat without treating emulated evidence as AMD trust.
@@ -469,7 +913,100 @@ pub fn verify_local_heartbeat_admission(
         reported_tcb: node.reported_tcb.clone(),
         tls_spki_sha256: node.report_data.tls_spki_sha256.clone(),
     };
+    verify_heartbeat_candidate_signature(heartbeat, &heartbeat.report_data.ed25519_public_key)?;
     Ok(VerifiedAdmission { node, verified })
+}
+
+fn verify_heartbeat_candidate_signature(
+    heartbeat: &HeartbeatCandidate,
+    public_key_b64url: &str,
+) -> Result<(), Error> {
+    let transcript = heartbeat_signature_transcript(heartbeat)?;
+    verify_raw_ed25519(
+        public_key_b64url,
+        &transcript,
+        &heartbeat.signature,
+        "heartbeat",
+    )
+}
+
+fn heartbeat_signature_transcript(heartbeat: &HeartbeatCandidate) -> Result<Vec<u8>, Error> {
+    let quote = URL_SAFE_NO_PAD
+        .decode(&heartbeat.quote)
+        .map_err(|_| Error::Node("heartbeat quote encoding is invalid".into()))?;
+    let quote_sha256 = Sha256::digest(&quote);
+    let report_sha512 = hex::decode(&heartbeat.report_data_sha512)
+        .map_err(|_| Error::Node("heartbeat report-data digest is not hex".into()))?;
+    if report_sha512.len() != 64 {
+        return Err(Error::Node(
+            "heartbeat report-data digest must be 64 bytes".into(),
+        ));
+    }
+
+    let mut transcript = Vec::with_capacity(512);
+    transcript.extend_from_slice(HEARTBEAT_SIGNATURE_DOMAIN);
+    for field in [
+        heartbeat.node_id.as_bytes(),
+        heartbeat.cert_expires_at.as_bytes(),
+        heartbeat.observed_at.as_bytes(),
+        heartbeat.quote_generated_at.as_bytes(),
+        &quote_sha256[..],
+        report_sha512.as_slice(),
+        if heartbeat.health.ready {
+            &[1_u8][..]
+        } else {
+            &[0_u8][..]
+        },
+        heartbeat
+            .health
+            .last_quote_error
+            .as_deref()
+            .unwrap_or_default()
+            .as_bytes(),
+    ] {
+        append_transcript_field(&mut transcript, field)?;
+    }
+    let secret_count = u32::try_from(heartbeat.health.secret_versions.len())
+        .map_err(|_| Error::Node("heartbeat has too many secret versions".into()))?;
+    transcript.extend_from_slice(&secret_count.to_be_bytes());
+    for (name, version) in &heartbeat.health.secret_versions {
+        append_transcript_field(&mut transcript, name.as_bytes())?;
+        append_transcript_field(&mut transcript, version.as_bytes())?;
+    }
+    Ok(transcript)
+}
+
+fn append_transcript_field(transcript: &mut Vec<u8>, value: &[u8]) -> Result<(), Error> {
+    let len = u32::try_from(value.len())
+        .map_err(|_| Error::Node("signed transcript field is too large".into()))?;
+    transcript.extend_from_slice(&len.to_be_bytes());
+    transcript.extend_from_slice(value);
+    Ok(())
+}
+
+fn verify_raw_ed25519(
+    public_key_b64url: &str,
+    payload: &[u8],
+    signature_b64url: &str,
+    label: &str,
+) -> Result<(), Error> {
+    use ed25519_dalek::Verifier as _;
+
+    let public_key = URL_SAFE_NO_PAD
+        .decode(public_key_b64url)
+        .map_err(|_| Error::Node(format!("{label} public key is not base64url")))?;
+    let public_key: [u8; 32] = public_key
+        .try_into()
+        .map_err(|_| Error::Node(format!("{label} public key must be 32 bytes")))?;
+    let key = VerifyingKey::from_bytes(&public_key)
+        .map_err(|_| Error::Node(format!("{label} public key is invalid")))?;
+    let signature = URL_SAFE_NO_PAD
+        .decode(signature_b64url)
+        .map_err(|_| Error::Node(format!("{label} signature is not base64url")))?;
+    let signature = Ed25519Signature::from_slice(&signature)
+        .map_err(|_| Error::Node(format!("{label} signature must be 64 bytes")))?;
+    key.verify(payload, &signature)
+        .map_err(|_| Error::Node(format!("{label} signature is invalid")))
 }
 
 fn parse_local_admission_request(request_bytes: &[u8]) -> Result<LocalAdmissionRequest, Error> {
@@ -1042,49 +1579,22 @@ fn verify_release(
     let attestation_bytes =
         serde_json::to_vec(attestation_value).map_err(|error| Error::Release(error.to_string()))?;
     let policy_digest = hex::encode(Sha256::digest(canonical.as_bytes()));
+    #[cfg(feature = "staging")]
     let staging_development_provenance = environment.allow_staging_development_provenance
         && is_staging_development_provenance(
             &attestation_bytes,
             &policy.igvm_sha256,
             &policy_digest,
         )?;
-    let github_integrated_time_unix_ms = if staging_development_provenance {
-        None
-    } else {
-        let workflow_identity = format!(
-            "https://github.com/StogasAI/gateway/.github/workflows/gateway-igvm-release.yml@refs/tags/{}",
-            policy.release_tag
-        );
-        let verified_attestation = verify_github_attestation(
-            &attestation_bytes,
-            &[
-                Subject {
-                    name: "gateway.igvm",
-                    sha256: &policy.igvm_sha256,
-                },
-                Subject {
-                    name: "gateway-launch-policy.json",
-                    sha256: &policy_digest,
-                },
-            ],
-            &GithubPolicy {
-                repository: policy.source.repository.clone(),
-                workflow_identity,
-                source_ref: format!("refs/tags/{}", policy.release_tag),
-                source_commit: policy.source.commit.clone(),
-                predicate_type: "https://slsa.dev/provenance/v1".into(),
-                require_github_hosted: true,
-            },
-            now_unix_ms,
-        )
-        .map_err(|error| Error::Release(error.to_string()))?;
-        Some(
-            verified_attestation
-                .integrated_time
-                .checked_mul(1000)
-                .ok_or_else(|| Error::Release("GitHub integration time overflows".into()))?,
-        )
-    };
+    #[cfg(not(feature = "staging"))]
+    let staging_development_provenance = false;
+    let (github_integrated_time_unix_ms, provenance) = verify_release_provenance(
+        &attestation_bytes,
+        policy,
+        &policy_digest,
+        staging_development_provenance,
+        now_unix_ms,
+    )?;
 
     Ok(VerifiedRelease {
         github_integrated_time_unix_ms,
@@ -1092,11 +1602,7 @@ fn verify_release(
         launch: policy.launch.clone(),
         launch_policy_sha256: policy_digest,
         measurement: policy.measurement.clone(),
-        provenance: if staging_development_provenance {
-            ReleaseProvenance::Staging
-        } else {
-            ReleaseProvenance::Github
-        },
+        provenance,
         release_tag: policy.release_tag.clone(),
         sequence: policy.sequence,
         source_commit: policy.source.commit.clone(),
@@ -1107,6 +1613,55 @@ fn verify_release(
     })
 }
 
+fn verify_release_provenance(
+    attestation_bytes: &[u8],
+    policy: &LaunchPolicy,
+    policy_digest: &str,
+    staging_development_provenance: bool,
+    now_unix_ms: i64,
+) -> Result<(Option<i64>, ReleaseProvenance), Error> {
+    #[cfg(feature = "staging")]
+    if staging_development_provenance {
+        return Ok((None, ReleaseProvenance::Staging));
+    }
+    #[cfg(not(feature = "staging"))]
+    let _ = staging_development_provenance;
+
+    let workflow_identity = format!(
+        "https://github.com/StogasAI/gateway/.github/workflows/gateway-igvm-release.yml@refs/tags/{}",
+        policy.release_tag
+    );
+    let verified = verify_github_attestation(
+        attestation_bytes,
+        &[
+            Subject {
+                name: "gateway.igvm",
+                sha256: &policy.igvm_sha256,
+            },
+            Subject {
+                name: "gateway-launch-policy.json",
+                sha256: policy_digest,
+            },
+        ],
+        &GithubPolicy {
+            repository: policy.source.repository.clone(),
+            workflow_identity,
+            source_ref: format!("refs/tags/{}", policy.release_tag),
+            source_commit: policy.source.commit.clone(),
+            predicate_type: "https://slsa.dev/provenance/v1".into(),
+            require_github_hosted: true,
+        },
+        now_unix_ms,
+    )
+    .map_err(|error| Error::Release(error.to_string()))?;
+    let integrated_time = verified
+        .integrated_time
+        .checked_mul(1000)
+        .ok_or_else(|| Error::Release("GitHub integration time overflows".into()))?;
+    Ok((Some(integrated_time), ReleaseProvenance::Github))
+}
+
+#[cfg(feature = "staging")]
 fn is_staging_development_provenance(
     bytes: &[u8],
     igvm_sha256: &str,
@@ -1232,7 +1787,9 @@ fn verify_node(
         chip_id: node.chip_id.clone(),
         drand_round: round,
         drand_round_time_unix_ms,
-        evidence_age_ms: now_unix_ms.saturating_sub(drand_round_time_unix_ms).max(0),
+        evidence_age_ms: bundle_created_at
+            .saturating_sub(drand_round_time_unix_ms)
+            .max(0),
         node_id: node.node_id.clone(),
         quote_verified_at_unix_ms: quote_verified_at,
         region: node.region.clone(),
@@ -2111,7 +2668,10 @@ mod tests {
     }
 
     fn local_admission_fixture(now_unix_ms: i64) -> serde_json::Value {
+        use ed25519_dalek::{Signer as _, SigningKey};
+
         let release = release_fixture().launch_policy;
+        let heartbeat_signing_key = SigningKey::from_bytes(&[7_u8; 32]);
         let report_data = ReportData {
             active_cert_sha256: "11".repeat(32),
             accepted_cert_sha256: vec!["11".repeat(32)],
@@ -2123,7 +2683,7 @@ mod tests {
                 round: 1,
                 signature: "44".repeat(48),
             },
-            ed25519_public_key: "local-ed25519".into(),
+            ed25519_public_key: URL_SAFE_NO_PAD.encode(heartbeat_signing_key.verifying_key()),
             hpke_public_key: "local-hpke".into(),
             schema: "stogas.node-report.v1".into(),
             tls_spki_sha256: "55".repeat(32),
@@ -2143,7 +2703,7 @@ mod tests {
             }))
             .unwrap(),
         );
-        serde_json::json!({
+        let mut request = serde_json::json!({
             "attester_mode": "mock",
             "heartbeat": {
                 "cert_expires_at": "2026-08-01T00:00:00.000Z",
@@ -2153,7 +2713,8 @@ mod tests {
                 "quote": quote,
                 "quote_generated_at": generated_at,
                 "report_data": report_data,
-                "report_data_sha512": report_data_sha512
+                "report_data_sha512": report_data_sha512,
+                "signature": ""
             },
             "launch_policies": [release],
             "region": "local",
@@ -2161,7 +2722,14 @@ mod tests {
                 "chip_id": "66".repeat(64),
                 "reported_tcb": "00".repeat(8)
             }]
-        })
+        });
+        let heartbeat: HeartbeatCandidate =
+            serde_json::from_value(request["heartbeat"].clone()).unwrap();
+        let signature =
+            heartbeat_signing_key.sign(&heartbeat_signature_transcript(&heartbeat).unwrap());
+        request["heartbeat"]["signature"] =
+            Value::String(URL_SAFE_NO_PAD.encode(signature.to_bytes()));
+        request
     }
 
     #[test]
@@ -2291,6 +2859,7 @@ mod tests {
                         .as_bytes(),
                 ),
             )]),
+            #[cfg(feature = "staging")]
             allow_staging_development_provenance: false,
         }
     }
@@ -2319,6 +2888,7 @@ mod tests {
         assert!(verify_release_approval(duplicate, 1_784_246_400_000).is_err());
     }
 
+    #[cfg(feature = "staging")]
     #[test]
     fn staging_development_provenance_is_exact_and_never_accepted_by_production() {
         let mut release = release_fixture();

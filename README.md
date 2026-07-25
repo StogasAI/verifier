@@ -8,7 +8,7 @@ The verifier checks a public evidence bundle locally. It does not contact GitHub
 
 | Need                                                                 | Use                       | Runs in                                                     |
 | -------------------------------------------------------------------- | ------------------------- | ----------------------------------------------------------- |
-| Use an existing OpenAI-compatible client with automatic verification | `stogas-verify serve`     | Linux, macOS, Windows                                       |
+| Use an existing OpenAI-compatible client with automatic verification | Stogas SDK `Transport`    | Native SDKs, browser, Worker, Node, Bun, Deno               |
 | Inspect a downloaded bundle or verify one in CI                      | `stogas-verify verify`    | Linux, macOS, Windows                                       |
 | Keep a verified trust set inside an application                      | Stogas Verifier SDK       | Rust, JavaScript, browser, Worker, Node, Bun, Python, Go, C |
 | Verify only GitHub/Sigstore provenance                               | `stogas-offline-sigstore` | Rust, JavaScript, browser, Worker, Node, Bun                |
@@ -23,9 +23,9 @@ stogas-verify serve
 
 Point any OpenAI-compatible client at `http://127.0.0.1:8787/v1`. The proxy:
 
-- polls and verifies the latest evidence bundle every 60 seconds by default;
-- performs normal WebPKI and hostname verification;
-- requires the certificate and public-key hashes from the same attested gateway;
+- polls for the latest evidence bundle every five minutes by default and avoids reverifying identical bytes;
+- supports attested TLS, E2EE, or both on the normal inference endpoints;
+- defaults to WebPKI plus certificate and public-key pinning in native mode;
 - forwards `/v1/*` requests and streaming responses without installing a local CA.
 
 `serve` is a native application. It is the right choice when the calling application cannot perform TLS pinning itself.
@@ -36,9 +36,9 @@ Browser applications can opt in one exact origin:
 stogas-verify serve --browser-origin https://app.example.com
 ```
 
-The CLI prints a capability-protected base URL for that browser session. It handles CORS and local-network preflights without allowing other origins or forwarding local access headers upstream.
+The CLI prints a capability-protected base URL for that browser session. It handles CORS and local-network preflights without allowing other origins or forwarding local access headers upstream, and defaults browser-origin traffic to E2EE.
 
-Use `--bundle-refresh-seconds` to select 10 to 840 seconds. The proxy also fetches before the hard bundle expiry, so a long interval cannot skip the final replacement window.
+Use `--security tls|e2ee|both` to select the transport policy. Use `--bundle-refresh-seconds` to select 1 to 840 seconds; zero is not accepted. The proxy also fetches before the hard bundle expiry, so a long interval cannot skip the final replacement window.
 
 ### Verify a file
 
@@ -50,7 +50,12 @@ Use `-` to read from standard input. The command prints the verified release, tr
 
 ## SDK
 
-Use an SDK when your application already owns bundle retrieval and connection handling.
+Each language installs one Stogas SDK. `Transport` owns snapshot refresh, attested TLS, E2EE,
+streaming, and fail-closed expiry; `Verifier` performs explicit networkless snapshot and receipt
+checks. Native transports run the Rust connection engine inside the application process. Fetch
+runtimes use the same core through WebAssembly and E2EE.
+
+Use `Verifier` when the application owns retrieval and needs the verified trust data directly:
 
 ```js
 import { Verifier } from '@stogas/verifier';
@@ -62,31 +67,46 @@ const result = verifier.verify_bundle(new Uint8Array(await response.arrayBuffer(
 console.log(result.bundle.nodes);
 ```
 
-Browser code imports `@stogas/verifier/browser` and calls its default WebAssembly initializer once. Browser `fetch` does not expose the peer certificate, so direct browser verification cannot provide pre-request TLS pinning. Use the CLI's explicit browser mode when an existing browser client needs a pinned connection.
+Browser code imports `@stogas/verifier/browser` and calls its default WebAssembly initializer once. Its `StogasTransport` verifies bundles, encrypts requests to every accepted node, and supplies a custom `fetch` for the OpenAI JavaScript client. Browser `fetch` does not expose the peer certificate, so direct browser mode provides E2EE rather than attested TLS.
 
 The client API has two forms:
 
 - `verify_bundle(bytes)` for one verification;
 - `new Verifier().verify_bundle(bytes)` when verifying successive bundles. The instance reuses already verified immutable release provenance in memory.
 
-Both read the platform clock once. Neither fetches, schedules refreshes, persists state, or makes requests to the inference API.
+Both verifier forms read the platform clock once. Neither fetches, schedules refreshes, persists state, or makes requests to the inference API.
+
+### Verify a response receipt
+
+The same verifier checks compact response receipts against the active bundle:
+
+```js
+const receipt = verifier.verify_response_proof(proofBytes, requestBytes, responseBytes);
+```
+
+Use `verify_historical_response_proof` with an immutable node-ledger record when the signing gateway is no longer in the active bundle.
+
+The receipt requires the exact plaintext request and response bytes. For streaming, omit the final `stogas.proof` event from the response bytes. When the exchange was encrypted, preserve the locally computed `X-Stogas-E2EE-Transcript-SHA256` response header and supply it during verification.
+
+`StogasTransport.verifyResponseProof(...)` performs the same check against the transport's
+already accepted bundle, avoiding a second bundle fetch and verification in managed clients.
 
 ## Packages
 
 | Package                           | Purpose                                                         |
 | --------------------------------- | --------------------------------------------------------------- |
-| `stogas-verifier`                 | Rust verification core                                          |
+| `stogas`                          | Complete Rust SDK                                               |
 | `stogas-verify`                   | Native CLI and loopback proxy                                   |
 | `@stogas/verifier`                | JavaScript and WebAssembly SDK                                  |
-| `stogas-verifier` on PyPI         | Python 3.10+ native PyO3 extension                              |
-| `github.com/StogasAI/verifier/go` | Go binding to the packaged native library                       |
-| `stogas_verifier.h`               | Bounded C ABI for native integrations                           |
+| `stogas-verifier` on PyPI         | Python 3.10+ SDK through a native PyO3 extension                |
+| `github.com/StogasAI/verifier/go` | Go SDK through the packaged native library                      |
+| `stogas_verifier.h`               | Complete bounded C ABI for native integrations                  |
 | `stogas-offline-sigstore`         | Generic Rust verifier for the supported GitHub/Sigstore profile |
 | `@stogas/offline-sigstore`        | JavaScript/WebAssembly build of the Sigstore verifier           |
 
 Python wheels use PyO3's stable `abi3-py310` ABI. Go uses cgo. The native packages cover Linux x86-64/ARM64, macOS x86-64/ARM64, and Windows x86-64.
 
-Java 22+ and other JVM languages can use the Foreign Function & Memory API, .NET can use P/Invoke, Swift and Objective-C have native C interoperability, and Kotlin/Native can use `cinterop`. These are self-managed C ABI integrations rather than separate Stogas SDK implementations. See the [native integration guide](https://stogas.ai/docs/verifier-native-integrations) for the complete bridge matrix and memory-ownership contract.
+Java 22+ and other JVM languages can use the Foreign Function & Memory API, .NET can use P/Invoke, Swift and Objective-C have native C interoperability, and Kotlin/Native can use `cinterop`. These are self-managed C ABI integrations rather than separate Stogas SDK implementations. See the [C and C++ guide](https://stogas.ai/docs/c-cpp) for the ABI and memory-ownership contract.
 
 ## What is verified
 
@@ -96,7 +116,8 @@ A trusted result means that:
 - the independent Stogas release signature authorizes those same launch-policy bytes;
 - each trusted gateway presents a valid AMD SEV-SNP report for an authorized launch measurement;
 - the report binds that gateway's TLS, certificate-rotation, response-signing, and encryption keys;
-- the bundle was created within three minutes, each trusted gateway's drand evidence was no more than two minutes older, and the bundle remains valid for no more than 15 minutes.
+- the bundle was created within three minutes, remains unexpired, and has a validity interval of no more than 15 minutes;
+- each trusted gateway's drand evidence was no more than two minutes old when the bundle was created.
 
 Older valid records are returned under `excluded_nodes`; they are never added to the trusted node set.
 
