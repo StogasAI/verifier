@@ -1597,6 +1597,7 @@ fn verify_release(
     )?;
 
     Ok(VerifiedRelease {
+        evidence: release.clone(),
         github_integrated_time_unix_ms,
         igvm_sha256: policy.igvm_sha256.clone(),
         launch: policy.launch.clone(),

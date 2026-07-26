@@ -175,6 +175,12 @@ fn verifies_real_staging_evidence_under_the_bundle_wide_freshness_invariant() {
     assert_eq!(release.release_tag, "v0.0.1");
     assert_eq!(release.sequence, 1);
     assert_eq!(release.vcpu_count, 4);
+    assert_eq!(release.evidence.launch_policy.release_tag, "v0.0.1");
+    assert_eq!(
+        release.evidence.stogas_signature.key_id,
+        "stogas-ed25519-stamp-v1"
+    );
+    assert!(!release.evidence.github_in_toto.is_empty());
     assert_eq!(release.launch.policy, "0x0000000000030000");
     assert_eq!(release.launch.vmpl, 0);
     assert_eq!(

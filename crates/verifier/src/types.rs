@@ -225,6 +225,7 @@ pub enum ReleaseProvenance {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct VerifiedRelease {
+    pub evidence: AllowedIgvm,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub github_integrated_time_unix_ms: Option<i64>,
     pub igvm_sha256: String,
