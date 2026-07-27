@@ -188,10 +188,10 @@ test('rejects an invalid Rekor inclusion proof without networking', async ({ pag
 	expect(requests).toEqual([]);
 });
 
-test('verifies a real full staging bundle with networking disabled', async ({ page }) => {
+test('rejects the pre-v2 full staging bundle with networking disabled', async ({ page }) => {
 	const requests = await initialize(page);
 	const fixture = await readFile(STAGING_BUNDLE_FIXTURE, 'utf8');
-	const result = await page.evaluate(
+	const error = await page.evaluate(
 		({ fixture, now }) => {
 			const platformNow = Date.now;
 			Date.now = () => now;
@@ -209,21 +209,10 @@ test('verifies a real full staging bundle with networking disabled', async ({ pa
 			).stogasVerifierBindings;
 			const verifier = new api.Verifier();
 			try {
-				const output = verifier.verify_bundle(new TextEncoder().encode(fixture));
-				return {
-					jsonCompatibleMaps: !(
-						(
-							output as unknown as {
-								bundle: {
-									original: { body: { nodes: Array<{ health: { secret_versions: unknown } }> } };
-								};
-							}
-						).bundle.original.body.nodes[0]?.health.secret_versions instanceof Map
-					),
-					nodes: output.bundle.nodes.length,
-					releases: output.bundle.releases.length,
-					sequence: output.bundle.sequence
-				};
+				verifier.verify_bundle(new TextEncoder().encode(fixture));
+				return null;
+			} catch (failure) {
+				return String(failure);
 			} finally {
 				verifier.free();
 				Date.now = platformNow;
@@ -231,16 +220,11 @@ test('verifies a real full staging bundle with networking disabled', async ({ pa
 		},
 		{ fixture, now: STAGING_BUNDLE_NOW_UNIX_MS }
 	);
-	expect(result).toMatchObject({
-		jsonCompatibleMaps: true,
-		nodes: 1,
-		releases: 1,
-		sequence: 1927
-	});
+	expect(error).toContain('catalog_hash');
 	expect(requests).toEqual([]);
 });
 
-test('seals browser inference to every member of the active verified bundle', async ({ page }) => {
+test('does not activate or seal from a pre-v2 bundle', async ({ page }) => {
 	const requests = await initialize(page);
 	const fixture = await readFile(STAGING_BUNDLE_FIXTURE, 'utf8');
 	const result = await page.evaluate(
@@ -270,27 +254,24 @@ test('seals browser inference to every member of the active verified bundle', as
 			).stogasVerifierBindings;
 			const verifier = new api.Verifier();
 			try {
-				verifier.verify_bundle(new TextEncoder().encode(fixture));
-				const encrypted = verifier.seal_e2ee_request(
-					'/v1/responses',
-					'sk-never-outer',
-					new TextEncoder().encode('{"model":"gpt-5","input":"never-outer"}'),
-					'application/json'
-				);
+				let verifyError: string | null = null;
 				try {
-					const text = new TextDecoder().decode(encrypted.body);
-					const envelope = JSON.parse(text).stogas_e2ee;
-					return {
-						containsAPIKey: text.includes('sk-never-outer'),
-						containsPrompt: text.includes('never-outer'),
-						recipients: envelope.recipients.length,
-						requestID: encrypted.request_id,
-						transcriptSHA256: encrypted.transcript_sha256,
-						version: envelope.version
-					};
-				} finally {
-					encrypted.free();
+					verifier.verify_bundle(new TextEncoder().encode(fixture));
+				} catch (failure) {
+					verifyError = String(failure);
 				}
+				let sealError: string | null = null;
+				try {
+					verifier.seal_e2ee_request(
+						'/v1/responses',
+						'sk-never-outer',
+						new TextEncoder().encode('{"model":"gpt-5","input":"never-outer"}'),
+						'application/json'
+					);
+				} catch (failure) {
+					sealError = String(failure);
+				}
+				return { sealError, verifyError };
 			} finally {
 				verifier.free();
 				Date.now = platformNow;
@@ -298,20 +279,12 @@ test('seals browser inference to every member of the active verified bundle', as
 		},
 		{ fixture, now: STAGING_BUNDLE_NOW_UNIX_MS }
 	);
-	expect(result).toMatchObject({
-		containsAPIKey: false,
-		containsPrompt: false,
-		recipients: 1,
-		version: 1
-	});
-	expect(result.requestID).toMatch(
-		/^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/
-	);
-	expect(result.transcriptSHA256).toMatch(/^[0-9a-f]{64}$/);
+	expect(result.verifyError).toContain('catalog_hash');
+	expect(result.sealError).toContain('bundle must be verified');
 	expect(requests).toEqual([]);
 });
 
-test('rejects deterministic mutations across the WASM bundle boundary', async ({ page }) => {
+test('rejects deterministic pre-v2 mutations across the WASM bundle boundary', async ({ page }) => {
 	const requests = await initialize(page);
 	const fixture = await readFile(STAGING_BUNDLE_FIXTURE, 'utf8');
 	const result = await page.evaluate(

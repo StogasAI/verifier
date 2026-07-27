@@ -48,7 +48,7 @@ const STOGAS_RELEASE_PUBLIC_KEY_DER_BASE64: &str =
     "MCowBQYDK2VwAyEAByVn3LvWVbf3YkokMZPvir70vcDu0nNflgXoM0Y8aQU=";
 #[cfg(feature = "staging")]
 const STAGING_PROVENANCE_TYPE: &str = "https://stogas.ai/attestations/staging-development/v1";
-const HEARTBEAT_SIGNATURE_DOMAIN: &[u8] = b"stogas.gateway-heartbeat.v1\0";
+const HEARTBEAT_SIGNATURE_DOMAIN: &[u8] = b"stogas.gateway-heartbeat.v2\0";
 const CSR_SIGNATURE_DOMAIN: &[u8] = b"stogas.gateway-csr-submission.v1\0";
 
 #[cfg(feature = "staging")]
@@ -423,6 +423,7 @@ fn validate_ledger_certificate_history(
 
 fn ledger_record_node(record: &NodeLedgerRecord) -> Node {
     Node {
+        catalog: record.admission.catalog.clone(),
         cert_expires_at: record.admission.cert_expires_at.clone(),
         chip_id: record.admission.chip_id.clone(),
         health: NodeHealth {
@@ -588,6 +589,7 @@ pub fn verify_heartbeat_admission(
         return Err(Error::Node("active certificate is expired".into()));
     }
     let node = Node {
+        catalog: heartbeat.catalog.clone(),
         cert_expires_at: heartbeat.cert_expires_at.clone(),
         chip_id: identity.chip_id,
         health: heartbeat.health.clone(),
@@ -865,6 +867,7 @@ pub fn verify_local_heartbeat_admission(
         .ok_or_else(|| Error::Node("captured time is out of range".into()))?
         .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
     let node = Node {
+        catalog: heartbeat.catalog.clone(),
         cert_expires_at: heartbeat.cert_expires_at.clone(),
         chip_id: identity.chip_id,
         health: heartbeat.health.clone(),
@@ -900,6 +903,7 @@ pub fn verify_local_heartbeat_admission(
 
     let verified = VerifiedNode {
         accepted_cert_sha256: node.report_data.accepted_cert_sha256.clone(),
+        catalog: node.catalog.clone(),
         chip_id: node.chip_id.clone(),
         drand_round: node.report_data.drand.round,
         drand_round_time_unix_ms,
@@ -945,8 +949,11 @@ fn heartbeat_signature_transcript(heartbeat: &HeartbeatCandidate) -> Result<Vec<
 
     let mut transcript = Vec::with_capacity(512);
     transcript.extend_from_slice(HEARTBEAT_SIGNATURE_DOMAIN);
+    let catalog_sequence = heartbeat.catalog.sequence.to_string();
     for field in [
         heartbeat.node_id.as_bytes(),
+        heartbeat.catalog.digest.as_bytes(),
+        catalog_sequence.as_bytes(),
         heartbeat.cert_expires_at.as_bytes(),
         heartbeat.observed_at.as_bytes(),
         heartbeat.quote_generated_at.as_bytes(),
@@ -1460,7 +1467,7 @@ fn validate_release_shape(release: &AllowedIgvm) -> Result<(), Error> {
 fn validate_node_shape(node: &Node) -> Result<(), Error> {
     let report = &node.report_data;
     let checks = [
-        (report.schema == "stogas.node-report.v1", "report schema"),
+        (report.schema == "stogas.node-report.v2", "report schema"),
         (is_lower_hex(&node.node_id, 32), "node id"),
         (is_lower_hex(&node.chip_id, 64), "chip id"),
         (is_lower_hex(&node.reported_tcb, 8), "reported TCB"),
@@ -1472,7 +1479,11 @@ fn validate_node_shape(node: &Node) -> Result<(), Error> {
             is_lower_hex(&node.report_data_sha512, 64),
             "report-data digest",
         ),
-        (is_lower_hex(&report.catalog_hash, 32), "catalog hash"),
+        (
+            node.catalog.digest.starts_with("sha256:")
+                && is_lower_hex(&node.catalog.digest["sha256:".len()..], 32),
+            "catalog digest",
+        ),
         (is_lower_hex(&report.tls_spki_sha256, 32), "TLS SPKI hash"),
         (
             is_lower_hex(&report.active_cert_sha256, 32),
@@ -1785,6 +1796,7 @@ fn verify_node(
     )?;
     Ok(VerifiedNode {
         accepted_cert_sha256: node.report_data.accepted_cert_sha256.clone(),
+        catalog: node.catalog.clone(),
         chip_id: node.chip_id.clone(),
         drand_round: round,
         drand_round_time_unix_ms,
@@ -2560,10 +2572,6 @@ fn canonical_report_data(report: &ReportData) -> Result<String, Error> {
     let mut value = serde_json::Map::new();
     value.insert("schema".into(), Value::String(report.schema.clone()));
     value.insert(
-        "catalog_hash".into(),
-        Value::String(report.catalog_hash.clone()),
-    );
-    value.insert(
         "tls_spki_sha256".into(),
         Value::String(report.tls_spki_sha256.clone()),
     );
@@ -2676,7 +2684,6 @@ mod tests {
         let report_data = ReportData {
             active_cert_sha256: "11".repeat(32),
             accepted_cert_sha256: vec!["11".repeat(32)],
-            catalog_hash: "22".repeat(32),
             drand: DrandBeacon {
                 chain_hash: DRAND_CHAIN_HASH.into(),
                 network: "quicknet".into(),
@@ -2686,7 +2693,7 @@ mod tests {
             },
             ed25519_public_key: URL_SAFE_NO_PAD.encode(heartbeat_signing_key.verifying_key()),
             hpke_public_key: "local-hpke".into(),
-            schema: "stogas.node-report.v1".into(),
+            schema: "stogas.node-report.v2".into(),
             tls_spki_sha256: "55".repeat(32),
         };
         let report_data_sha512 = hex::encode(Sha512::digest(
@@ -2707,6 +2714,10 @@ mod tests {
         let mut request = serde_json::json!({
             "attester_mode": "mock",
             "heartbeat": {
+                "catalog": {
+                    "digest": format!("sha256:{}", "22".repeat(32)),
+                    "sequence": 7
+                },
                 "cert_expires_at": "2026-08-01T00:00:00.000Z",
                 "health": { "ready": true, "secret_versions": {} },
                 "node_id": "local-node",

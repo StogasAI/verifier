@@ -76,7 +76,15 @@ pub struct ReleaseSignature {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
+pub struct CatalogIdentity {
+    pub digest: String,
+    pub sequence: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct Node {
+    pub catalog: CatalogIdentity,
     pub cert_expires_at: String,
     pub chip_id: String,
     pub health: NodeHealth,
@@ -103,6 +111,7 @@ pub struct NodeHealth {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct HeartbeatCandidate {
+    pub catalog: CatalogIdentity,
     pub cert_expires_at: String,
     pub health: NodeHealth,
     pub node_id: String,
@@ -168,7 +177,6 @@ pub struct VerifiedAdmission {
 pub struct ReportData {
     pub active_cert_sha256: String,
     pub accepted_cert_sha256: Vec<String>,
-    pub catalog_hash: String,
     pub drand: DrandBeacon,
     pub ed25519_public_key: String,
     pub hpke_public_key: String,
@@ -246,6 +254,7 @@ pub struct VerifiedRelease {
 pub struct VerifiedNode {
     pub accepted_cert_sha256: Vec<String>,
     pub chip_id: String,
+    pub catalog: CatalogIdentity,
     pub drand_round: u64,
     pub drand_round_time_unix_ms: i64,
     pub evidence_age_ms: i64,
@@ -305,6 +314,7 @@ pub struct NodeLedgerCertificate {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct NodeLedgerAdmission {
+    pub catalog: CatalogIdentity,
     pub cert_expires_at: String,
     pub chip_id: String,
     pub collateral: Vec<VendorCollateral>,

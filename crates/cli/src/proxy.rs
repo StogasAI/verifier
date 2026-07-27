@@ -910,14 +910,6 @@ mod tests {
     use tokio::sync::oneshot;
     use tokio_rustls::TlsAcceptor;
 
-    const STAGING_BUNDLE: &[u8] =
-        include_bytes!("../../verifier/tests/fixtures/staging-bundle-sequence-1927.json");
-    const STAGING_BUNDLE_VERIFIED_AT_MS: i64 = 1_784_414_117_082;
-
-    fn staging_bundle() -> (Vec<u8>, Environment) {
-        (STAGING_BUNDLE.to_vec(), Environment::stogas())
-    }
-
     struct TestCertificate {
         ca: CertificateDer<'static>,
         chain: Vec<CertificateDer<'static>>,
@@ -944,6 +936,10 @@ mod tests {
             key: PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(leaf_key.serialize_der())),
             node: VerifiedNode {
                 accepted_cert_sha256: vec![cert_hash],
+                catalog: stogas_verifier::CatalogIdentity {
+                    digest: format!("sha256:{}", "00".repeat(32)),
+                    sequence: 0,
+                },
                 chip_id: "00".repeat(64),
                 drand_round: 0,
                 drand_round_time_unix_ms: 0,
@@ -954,7 +950,6 @@ mod tests {
                 report_data: ReportData {
                     active_cert_sha256: "00".repeat(32),
                     accepted_cert_sha256: vec!["00".repeat(32)],
-                    catalog_hash: "00".repeat(32),
                     drand: DrandBeacon {
                         chain_hash: String::new(),
                         network: String::new(),
@@ -964,13 +959,45 @@ mod tests {
                     },
                     ed25519_public_key: String::new(),
                     hpke_public_key: String::new(),
-                    schema: "stogas.node-report.v1".into(),
+                    schema: "stogas.node-report.v2".into(),
                     tls_spki_sha256: spki_hash.clone(),
                 },
                 report_data_sha512: "00".repeat(64),
                 release_measurement: "00".repeat(48),
                 reported_tcb: "0000000000000000".into(),
                 tls_spki_sha256: spki_hash,
+            },
+        }
+    }
+
+    fn test_output(expires_at_unix_ms: i64) -> VerificationOutput {
+        let mut node = test_certificate().node;
+        node.report_data.hpke_public_key =
+            "BGn8DU65A_k1uW7rcnRbFwefL32ZjA94AYLFaVDP6RHEZ3BXsZ3WAsDq00JijkYQ0yswDe5fpxhtbDozQqUK8-U"
+                .into();
+        let original = serde_json::from_value(serde_json::json!({
+            "body": {
+                "allowed_igvms": [],
+                "created_at": "2026-07-23T16:00:00.000Z",
+                "expires_at": "2026-07-23T16:15:00.000Z",
+                "nodes": [],
+                "schema": "stogas.confidential-bundle.v1",
+                "sequence": 1,
+                "ttl_ms": 900_000,
+                "vendor_collateral": []
+            },
+            "body_sha256": "00".repeat(32)
+        }))
+        .unwrap();
+        VerificationOutput {
+            bundle: stogas_verifier::VerifiedBundle {
+                sequence: 1,
+                created_at_unix_ms: 0,
+                expires_at_unix_ms,
+                excluded_nodes: Vec::new(),
+                releases: Vec::new(),
+                nodes: vec![node],
+                original,
             },
         }
     }
@@ -1083,15 +1110,11 @@ mod tests {
         expires_at_unix_ms: i64,
         browser_origin: Option<&str>,
     ) -> ProxyState {
-        let (bundle, environment) = staging_bundle();
-        let mut verifier = Verifier::default();
-        let mut output = verifier
-            .verify_bundle(&bundle, STAGING_BUNDLE_VERIFIED_AT_MS, &environment)
-            .unwrap();
-        output.bundle.expires_at_unix_ms = expires_at_unix_ms;
+        let output = test_output(expires_at_unix_ms);
+        let bundle = b"test bundle";
         let version = BundleVersion {
             etag: None,
-            sha256: bundle_sha256(&bundle),
+            sha256: bundle_sha256(bundle),
         };
         let recipients = recipients_from_verified_bundle(&output).unwrap();
         ProxyState {
@@ -1106,7 +1129,7 @@ mod tests {
                     bundle_url,
                     upstream,
                     listen: "127.0.0.1:8787",
-                    environment,
+                    environment: Environment::stogas(),
                     bundle_refresh_interval: Duration::from_mins(1),
                     security: SecurityMode::Tls,
                     browser_origin,
@@ -1115,7 +1138,7 @@ mod tests {
                 .unwrap(),
             ),
             refresh_lock: Mutex::new(()),
-            verifier: Mutex::new(verifier),
+            verifier: Mutex::new(Verifier::default()),
         }
     }
 
@@ -1471,11 +1494,7 @@ mod tests {
 
     #[test]
     fn replacement_fetch_uses_the_interval_or_the_safe_expiry_lead() {
-        let (bundle, environment) = staging_bundle();
-        let mut output = Verifier::default()
-            .verify_bundle(&bundle, STAGING_BUNDLE_VERIFIED_AT_MS, &environment)
-            .unwrap();
-        output.bundle.expires_at_unix_ms = 1_000_000;
+        let output = test_output(1_000_000);
         assert_eq!(
             replacement_refresh_at_with_lead(&output, 100_000, Duration::from_mins(1), 70,),
             160_000

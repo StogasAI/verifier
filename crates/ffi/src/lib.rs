@@ -535,7 +535,7 @@ mod tests {
     }
 
     #[test]
-    fn verifies_the_shared_real_staging_bundle_through_the_c_abi() {
+    fn c_abi_rejects_the_pre_v2_bundle() {
         let bundle =
             include_bytes!("../../verifier/tests/fixtures/staging-bundle-sequence-1927.json");
         let verifier = stogas_verifier_new();
@@ -549,15 +549,8 @@ mod tests {
                 1_784_414_117_082,
             ))
         };
-        assert_eq!(response["ok"], true);
-        assert_eq!(response["value"]["bundle"]["sequence"], 1_927);
-        assert_eq!(
-            response["value"]["bundle"]["nodes"]
-                .as_array()
-                .unwrap()
-                .len(),
-            1
-        );
+        assert_eq!(response["ok"], false);
+        assert!(response["error"].as_str().unwrap().contains("catalog_hash"));
         // SAFETY: no call is using this live verifier.
         unsafe { stogas_verifier_free(verifier) };
     }

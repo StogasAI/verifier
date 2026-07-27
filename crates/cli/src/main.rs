@@ -242,11 +242,10 @@ async fn run_proof(input: ProofCommandInput) -> Result<()> {
     if input.json {
         println!("{}", serde_json::to_string(&output)?);
     } else {
-        println!("Verified response {}", output.request_id);
+        println!("Verified response");
         println!("  node: {}", output.node_id);
-        println!("  request SHA-256: {}", output.request_sha256);
-        println!("  response SHA-256: {}", output.response_sha256);
-        println!("  receipt SHA-256: {}", output.proof_hash);
+        println!("  catalog: {}", output.catalog_digest);
+        println!("  catalog nodes: {}", output.catalog_node_ids.join(", "));
     }
     Ok(())
 }
