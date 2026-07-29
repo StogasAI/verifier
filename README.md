@@ -23,10 +23,14 @@ stogas-verify serve
 
 Point any OpenAI-compatible client at `http://127.0.0.1:8787/v1`. The proxy:
 
-- polls for the latest evidence bundle every five minutes by default and avoids reverifying identical bytes;
+- randomly polls one independent evidence origin every minute by default, falls back to the other
+  after fetch, verification, or sequence regression failure, and avoids reverifying identical bytes;
 - supports attested TLS, E2EE, or both on the normal inference endpoints;
 - defaults to WebPKI plus certificate and public-key pinning in native mode;
 - forwards `/v1/*` requests and streaming responses without installing a local CA.
+
+The official origins are `https://evidence.stogas.ai/bundles/latest.json` on Cloudflare/R2 and
+`https://evidence2.stogas.ai/bundles/latest.json` on AWS CloudFront/S3.
 
 `serve` is a native application. It is the right choice when the calling application cannot perform TLS pinning itself.
 
@@ -68,6 +72,11 @@ console.log(result.bundle.nodes);
 ```
 
 Browser code imports `@stogas/verifier/browser` and calls its default WebAssembly initializer once. Its `StogasTransport` verifies bundles, encrypts requests to every accepted node, and supplies a custom `fetch` for the OpenAI JavaScript client. Browser `fetch` does not expose the peer certificate, so direct browser mode provides E2EE rather than attested TLS.
+
+`StogasTransport.bundleURLs` exposes the configured evidence origins.
+`StogasTransport.bundleSnapshot` reports the origin used by the latest successful refresh, when the
+accepted bytes were verified, and the measured local cryptographic verification time. Byte-identical
+refreshes reuse the earlier verified result and its measurement.
 
 The client API has two forms:
 

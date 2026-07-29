@@ -8,12 +8,14 @@ export { verify_bundle };
 
 const PRODUCTION_API_BASE_URL = 'https://api.stogas.ai/v1';
 const PRODUCTION_BUNDLE_URL = 'https://evidence.stogas.ai/bundles/latest.json';
+const PRODUCTION_BUNDLE_FALLBACK_URL = 'https://evidence2.stogas.ai/bundles/latest.json';
 const STAGING_API_BASE_URL = 'https://api-staging.stogas.ai/v1';
 const STAGING_BUNDLE_URL = 'https://evidence-staging.stogas.ai/bundles/latest.json';
-const DEFAULT_REFRESH_SECONDS = 300;
+const STAGING_BUNDLE_FALLBACK_URL = 'https://evidence2-staging.stogas.ai/bundles/latest.json';
+const DEFAULT_REFRESH_SECONDS = 60;
 const MAX_REFRESH_SECONDS = 840;
 const MAX_BUNDLE_BYTES = 16 * 1024 * 1024;
-const BUNDLE_FETCH_TIMEOUT_MS = 10_000;
+const BUNDLE_ORIGIN_TIMEOUT_MS = 5_000;
 const EXPIRY_REFRESH_LEAD_MS = 60_000;
 const E2EE_CONTENT_TYPE = 'application/vnd.stogas.e2ee';
 const E2EE_TRANSCRIPT_HEADER = 'x-stogas-e2ee-transcript-sha256';
@@ -56,22 +58,24 @@ export class Verifier {
 export class StogasTransport {
 	#active;
 	#baseURL;
-	#bundleURL;
+	#bundleURLs;
 	#bundleAbort;
 	#closed = false;
 	#core;
 	#fetchImpl;
-	#inFlightRequests = 0;
 	#listeners = new Set();
 	#refreshIntervalMs;
 	#refreshPromise;
 	#retryCount = 0;
 	#snapshot = Object.freeze({
 		bundle: null,
+		bundleURL: null,
 		envelopeSha256: null,
 		error: null,
 		fetchedAtUnixMs: null,
-		status: 'idle'
+		status: 'idle',
+		verificationDurationMs: null,
+		verifiedAtUnixMs: null
 	});
 	#timer;
 
@@ -105,18 +109,25 @@ export class StogasTransport {
 			options.baseURL ??
 				(environment === 'staging' ? STAGING_API_BASE_URL : PRODUCTION_API_BASE_URL)
 		);
-		this.#bundleURL = normalizeBundleURL(
-			options.bundleURL ?? (environment === 'staging' ? STAGING_BUNDLE_URL : PRODUCTION_BUNDLE_URL)
-		);
+		const defaultBundleURLs =
+			environment === 'staging'
+				? [STAGING_BUNDLE_URL, STAGING_BUNDLE_FALLBACK_URL]
+				: [PRODUCTION_BUNDLE_URL, PRODUCTION_BUNDLE_FALLBACK_URL];
+		const configuredBundleURL =
+			options.bundleURL === undefined ? undefined : normalizeBundleURL(options.bundleURL);
+		this.#bundleURLs =
+			configuredBundleURL === undefined || configuredBundleURL === defaultBundleURLs[0]
+				? defaultBundleURLs
+				: [configuredBundleURL];
 		if (
 			environment === 'staging' &&
-			(this.#baseURL !== STAGING_API_BASE_URL || this.#bundleURL !== STAGING_BUNDLE_URL)
+			(this.#baseURL !== STAGING_API_BASE_URL || !sameStrings(this.#bundleURLs, defaultBundleURLs))
 		) {
 			throw new TypeError(
 				'staging verification is restricted to the Stogas staging API and evidence origins'
 			);
 		}
-		this.#fetchImpl = options.fetch ?? globalThis.fetch;
+		this.#fetchImpl = options.fetch ?? ((input, init) => globalThis.fetch(input, init));
 		if (typeof this.#fetchImpl !== 'function') {
 			throw new TypeError('a Fetch API implementation is required');
 		}
@@ -131,6 +142,10 @@ export class StogasTransport {
 
 	get bundleSnapshot() {
 		return this.#snapshot;
+	}
+
+	get bundleURLs() {
+		return [...this.#bundleURLs];
 	}
 
 	subscribe(listener) {
@@ -198,13 +213,6 @@ export class StogasTransport {
 			request.headers.get('accept') ?? undefined,
 			request.headers.get('x-stogas-return-extra-fields') ?? undefined
 		);
-		this.#inFlightRequests += 1;
-		let requestReleased = false;
-		const releaseRequest = () => {
-			if (requestReleased) return;
-			requestReleased = true;
-			this.#inFlightRequests = Math.max(0, this.#inFlightRequests - 1);
-		};
 		let response;
 		try {
 			response = await this.#fetchImpl(request.url, {
@@ -220,10 +228,9 @@ export class StogasTransport {
 			});
 		} catch (error) {
 			session.free();
-			releaseRequest();
 			throw error;
 		}
-		return decryptResponse(response, session, releaseRequest);
+		return decryptResponse(response, session);
 	}
 
 	close() {
@@ -247,64 +254,77 @@ export class StogasTransport {
 
 	async #refreshBundle() {
 		clearTimeout(this.#timer);
-		if (this.#inFlightRequests > 0) {
-			this.#setTimer(1_000);
-			return false;
-		}
 		this.#publish({ ...this.#snapshot, error: null, status: 'refreshing' });
-		const abort = new AbortController();
-		this.#bundleAbort = abort;
-		const timeout = setTimeout(() => abort.abort(), BUNDLE_FETCH_TIMEOUT_MS);
-		timeout.unref?.();
 		try {
-			const response = await this.#fetchImpl(this.#bundleURL, {
-				cache: 'no-store',
-				credentials: 'omit',
-				headers: { accept: 'application/json' },
-				method: 'GET',
-				redirect: 'error',
-				signal: abort.signal
-			});
-			if (!response.ok) {
-				throw new Error(`bundle fetch failed with HTTP ${response.status}`);
+			const urls =
+				this.#bundleURLs.length === 2 && Math.random() < 0.5
+					? [this.#bundleURLs[1], this.#bundleURLs[0]]
+					: this.#bundleURLs;
+			const failures = [];
+			for (const url of urls) {
+				try {
+					const candidate = await this.#fetchBundleCandidate(url);
+					const unchangedBytes = this.#active?.sha256 === candidate.sha256;
+					const verificationStartedAt = monotonicNow();
+					const output = unchangedBytes
+						? { bundle: this.#active.bundle }
+						: this.#core.verify_bundle(candidate.bytes);
+					const verificationDurationMs = unchangedBytes
+						? this.#active.verificationDurationMs
+						: monotonicNow() - verificationStartedAt;
+					const verifiedAtUnixMs = unchangedBytes ? this.#active.verifiedAtUnixMs : Date.now();
+					if (this.#active && output.bundle.sequence < this.#active.bundle.sequence) {
+						throw new Error('origin returned an older bundle sequence');
+					}
+					const fetchedAtUnixMs = Date.now();
+					if (this.#active && output.bundle.sequence === this.#active.bundle.sequence) {
+						if (!unchangedBytes) {
+							throw new Error('origin returned different bytes for the active bundle sequence');
+						}
+						this.#active.bundleURL = url;
+						this.#active.fetchedAtUnixMs = fetchedAtUnixMs;
+						this.#publish({
+							...this.#snapshot,
+							bundleURL: url,
+							error: null,
+							fetchedAtUnixMs,
+							status: 'ready'
+						});
+						this.#retryCount = 0;
+						this.#scheduleRefresh();
+						return false;
+					}
+					this.#active = {
+						bundle: output.bundle,
+						bundleURL: url,
+						expiresAtUnixMs: output.bundle.expires_at_unix_ms,
+						fetchedAtUnixMs,
+						sha256: candidate.sha256,
+						verificationDurationMs,
+						verifiedAtUnixMs
+					};
+					this.#publish({
+						bundle: output.bundle,
+						bundleURL: url,
+						envelopeSha256: candidate.sha256,
+						error: null,
+						fetchedAtUnixMs,
+						status: 'ready',
+						verificationDurationMs,
+						verifiedAtUnixMs
+					});
+					this.#retryCount = 0;
+					this.#scheduleRefresh();
+					return true;
+				} catch (error) {
+					failures.push(new Error(`${new URL(url).host}: ${errorMessage(error)}`));
+					if (this.#closed) throw error;
+				}
 			}
-			const declaredLength = Number(response.headers.get('content-length'));
-			if (Number.isFinite(declaredLength) && declaredLength > MAX_BUNDLE_BYTES) {
-				throw new Error(`bundle exceeds ${MAX_BUNDLE_BYTES} bytes`);
-			}
-			const bytes = await readBoundedBody(response, MAX_BUNDLE_BYTES);
-			const sha256 = await sha256Hex(bytes);
-			if (this.#active?.sha256 === sha256) {
-				const fetchedAtUnixMs = Date.now();
-				this.#active.fetchedAtUnixMs = fetchedAtUnixMs;
-				this.#publish({
-					...this.#snapshot,
-					error: null,
-					fetchedAtUnixMs,
-					status: 'ready'
-				});
-				this.#retryCount = 0;
-				this.#scheduleRefresh();
-				return false;
-			}
-			const output = this.#core.verify_bundle(bytes);
-			const fetchedAtUnixMs = Date.now();
-			this.#active = {
-				bundle: output.bundle,
-				expiresAtUnixMs: output.bundle.expires_at_unix_ms,
-				fetchedAtUnixMs,
-				sha256
-			};
-			this.#publish({
-				bundle: output.bundle,
-				envelopeSha256: sha256,
-				error: null,
-				fetchedAtUnixMs,
-				status: 'ready'
-			});
-			this.#retryCount = 0;
-			this.#scheduleRefresh();
-			return true;
+			throw new AggregateError(
+				failures,
+				`every evidence origin failed: ${failures.map(errorMessage).join('; ')}`
+			);
 		} catch (error) {
 			this.#publish({
 				...this.#snapshot,
@@ -313,6 +333,29 @@ export class StogasTransport {
 			});
 			this.#scheduleRetry();
 			throw error;
+		}
+	}
+
+	async #fetchBundleCandidate(url) {
+		const abort = new AbortController();
+		this.#bundleAbort = abort;
+		const timeout = setTimeout(() => abort.abort(), BUNDLE_ORIGIN_TIMEOUT_MS);
+		timeout.unref?.();
+		try {
+			const response = await this.#fetchImpl(url, {
+				credentials: 'omit',
+				headers: { accept: 'application/json' },
+				method: 'GET',
+				redirect: 'error',
+				signal: abort.signal
+			});
+			if (!response.ok) throw new Error(`returned HTTP ${response.status}`);
+			const declaredLength = Number(response.headers.get('content-length'));
+			if (Number.isFinite(declaredLength) && declaredLength > MAX_BUNDLE_BYTES) {
+				throw new Error(`bundle exceeds ${MAX_BUNDLE_BYTES} bytes`);
+			}
+			const bytes = await readBoundedBody(response, MAX_BUNDLE_BYTES);
+			return { bytes, sha256: await sha256Hex(bytes) };
 		} finally {
 			clearTimeout(timeout);
 			if (this.#bundleAbort === abort) this.#bundleAbort = undefined;
@@ -390,6 +433,18 @@ function normalizeBundleURL(value) {
 	return url.toString();
 }
 
+function sameStrings(left, right) {
+	return left.length === right.length && left.every((value, index) => value === right[index]);
+}
+
+function errorMessage(error) {
+	return error instanceof Error ? error.message : String(error);
+}
+
+function monotonicNow() {
+	return globalThis.performance?.now() ?? Date.now();
+}
+
 function bearerAPIKey(value) {
 	if (typeof value !== 'string') {
 		throw new TypeError('a Bearer authorization value is required');
@@ -434,7 +489,7 @@ async function readBoundedBody(response, limit) {
 	return bytes;
 }
 
-async function decryptResponse(response, session, releaseRequest) {
+async function decryptResponse(response, session) {
 	const transcriptSHA256 = session.transcript_sha256;
 	if (
 		response.status !== 200 ||
@@ -443,7 +498,6 @@ async function decryptResponse(response, session, releaseRequest) {
 		!response.body
 	) {
 		session.free();
-		releaseRequest();
 		throw new Error('upstream did not return an encrypted response');
 	}
 	const reader = response.body.getReader();
@@ -455,7 +509,6 @@ async function decryptResponse(response, session, releaseRequest) {
 		if (!sessionFreed) {
 			sessionFreed = true;
 			session.free();
-			releaseRequest();
 		}
 	};
 	try {

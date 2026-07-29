@@ -34,10 +34,13 @@ export interface StogasTransportOptions {
 
 export interface StogasBundleSnapshot {
 	bundle: ReturnType<CoreVerifier['verify_bundle']>['bundle'] | null;
+	bundleURL: string | null;
 	envelopeSha256: string | null;
 	error: string | null;
 	fetchedAtUnixMs: number | null;
 	status: 'idle' | 'refreshing' | 'ready' | 'error';
+	verificationDurationMs: number | null;
+	verifiedAtUnixMs: number | null;
 }
 
 export interface StogasOpenAIOptions {
@@ -52,6 +55,7 @@ export declare class StogasTransport {
 	static create(options?: StogasTransportOptions): Promise<StogasTransport>;
 	readonly baseURL: string;
 	readonly bundleSnapshot: StogasBundleSnapshot;
+	readonly bundleURLs: string[];
 	readonly fetch: typeof globalThis.fetch;
 	openAIOptions(apiKey: string): StogasOpenAIOptions;
 	verifyResponseProof(

@@ -88,7 +88,7 @@ enum Command {
         #[arg(long, default_value = "127.0.0.1:8787")]
         listen: String,
         /// How often to fetch and verify the latest bundle.
-        #[arg(long, default_value_t = 300, value_parser = clap::value_parser!(u16).range(1..=840))]
+        #[arg(long, default_value_t = 60, value_parser = clap::value_parser!(u16).range(1..=840))]
         bundle_refresh_seconds: u16,
         /// Protect inference with verified TLS, application E2EE, or both.
         #[arg(long, value_enum)]
@@ -331,7 +331,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn serve_refresh_interval_defaults_to_five_minutes() {
+    fn serve_refresh_interval_defaults_to_one_minute() {
         let cli = Cli::try_parse_from(["stogas-verify", "serve"]).unwrap();
         let Command::Serve {
             bundle_refresh_seconds,
@@ -340,7 +340,7 @@ mod tests {
         else {
             panic!("serve command was not parsed");
         };
-        assert_eq!(bundle_refresh_seconds, 300);
+        assert_eq!(bundle_refresh_seconds, 60);
     }
 
     #[test]

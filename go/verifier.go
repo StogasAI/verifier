@@ -62,7 +62,7 @@ func NewTransport(options TransportOptions) (*Transport, error) {
 		options.Security = "tls"
 	}
 	if options.BundleRefreshIntervalSeconds == 0 {
-		options.BundleRefreshIntervalSeconds = 300
+		options.BundleRefreshIntervalSeconds = 60
 	}
 	configuration, err := json.Marshal(options)
 	if err != nil {

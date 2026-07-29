@@ -24,7 +24,7 @@ impl PythonTransport {
     #[new]
     #[pyo3(signature = (
         security = "tls",
-        bundle_refresh_interval_seconds = 300,
+        bundle_refresh_interval_seconds = 60,
         base_url = None,
         bundle_url = None
     ))]

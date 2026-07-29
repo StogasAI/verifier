@@ -17,6 +17,7 @@ use rustls::{
 };
 use sha2::{Digest as _, Sha256};
 use std::{
+    collections::HashMap,
     fmt,
     net::SocketAddr,
     sync::{Arc, mpsc::SyncSender},
@@ -33,14 +34,18 @@ use crate::{SecurityMode, e2ee};
 
 const MAX_BUNDLE_BYTES: usize = 16 * 1024 * 1024;
 const MAX_REQUEST_BYTES: usize = 16 * 1024 * 1024;
-const BUNDLE_FETCH_TIMEOUT_SECONDS: u64 = 10;
+const BUNDLE_ORIGIN_TIMEOUT_SECONDS: u64 = 5;
 const MIN_REFRESH_RETRY_SECONDS: u64 = 4;
 const MAX_REFRESH_RETRY_SECONDS: u64 = 8;
 const MIN_BUNDLE_REFRESH_LEAD_SECONDS: i64 = 40;
 const MAX_BUNDLE_REFRESH_LEAD_SECONDS: i64 = 70;
+const PRODUCTION_BUNDLE_URL: &str = "https://evidence.stogas.ai/bundles/latest.json";
+const PRODUCTION_BUNDLE_FALLBACK_URL: &str = "https://evidence2.stogas.ai/bundles/latest.json";
+const STAGING_BUNDLE_URL: &str = "https://evidence-staging.stogas.ai/bundles/latest.json";
+const STAGING_BUNDLE_FALLBACK_URL: &str = "https://evidence2-staging.stogas.ai/bundles/latest.json";
 
 pub struct ServeConfig {
-    bundle_url: Url,
+    bundle_urls: Vec<Url>,
     bundle_fetcher: reqwest::Client,
     upstream_client: reqwest::Client,
     upstream: Url,
@@ -72,11 +77,11 @@ struct BrowserAccess {
 
 impl ServeConfig {
     pub fn new(input: ServeConfigInput<'_>) -> Result<Self> {
-        let bundle_url = secure_bundle_url(input.bundle_url)?;
+        let bundle_urls = secure_bundle_urls(input.bundle_url)?;
         let bundle_fetcher = reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
             .connect_timeout(Duration::from_secs(5))
-            .timeout(Duration::from_secs(BUNDLE_FETCH_TIMEOUT_SECONDS))
+            .timeout(Duration::from_secs(BUNDLE_ORIGIN_TIMEOUT_SECONDS))
             .build()?;
         let upstream_client = reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
@@ -95,7 +100,7 @@ impl ServeConfig {
             None => None,
         };
         Ok(Self {
-            bundle_url,
+            bundle_urls,
             bundle_fetcher,
             upstream_client,
             upstream,
@@ -191,6 +196,20 @@ fn secure_bundle_url(value: &str) -> Result<Url> {
     Ok(url)
 }
 
+fn secure_bundle_urls(primary: &str) -> Result<Vec<Url>> {
+    let primary = secure_bundle_url(primary)?;
+    let fallback = match primary.as_str() {
+        PRODUCTION_BUNDLE_URL => Some(PRODUCTION_BUNDLE_FALLBACK_URL),
+        STAGING_BUNDLE_URL => Some(STAGING_BUNDLE_FALLBACK_URL),
+        _ => None,
+    };
+    let mut urls = vec![primary];
+    if let Some(fallback) = fallback {
+        urls.push(secure_bundle_url(fallback)?);
+    }
+    Ok(urls)
+}
+
 struct ActiveBundle {
     output: VerificationOutput,
     client: reqwest::Client,
@@ -205,15 +224,18 @@ struct BundleVersion {
 }
 
 enum BundleFetch {
-    Changed {
-        bytes: Vec<u8>,
-        version: BundleVersion,
-    },
+    Changed(BundleCandidate),
     Unchanged,
+}
+
+struct BundleCandidate {
+    bytes: Vec<u8>,
+    version: BundleVersion,
 }
 
 struct ProxyState {
     active: RwLock<Arc<ActiveBundle>>,
+    bundle_versions: Mutex<HashMap<String, BundleVersion>>,
     config: Arc<ServeConfig>,
     refresh_lock: Mutex<()>,
     verifier: Mutex<Verifier>,
@@ -222,12 +244,10 @@ struct ProxyState {
 pub async fn serve(config: ServeConfig) -> Result<()> {
     let config = Arc::new(config);
     let mut verifier = Verifier::default();
-    let BundleFetch::Changed { bytes, version } = fetch_bundle(&config, None).await? else {
-        unreachable!("an initial bundle fetch cannot be unchanged");
-    };
-    let initial = activate_bundle(&config, &bytes, version, wall_clock_ms(), &mut verifier)?;
+    let (initial, bundle_versions) = fetch_initial_bundle(&config, &mut verifier).await?;
     let state = Arc::new(ProxyState {
         active: RwLock::new(Arc::new(initial)),
+        bundle_versions: Mutex::new(bundle_versions),
         config: Arc::clone(&config),
         refresh_lock: Mutex::new(()),
         verifier: Mutex::new(verifier),
@@ -268,12 +288,10 @@ pub async fn serve_embedded(
     let config = Arc::new(config);
     let mut verifier = Verifier::default();
     let initialized = async {
-        let BundleFetch::Changed { bytes, version } = fetch_bundle(&config, None).await? else {
-            unreachable!("an initial bundle fetch cannot be unchanged");
-        };
-        let initial = activate_bundle(&config, &bytes, version, wall_clock_ms(), &mut verifier)?;
+        let (initial, bundle_versions) = fetch_initial_bundle(&config, &mut verifier).await?;
         let state = Arc::new(ProxyState {
             active: RwLock::new(Arc::new(initial)),
+            bundle_versions: Mutex::new(bundle_versions),
             config: Arc::clone(&config),
             refresh_lock: Mutex::new(()),
             verifier: Mutex::new(verifier),
@@ -375,43 +393,142 @@ async fn sleep_until_wall_clock(deadline_ms: i64) {
     }
 }
 
-async fn refresh_once(state: &ProxyState) -> Result<bool> {
-    let _guard = state.refresh_lock.lock().await;
-    let previous = state.active.read().await.version.clone();
-    let BundleFetch::Changed { bytes, version } =
-        fetch_bundle(&state.config, Some(&previous)).await?
-    else {
-        return Ok(false);
-    };
-    let mut verifier = state.verifier.lock().await;
-    let candidate = activate_bundle(
-        &state.config,
-        &bytes,
-        version,
-        wall_clock_ms(),
-        &mut verifier,
-    )?;
-    drop(verifier);
-    *state.active.write().await = Arc::new(candidate);
-    Ok(true)
+async fn fetch_initial_bundle(
+    config: &ServeConfig,
+    verifier: &mut Verifier,
+) -> Result<(ActiveBundle, HashMap<String, BundleVersion>)> {
+    let mut errors = Vec::new();
+    for bundle_url in randomized_bundle_urls(config) {
+        match fetch_bundle_origin(config, bundle_url.clone(), None).await {
+            Ok(BundleFetch::Changed(candidate)) => match activate_bundle(
+                config,
+                &candidate.bytes,
+                candidate.version.clone(),
+                wall_clock_ms(),
+                verifier,
+            ) {
+                Ok(active) => {
+                    let mut versions = HashMap::new();
+                    versions.insert(bundle_url.to_string(), candidate.version);
+                    return Ok((active, versions));
+                }
+                Err(error) => errors.push(format!("{bundle_url}: {error}")),
+            },
+            Ok(BundleFetch::Unchanged) => {
+                errors.push(format!(
+                    "{bundle_url}: returned an unexpected unchanged response"
+                ));
+            }
+            Err(error) => errors.push(error.to_string()),
+        }
+    }
+    bail!("every evidence origin failed: {}", errors.join("; "))
 }
 
-async fn fetch_bundle(
+async fn refresh_once(state: &ProxyState) -> Result<bool> {
+    let _guard = state.refresh_lock.lock().await;
+    let current = {
+        let active = state.active.read().await;
+        Arc::clone(&active)
+    };
+    let mut errors = Vec::new();
+    for bundle_url in randomized_bundle_urls(&state.config) {
+        let previous = {
+            let versions = state.bundle_versions.lock().await;
+            versions.get(bundle_url.as_str()).cloned()
+        };
+        match fetch_bundle_origin(&state.config, bundle_url.clone(), previous).await {
+            Ok(BundleFetch::Unchanged) => return Ok(false),
+            Ok(BundleFetch::Changed(candidate)) => {
+                if candidate.version.sha256 == current.version.sha256 {
+                    state
+                        .bundle_versions
+                        .lock()
+                        .await
+                        .insert(bundle_url.to_string(), candidate.version);
+                    return Ok(false);
+                }
+                let activated = {
+                    let mut verifier = state.verifier.lock().await;
+                    activate_bundle(
+                        &state.config,
+                        &candidate.bytes,
+                        candidate.version.clone(),
+                        wall_clock_ms(),
+                        &mut verifier,
+                    )
+                };
+                let candidate = match activated {
+                    Ok(candidate) => candidate,
+                    Err(error) => {
+                        errors.push(format!("{bundle_url}: {error}"));
+                        continue;
+                    }
+                };
+                if candidate.output.bundle.sequence < current.output.bundle.sequence {
+                    errors.push(format!("{bundle_url}: returned an older bundle sequence"));
+                    continue;
+                }
+                if candidate.output.bundle.sequence == current.output.bundle.sequence {
+                    state
+                        .bundle_versions
+                        .lock()
+                        .await
+                        .insert(bundle_url.to_string(), candidate.version);
+                    return Ok(false);
+                }
+                {
+                    let mut versions = state.bundle_versions.lock().await;
+                    versions.clear();
+                    versions.insert(bundle_url.to_string(), candidate.version.clone());
+                }
+                *state.active.write().await = Arc::new(candidate);
+                return Ok(true);
+            }
+            Err(error) => errors.push(error.to_string()),
+        }
+    }
+    bail!("every evidence origin failed: {}", errors.join("; "))
+}
+
+fn randomized_bundle_urls(config: &ServeConfig) -> Vec<Url> {
+    let mut urls = config.bundle_urls.clone();
+    if urls.len() == 2 && rand::rng().random_bool(0.5) {
+        urls.swap(0, 1);
+    }
+    urls
+}
+
+async fn fetch_bundle_origin(
     config: &ServeConfig,
-    previous: Option<&BundleVersion>,
+    bundle_url: Url,
+    previous: Option<BundleVersion>,
 ) -> Result<BundleFetch> {
-    let mut request = config
-        .bundle_fetcher
-        .get(config.bundle_url.clone())
-        .header(reqwest::header::CACHE_CONTROL, "no-cache");
-    if let Some(etag) = previous.and_then(|version| version.etag.as_deref()) {
+    let mut request = config.bundle_fetcher.get(bundle_url.clone());
+    if let Some(etag) = previous
+        .as_ref()
+        .and_then(|version| version.etag.as_deref())
+    {
         request = request.header(reqwest::header::IF_NONE_MATCH, etag);
     }
-    let response = request.send().await?;
+    let response = request.send().await.with_context(|| {
+        format!(
+            "{} bundle fetch failed",
+            bundle_url.host_str().unwrap_or("evidence")
+        )
+    })?;
     if response.status() == StatusCode::NOT_MODIFIED {
+        if previous.is_none() {
+            bail!("{bundle_url} returned 304 without a prior ETag");
+        }
         return Ok(BundleFetch::Unchanged);
     }
-    let response = response.error_for_status()?;
+    let response = response.error_for_status().with_context(|| {
+        format!(
+            "{} bundle fetch failed",
+            bundle_url.host_str().unwrap_or("evidence")
+        )
+    })?;
     let etag = response
         .headers()
         .get(reqwest::header::ETAG)
@@ -419,13 +536,16 @@ async fn fetch_bundle(
         .map(str::to_owned);
     let bytes = bounded_response(response, MAX_BUNDLE_BYTES).await?;
     let sha256 = bundle_sha256(&bytes);
-    if previous.is_some_and(|version| version_matches(version, sha256)) {
+    if previous
+        .as_ref()
+        .is_some_and(|version| version_matches(version, sha256))
+    {
         return Ok(BundleFetch::Unchanged);
     }
-    Ok(BundleFetch::Changed {
+    Ok(BundleFetch::Changed(BundleCandidate {
         bytes,
         version: BundleVersion { etag, sha256 },
-    })
+    }))
 }
 
 fn bundle_sha256(bytes: &[u8]) -> [u8; 32] {
@@ -961,7 +1081,7 @@ mod tests {
                     ed25519_public_key: String::new(),
                     hpke_public_key: String::new(),
                     schema: "stogas.node-report.v2".into(),
-                    tls_spki_sha256: spki_hash.clone(),
+                    tls_spki_sha256: spki_hash,
                 },
                 report_data_sha512: "00".repeat(64),
                 release_measurement: "00".repeat(48),
@@ -1124,6 +1244,7 @@ mod tests {
                 recipients,
                 version,
             })),
+            bundle_versions: Mutex::new(HashMap::new()),
             config: Arc::new(
                 ServeConfig::new(ServeConfigInput {
                     bundle_url,
@@ -1470,6 +1591,13 @@ mod tests {
         assert!(secure_base_url("https://api.example/path", "upstream URL").is_err());
         assert!(secure_bundle_url("https://evidence.example/bundles/latest.json").is_ok());
         assert!(secure_bundle_url("https://evidence.example/latest.json?redirect=1").is_err());
+        assert_eq!(secure_bundle_urls(PRODUCTION_BUNDLE_URL).unwrap().len(), 2);
+        assert_eq!(
+            secure_bundle_urls("https://evidence.example/bundles/latest.json")
+                .unwrap()
+                .len(),
+            1
+        );
         assert_eq!(
             secure_browser_origin("https://client.example/").unwrap(),
             "https://client.example"

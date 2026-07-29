@@ -49,7 +49,7 @@ impl Default for TransportOptions {
     fn default() -> Self {
         Self {
             security: SecurityMode::Tls,
-            bundle_refresh_interval: Duration::from_mins(5),
+            bundle_refresh_interval: Duration::from_mins(1),
             bundle_url: PRODUCTION_BUNDLE_URL.to_owned(),
             base_url: PRODUCTION_UPSTREAM.to_owned(),
         }

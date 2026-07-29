@@ -19,6 +19,37 @@ assert.throws(
 		}),
 	/restricted to the Stogas staging API/
 );
+const defaultTransport = new StogasTransport();
+assert.deepEqual(defaultTransport.bundleURLs, [
+	'https://evidence.stogas.ai/bundles/latest.json',
+	'https://evidence2.stogas.ai/bundles/latest.json'
+]);
+assert.deepEqual(defaultTransport.bundleSnapshot, {
+	bundle: null,
+	bundleURL: null,
+	envelopeSha256: null,
+	error: null,
+	fetchedAtUnixMs: null,
+	status: 'idle',
+	verificationDurationMs: null,
+	verifiedAtUnixMs: null
+});
+defaultTransport.close();
+
+const originalFetch = globalThis.fetch;
+let defaultFetchReceiver;
+globalThis.fetch = function () {
+	defaultFetchReceiver = this;
+	return Promise.resolve(new Response(null, { status: 503 }));
+};
+const defaultFetchTransport = new StogasTransport();
+try {
+	await assert.rejects(defaultFetchTransport.refreshBundle(), /every evidence origin failed/);
+	assert.equal(defaultFetchReceiver, globalThis);
+} finally {
+	defaultFetchTransport.close();
+	globalThis.fetch = originalFetch;
+}
 
 const abortTransport = new StogasTransport({
 	bundleURL: 'https://evidence.example/bundles/latest.json',
@@ -34,6 +65,24 @@ const abortTransport = new StogasTransport({
 const abortedRefresh = abortTransport.refreshBundle();
 abortTransport.close();
 await assert.rejects(abortedRefresh, /abort/i);
+
+const attemptedOrigins = [];
+const fallbackTransport = new StogasTransport({
+	fetch: async (input) => {
+		attemptedOrigins.push(new URL(input).host);
+		return new Response(null, { status: 503 });
+	}
+});
+try {
+	await assert.rejects(fallbackTransport.refreshBundle(), /every evidence origin failed/);
+	assert.equal(attemptedOrigins.length, 2);
+	assert.deepEqual(
+		new Set(attemptedOrigins),
+		new Set(['evidence.stogas.ai', 'evidence2.stogas.ai'])
+	);
+} finally {
+	fallbackTransport.close();
+}
 
 const fetch = async () => new Response(null, { status: 503 });
 const transport = new StogasTransport({
@@ -76,4 +125,19 @@ assert.doesNotMatch(
 	encryptedRequestOptions,
 	/cache:\s*'no-store'/,
 	'encrypted POSTs must not ask the browser to synthesize Cache-Control'
+);
+assert.doesNotMatch(
+	browserSource,
+	/cache:\s*'no-store'/,
+	'bundle reads must preserve normal browser and shared-cache revalidation'
+);
+assert.doesNotMatch(
+	browserSource,
+	/#inFlightRequests/,
+	'long-lived responses must not postpone bundle refresh'
+);
+assert.match(
+	browserSource,
+	/evidence2\.stogas\.ai\/bundles\/latest\.json/,
+	'the production transport must include the independent evidence origin'
 );

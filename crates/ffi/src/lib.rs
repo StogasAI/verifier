@@ -51,7 +51,7 @@ impl Default for AbiTransportOptions {
     fn default() -> Self {
         Self {
             security: "tls".into(),
-            bundle_refresh_interval_seconds: 300,
+            bundle_refresh_interval_seconds: 60,
             base_url: None,
             bundle_url: None,
         }
