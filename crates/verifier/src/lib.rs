@@ -902,20 +902,19 @@ pub fn verify_local_heartbeat_admission(
     };
 
     let verified = VerifiedNode {
-        accepted_cert_sha256: node.report_data.accepted_cert_sha256.clone(),
         catalog: node.catalog.clone(),
         chip_id: node.chip_id.clone(),
         drand_round: node.report_data.drand.round,
         drand_round_time_unix_ms,
         evidence_age_ms,
         node_id: node.node_id.clone(),
+        quote: node.quote.clone(),
         quote_verified_at_unix_ms: now_unix_ms,
         region: node.region.clone(),
         report_data: node.report_data.clone(),
         report_data_sha512: node.report_data_sha512.clone(),
         release_measurement: node.release_measurement.clone(),
         reported_tcb: node.reported_tcb.clone(),
-        tls_spki_sha256: node.report_data.tls_spki_sha256.clone(),
     };
     verify_heartbeat_candidate_signature(heartbeat, &heartbeat.report_data.ed25519_public_key)?;
     Ok(VerifiedAdmission { node, verified })
@@ -1795,7 +1794,6 @@ fn verify_node(
         amd_stack,
     )?;
     Ok(VerifiedNode {
-        accepted_cert_sha256: node.report_data.accepted_cert_sha256.clone(),
         catalog: node.catalog.clone(),
         chip_id: node.chip_id.clone(),
         drand_round: round,
@@ -1804,13 +1802,13 @@ fn verify_node(
             .saturating_sub(drand_round_time_unix_ms)
             .max(0),
         node_id: node.node_id.clone(),
+        quote: node.quote.clone(),
         quote_verified_at_unix_ms: quote_verified_at,
         region: node.region.clone(),
         report_data: node.report_data.clone(),
         report_data_sha512: node.report_data_sha512.clone(),
         release_measurement: node.release_measurement.clone(),
         reported_tcb: node.reported_tcb.clone(),
-        tls_spki_sha256: node.report_data.tls_spki_sha256.clone(),
     })
 }
 
@@ -2753,6 +2751,7 @@ mod tests {
         assert_eq!(output.node.chip_id, "66".repeat(64));
         assert_eq!(output.node.reported_tcb, "00".repeat(8));
         assert_eq!(output.verified.evidence_age_ms, 0);
+        assert_eq!(output.verified.quote, output.node.quote);
 
         for mutation in [
             "/heartbeat/report_data_sha512",

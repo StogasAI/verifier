@@ -60,6 +60,7 @@ export declare class StogasTransport {
 		responseBody: Uint8Array,
 		e2eeTranscriptSHA256?: string
 	): ReturnType<CoreVerifier['verify_response_proof']>;
+	verifyNodeLedgerRecord(ledger: Uint8Array): ReturnType<CoreVerifier['verify_node_ledger_record']>;
 	refreshBundle(): Promise<boolean>;
 	subscribe(listener: (snapshot: StogasBundleSnapshot) => void): () => void;
 	close(): void;

@@ -159,6 +159,11 @@ export class StogasTransport {
 		return this.#core.verify_response_proof(proof, requestBody, responseBody, e2eeTranscriptSHA256);
 	}
 
+	verifyNodeLedgerRecord(ledger) {
+		this.#assertOpen();
+		return this.#core.verify_node_ledger_record(ledger);
+	}
+
 	async refreshBundle() {
 		this.#assertOpen();
 		if (this.#refreshPromise) return this.#refreshPromise;

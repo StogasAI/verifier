@@ -45,6 +45,6 @@
 		"test:node": "node tests/node/verifier.test.mjs && node tests/node/offline-sigstore.test.mjs && node tests/node/browser-transport.test.mjs"
 	},
 	"devDependencies": {
-		"@playwright/test": "1.61.1"
+		"@playwright/test": "1.62.0"
 	}
 }

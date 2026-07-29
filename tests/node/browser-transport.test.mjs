@@ -54,6 +54,7 @@ try {
 		() => transport.verifyResponseProof(new Uint8Array(), new Uint8Array(), new Uint8Array()),
 		/a bundle must be verified before a response proof/
 	);
+	assert.throws(() => transport.verifyNodeLedgerRecord(new Uint8Array()), /invalid bundle JSON/);
 } finally {
 	transport.close();
 }

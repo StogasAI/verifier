@@ -757,8 +757,9 @@ impl TryFrom<&VerifiedNode> for NodePins {
     type Error = anyhow::Error;
 
     fn try_from(node: &VerifiedNode) -> Result<Self> {
-        let spki_sha256 = decode_sha256(&node.tls_spki_sha256)?;
+        let spki_sha256 = decode_sha256(&node.report_data.tls_spki_sha256)?;
         let certificate_sha256 = node
+            .report_data
             .accepted_cert_sha256
             .iter()
             .map(|value| decode_sha256(value))
@@ -935,7 +936,6 @@ mod tests {
             chain: vec![leaf_der, ca.der().clone()],
             key: PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(leaf_key.serialize_der())),
             node: VerifiedNode {
-                accepted_cert_sha256: vec![cert_hash],
                 catalog: stogas_verifier::CatalogIdentity {
                     digest: format!("sha256:{}", "00".repeat(32)),
                     sequence: 0,
@@ -945,11 +945,12 @@ mod tests {
                 drand_round_time_unix_ms: 0,
                 evidence_age_ms: 0,
                 node_id: "node".into(),
+                quote: "verified-quote".into(),
                 quote_verified_at_unix_ms: 0,
                 region: "test".into(),
                 report_data: ReportData {
-                    active_cert_sha256: "00".repeat(32),
-                    accepted_cert_sha256: vec!["00".repeat(32)],
+                    active_cert_sha256: cert_hash.clone(),
+                    accepted_cert_sha256: vec![cert_hash],
                     drand: DrandBeacon {
                         chain_hash: String::new(),
                         network: String::new(),
@@ -965,7 +966,6 @@ mod tests {
                 report_data_sha512: "00".repeat(64),
                 release_measurement: "00".repeat(48),
                 reported_tcb: "0000000000000000".into(),
-                tls_spki_sha256: spki_hash,
             },
         }
     }
@@ -1162,7 +1162,9 @@ mod tests {
         let certificate = test_certificate();
         let ca = certificate.ca.clone();
         let mut node = certificate.node.clone();
-        node.accepted_cert_sha256.insert(0, "11".repeat(32));
+        node.report_data
+            .accepted_cert_sha256
+            .insert(0, "11".repeat(32));
         let address = tls_server(certificate, 1).await;
         let client = pinned_client_with_roots(&[node], roots(ca)).unwrap();
         let response = client
@@ -1253,7 +1255,7 @@ mod tests {
         let certificate = test_certificate();
         let ca = certificate.ca.clone();
         let mut node = certificate.node.clone();
-        node.accepted_cert_sha256 = vec!["11".repeat(32)];
+        node.report_data.accepted_cert_sha256 = vec!["11".repeat(32)];
         let address = tls_server(certificate, 1).await;
         let client = pinned_client_with_roots(&[node], roots(ca)).unwrap();
         assert!(

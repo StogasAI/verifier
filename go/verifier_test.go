@@ -3,7 +3,6 @@
 package verifier
 
 import (
-	"encoding/json"
 	"errors"
 	"os"
 	"strings"
@@ -23,7 +22,7 @@ func TestRejectsMalformedBundle(t *testing.T) {
 	}
 }
 
-func TestVerifiesTheSharedRealStagingBundle(t *testing.T) {
+func TestRejectsTheSharedPreV2StagingBundle(t *testing.T) {
 	bundle, err := os.ReadFile("../crates/verifier/tests/fixtures/staging-bundle-sequence-1927.json")
 	if err != nil {
 		t.Fatal(err)
@@ -33,22 +32,8 @@ func TestVerifiesTheSharedRealStagingBundle(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = verifier.Close() })
-	result, err := verifier.verifyBundleAt(bundle, stagingBundleNowUnixMS)
-	if err != nil {
-		t.Fatal(err)
-	}
-	var output struct {
-		Bundle struct {
-			Nodes    []json.RawMessage `json:"nodes"`
-			Releases []json.RawMessage `json:"releases"`
-			Sequence uint64            `json:"sequence"`
-		} `json:"bundle"`
-	}
-	if err := json.Unmarshal(result, &output); err != nil {
-		t.Fatal(err)
-	}
-	if output.Bundle.Sequence != 1927 || len(output.Bundle.Nodes) != 1 || len(output.Bundle.Releases) != 1 {
-		t.Fatalf("unexpected verified trust set: %+v", output.Bundle)
+	if _, err := verifier.verifyBundleAt(bundle, stagingBundleNowUnixMS); err == nil || !strings.Contains(err.Error(), "catalog_hash") {
+		t.Fatalf("unexpected verification error: %v", err)
 	}
 }
 

@@ -319,7 +319,6 @@ mod tests {
     fn node(key: &SigningKey) -> VerifiedNode {
         let public_key = URL_SAFE_NO_PAD.encode(key.verifying_key().as_bytes());
         VerifiedNode {
-            accepted_cert_sha256: vec!["11".repeat(32)],
             catalog: CatalogIdentity {
                 digest: format!("sha256:{}", "44".repeat(32)),
                 sequence: 7,
@@ -329,6 +328,7 @@ mod tests {
             drand_round_time_unix_ms: NOW - 1_000,
             evidence_age_ms: 0,
             node_id: "33".repeat(32),
+            quote: "verified-quote".into(),
             quote_verified_at_unix_ms: NOW,
             region: "us-east-va".into(),
             report_data: ReportData {
@@ -349,7 +349,6 @@ mod tests {
             report_data_sha512: "99".repeat(64),
             release_measurement: "aa".repeat(48),
             reported_tcb: "0x0102030405060708".into(),
-            tls_spki_sha256: "88".repeat(32),
         }
     }
 
