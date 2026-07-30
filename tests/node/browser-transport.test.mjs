@@ -37,15 +37,15 @@ assert.deepEqual(defaultTransport.bundleSnapshot, {
 defaultTransport.close();
 
 const originalFetch = globalThis.fetch;
-let defaultFetchReceiver;
+let defaultFetchReceiverMatches = false;
 globalThis.fetch = function () {
-	defaultFetchReceiver = this;
+	defaultFetchReceiverMatches = this === globalThis;
 	return Promise.resolve(new Response(null, { status: 503 }));
 };
 const defaultFetchTransport = new StogasTransport();
 try {
 	await assert.rejects(defaultFetchTransport.refreshBundle(), /every evidence origin failed/);
-	assert.equal(defaultFetchReceiver, globalThis);
+	assert.equal(defaultFetchReceiverMatches, true);
 } finally {
 	defaultFetchTransport.close();
 	globalThis.fetch = originalFetch;
