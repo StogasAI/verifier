@@ -15,6 +15,7 @@ const STAGING_BUNDLE_FALLBACK_URL = 'https://evidence2-staging.stogas.ai/bundles
 const DEFAULT_REFRESH_SECONDS = 60;
 const MAX_REFRESH_SECONDS = 840;
 const MAX_BUNDLE_BYTES = 16 * 1024 * 1024;
+const MAX_E2EE_REQUEST_BYTES = 64 * 1024 * 1024;
 const BUNDLE_ORIGIN_TIMEOUT_MS = 5_000;
 const EXPIRY_REFRESH_LEAD_MS = 60_000;
 const E2EE_CONTENT_TYPE = 'application/vnd.stogas.e2ee';
@@ -205,7 +206,7 @@ export class StogasTransport {
 		await this.#ensureCurrentBundle();
 
 		const apiKey = bearerAPIKey(request.headers.get('authorization'));
-		const body = new Uint8Array(await request.arrayBuffer());
+		const body = await readBoundedBody(request, MAX_E2EE_REQUEST_BYTES, 'request');
 		const session = this.#core.seal_e2ee_request(
 			url.pathname,
 			apiKey,
@@ -350,11 +351,7 @@ export class StogasTransport {
 				signal: abort.signal
 			});
 			if (!response.ok) throw new Error(`returned HTTP ${response.status}`);
-			const declaredLength = Number(response.headers.get('content-length'));
-			if (Number.isFinite(declaredLength) && declaredLength > MAX_BUNDLE_BYTES) {
-				throw new Error(`bundle exceeds ${MAX_BUNDLE_BYTES} bytes`);
-			}
-			const bytes = await readBoundedBody(response, MAX_BUNDLE_BYTES);
+			const bytes = await readBoundedBody(response, MAX_BUNDLE_BYTES, 'bundle', true);
 			return { bytes, sha256: await sha256Hex(bytes) };
 		} finally {
 			clearTimeout(timeout);
@@ -461,9 +458,16 @@ async function sha256Hex(bytes) {
 	return Array.from(digest, (byte) => byte.toString(16).padStart(2, '0')).join('');
 }
 
-async function readBoundedBody(response, limit) {
-	if (!response.body) throw new Error('bundle response body is unavailable');
-	const reader = response.body.getReader();
+async function readBoundedBody(message, limit, label, required = false) {
+	const declaredLength = Number(message.headers.get('content-length'));
+	if (Number.isFinite(declaredLength) && declaredLength > limit) {
+		throw new Error(`${label} exceeds ${limit} bytes`);
+	}
+	if (!message.body) {
+		if (required) throw new Error(`${label} response body is unavailable`);
+		return new Uint8Array();
+	}
+	const reader = message.body.getReader();
 	const chunks = [];
 	let total = 0;
 	try {
@@ -473,7 +477,7 @@ async function readBoundedBody(response, limit) {
 			total += next.value.byteLength;
 			if (total > limit) {
 				await reader.cancel().catch(() => {});
-				throw new Error(`bundle exceeds ${limit} bytes`);
+				throw new Error(`${label} exceeds ${limit} bytes`);
 			}
 			chunks.push(next.value);
 		}

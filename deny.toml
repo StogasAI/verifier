@@ -1,4 +1,7 @@
 [advisories]
+ignore = [
+  { id = "RUSTSEC-2023-0071", reason = "Private-key timing leakage cannot affect the verifier's public-key-only RSA use." },
+]
 yanked = "deny"
 
 [licenses]
@@ -20,4 +23,3 @@ wildcards = "deny"
 [sources]
 unknown-git = "deny"
 unknown-registry = "deny"
-

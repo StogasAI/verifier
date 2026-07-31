@@ -24,7 +24,8 @@ stogas-verify serve
 Point any OpenAI-compatible client at `http://127.0.0.1:8787/v1`. The proxy:
 
 - randomly polls one independent evidence origin every minute by default, falls back to the other
-  after fetch, verification, or sequence regression failure, and avoids reverifying identical bytes;
+  after network, HTTP, local-verification, or sequence-regression failure, and avoids reverifying
+  identical bytes;
 - supports attested TLS, E2EE, or both on the normal inference endpoints;
 - defaults to WebPKI plus certificate and public-key pinning in native mode;
 - forwards `/v1/*` requests and streaming responses without installing a local CA.
@@ -124,8 +125,11 @@ A trusted result means that:
 - GitHub built the attested IGVM and launch policy from the expected Stogas gateway repository and workflow;
 - the independent Stogas release signature authorizes those same launch-policy bytes;
 - each trusted gateway presents a valid AMD SEV-SNP report for an authorized launch measurement;
+- the report CPUID, AMD product, VCEK structure, generation-specific hardware identifier, complete TCB, and pinned product root agree; unknown processor profiles fail closed;
 - the report binds that gateway's TLS, certificate-rotation, response-signing, and encryption keys;
-- the bundle was created within three minutes, remains unexpired, and has a validity interval of no more than 15 minutes;
+- the unsigned bundle envelope's SHA-256 matches its canonical body, while every trust claim verifies to its embedded root;
+- the bundle was created no more than three minutes before or one minute after local verification, remains unexpired, and has a positive validity interval of no more than 15 minutes;
+- every trusted gateway certificate and required AMD validity deadline covers that complete interval;
 - each trusted gateway's drand evidence was no more than two minutes old when the bundle was created.
 
 Older valid records are returned under `excluded_nodes`; they are never added to the trusted node set.

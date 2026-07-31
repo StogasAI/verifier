@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use clap::{Parser, Subcommand};
 use std::{
@@ -7,9 +7,15 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use stogas::SecurityMode;
-use stogas_verifier::{VerificationOutput, Verifier, verify_bundle};
+use stogas_verifier::{
+    MAX_INPUT_BYTES, VerificationOutput, Verifier,
+    response_proof::{MAX_BODY_BYTES, MAX_PROOF_BYTES},
+    verify_bundle,
+};
+use tokio::io::AsyncReadExt as _;
 
 const PRODUCTION_BUNDLE_URL: &str = "https://evidence.stogas.ai/bundles/latest.json";
+const MAX_PROOF_INPUT_BYTES: usize = MAX_PROOF_BYTES * 2;
 
 #[cfg(feature = "staging")]
 #[derive(Clone, Copy, Debug, clap::ValueEnum)]
@@ -115,12 +121,15 @@ async fn main() -> Result<()> {
         } => {
             let bytes = if bundle.as_os_str() == "-" {
                 let mut input = Vec::new();
-                std::io::stdin().read_to_end(&mut input)?;
+                std::io::stdin()
+                    .take(u64::try_from(MAX_INPUT_BYTES + 1)?)
+                    .read_to_end(&mut input)?;
+                if input.len() > MAX_INPUT_BYTES {
+                    bail!("bundle exceeds {MAX_INPUT_BYTES} bytes");
+                }
                 input
             } else {
-                tokio::fs::read(&bundle)
-                    .await
-                    .with_context(|| format!("could not read {}", bundle.display()))?
+                read_bounded_file(&bundle, MAX_INPUT_BYTES, "bundle").await?
             };
             let output = verify_bundle(&bytes, now_unix_ms.unwrap_or_else(wall_clock_ms), &{
                 #[cfg(feature = "staging")]
@@ -200,18 +209,12 @@ async fn main() -> Result<()> {
 
 async fn run_proof(input: ProofCommandInput) -> Result<()> {
     let proof = read_proof(&input.proof).await?;
-    let request = tokio::fs::read(&input.request)
-        .await
-        .with_context(|| format!("could not read {}", input.request.display()))?;
-    let response = tokio::fs::read(&input.response)
-        .await
-        .with_context(|| format!("could not read {}", input.response.display()))?;
+    let request = read_bounded_file(&input.request, MAX_BODY_BYTES, "request body").await?;
+    let response = read_bounded_file(&input.response, MAX_BODY_BYTES, "response body").await?;
     let now = input.now_unix_ms.unwrap_or_else(wall_clock_ms);
     let mut verifier = Verifier::default();
     let output = if let Some(bundle) = input.bundle {
-        let bundle = tokio::fs::read(&bundle)
-            .await
-            .with_context(|| format!("could not read {}", bundle.display()))?;
+        let bundle = read_bounded_file(&bundle, MAX_INPUT_BYTES, "bundle").await?;
         verifier.verify_bundle(&bundle, now, &stogas_verifier::Environment::stogas())?;
         verifier.verify_response_proof(
             &proof,
@@ -224,9 +227,7 @@ async fn run_proof(input: ProofCommandInput) -> Result<()> {
         let ledger = input
             .ledger
             .context("a bundle or historical ledger is required")?;
-        let ledger = tokio::fs::read(&ledger)
-            .await
-            .with_context(|| format!("could not read {}", ledger.display()))?;
+        let ledger = read_bounded_file(&ledger, MAX_INPUT_BYTES, "ledger record").await?;
         verifier.verify_historical_response_proof(
             &stogas_verifier::HistoricalResponseProofInput {
                 proof_bytes: &proof,
@@ -251,9 +252,7 @@ async fn run_proof(input: ProofCommandInput) -> Result<()> {
 }
 
 async fn read_proof(path: &PathBuf) -> Result<Vec<u8>> {
-    let bytes = tokio::fs::read(path)
-        .await
-        .with_context(|| format!("could not read {}", path.display()))?;
+    let bytes = read_bounded_file(path, MAX_PROOF_INPUT_BYTES, "response proof").await?;
     let trimmed = std::str::from_utf8(&bytes)
         .context("response proof must be UTF-8 JSON or base64url")?
         .trim();
@@ -267,6 +266,21 @@ async fn read_proof(path: &PathBuf) -> Result<Vec<u8>> {
     URL_SAFE_NO_PAD
         .decode(encoded)
         .context("response proof is neither JSON nor canonical base64url")
+}
+
+async fn read_bounded_file(path: &PathBuf, maximum: usize, label: &str) -> Result<Vec<u8>> {
+    let file = tokio::fs::File::open(path)
+        .await
+        .with_context(|| format!("could not read {}", path.display()))?;
+    let mut bytes = Vec::new();
+    file.take(u64::try_from(maximum + 1)?)
+        .read_to_end(&mut bytes)
+        .await
+        .with_context(|| format!("could not read {}", path.display()))?;
+    if bytes.len() > maximum {
+        bail!("{label} exceeds {maximum} bytes");
+    }
+    Ok(bytes)
 }
 
 async fn serve(

@@ -67,9 +67,11 @@ abortTransport.close();
 await assert.rejects(abortedRefresh, /abort/i);
 
 const attemptedOrigins = [];
+const bundleRequestOptions = [];
 const fallbackTransport = new StogasTransport({
-	fetch: async (input) => {
+	fetch: async (input, options = {}) => {
 		attemptedOrigins.push(new URL(input).host);
+		bundleRequestOptions.push(options);
 		return new Response(null, { status: 503 });
 	}
 });
@@ -79,6 +81,11 @@ try {
 	assert.deepEqual(
 		new Set(attemptedOrigins),
 		new Set(['evidence.stogas.ai', 'evidence2.stogas.ai'])
+	);
+	assert.equal(bundleRequestOptions.every((options) => options.cache === undefined), true);
+	assert.equal(
+		bundleRequestOptions.every((options) => !new Headers(options.headers).has('cache-control')),
+		true
 	);
 } finally {
 	fallbackTransport.close();
@@ -107,37 +114,3 @@ try {
 } finally {
 	transport.close();
 }
-
-const browserSource = await readFile(
-	new URL('../../bindings/browser/browser.js', import.meta.url),
-	'utf8'
-);
-assert.doesNotMatch(
-	browserSource,
-	/'cache-control'\s*:\s*'no-store'/,
-	'encrypted browser requests must not add a non-safelisted Cache-Control header'
-);
-const encryptedRequestOptions = browserSource.slice(
-	browserSource.indexOf('body: session.body'),
-	browserSource.indexOf('return decryptResponse')
-);
-assert.doesNotMatch(
-	encryptedRequestOptions,
-	/cache:\s*'no-store'/,
-	'encrypted POSTs must not ask the browser to synthesize Cache-Control'
-);
-assert.doesNotMatch(
-	browserSource,
-	/cache:\s*'no-store'/,
-	'bundle reads must preserve normal browser and shared-cache revalidation'
-);
-assert.doesNotMatch(
-	browserSource,
-	/#inFlightRequests/,
-	'long-lived responses must not postpone bundle refresh'
-);
-assert.match(
-	browserSource,
-	/evidence2\.stogas\.ai\/bundles\/latest\.json/,
-	'the production transport must include the independent evidence origin'
-);

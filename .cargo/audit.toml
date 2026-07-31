@@ -1,0 +1,5 @@
+[advisories]
+# RUSTSEC-2023-0071 concerns private-key timing leakage. The verifier only uses
+# RSA public keys to verify AMD and Sigstore signatures; it never signs or decrypts.
+# No fixed rsa release exists. Remove this exception when RustCrypto ships one.
+ignore = ["RUSTSEC-2023-0071"]

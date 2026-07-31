@@ -161,7 +161,16 @@ pub struct TrustedPlatform {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct InspectedSnpQuote {
     pub chip_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cpuid_family: Option<u8>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cpuid_model: Option<u8>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cpuid_stepping: Option<u8>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub product_name: Option<String>,
     pub release_measurement: String,
+    pub report_version: u32,
     pub reported_tcb: String,
 }
 

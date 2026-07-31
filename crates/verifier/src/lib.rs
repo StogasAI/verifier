@@ -51,6 +51,98 @@ const STAGING_PROVENANCE_TYPE: &str = "https://stogas.ai/attestations/staging-de
 const HEARTBEAT_SIGNATURE_DOMAIN: &[u8] = b"stogas.gateway-heartbeat.v2\0";
 const CSR_SIGNATURE_DOMAIN: &[u8] = b"stogas.gateway-csr-submission.v1\0";
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AmdTcbLayout {
+    Family19h,
+    Family1ah,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct AmdProductProfile {
+    product_name: &'static str,
+    root_spki_sha384: &'static str,
+    struct_version: u8,
+    tcb_layout: AmdTcbLayout,
+}
+
+// AMD publication 57230 product policy. Future products remain fail-closed until their CPUID
+// range, KDS name, certificate layout, and pinned ARK are added together here.
+const AMD_PRODUCT_PROFILES: [AmdProductProfile; 4] = [
+    AmdProductProfile {
+        product_name: "Milan",
+        root_spki_sha384: "1249f67f15cf229a4069195e1a9ce537d1765ef706a1f4a123c36be9518786515d25ecc007f366b564d2b3f31c48082e",
+        struct_version: 0,
+        tcb_layout: AmdTcbLayout::Family19h,
+    },
+    AmdProductProfile {
+        product_name: "Genoa",
+        root_spki_sha384: "32ab53a6ce5ec14926207396e5c475ae768a6a9831b7e860b5acf2e1c1dff222bc5a8bfc43eb5e06393189c1f246d880",
+        struct_version: 0,
+        tcb_layout: AmdTcbLayout::Family19h,
+    },
+    AmdProductProfile {
+        product_name: "Siena",
+        root_spki_sha384: "32ab53a6ce5ec14926207396e5c475ae768a6a9831b7e860b5acf2e1c1dff222bc5a8bfc43eb5e06393189c1f246d880",
+        struct_version: 0,
+        tcb_layout: AmdTcbLayout::Family19h,
+    },
+    AmdProductProfile {
+        product_name: "Turin",
+        root_spki_sha384: "3475f08a9727f8ac9a1deaea5f2a2097aa59d64d05c2a678c229c873e6359d3a6926287a2a22cd5f88a385e333a2fcc5",
+        struct_version: 1,
+        tcb_layout: AmdTcbLayout::Family1ah,
+    },
+];
+
+fn amd_product_from_cpuid(family: u8, model: u8) -> Option<&'static AmdProductProfile> {
+    let extended_model = model >> 4;
+    let product_name = match (family, extended_model) {
+        (0x19, 0x0) => "Milan",
+        (0x19, 0x1) => "Genoa",
+        (0x19, 0xa) => "Siena",
+        (0x1a, 0x0 | 0x1) => "Turin",
+        _ => return None,
+    };
+    AMD_PRODUCT_PROFILES
+        .iter()
+        .find(|profile| profile.product_name == product_name)
+}
+
+type InspectedReportProduct = (
+    Option<u8>,
+    Option<u8>,
+    Option<u8>,
+    Option<&'static AmdProductProfile>,
+);
+
+fn inspect_report_product(
+    report: &[u8],
+    report_version: u32,
+) -> Result<InspectedReportProduct, Error> {
+    if report_version == 2 {
+        if report[0x1a8..0x1e0].iter().all(|byte| *byte == 0)
+            && report[0x1a0..0x1a8].iter().any(|byte| *byte != 0)
+        {
+            return Err(Error::Node(
+                "Family 1Ah-shaped CHIP_ID requires a report with CPUID fields".into(),
+            ));
+        }
+        return Ok((None, None, None, None));
+    }
+
+    let family = report[0x188];
+    let model = report[0x189];
+    let stepping = report[0x18a];
+    let product = amd_product_from_cpuid(family, model)
+        .ok_or_else(|| Error::Node("unsupported AMD processor family or model".into()))?;
+    if product.tcb_layout == AmdTcbLayout::Family1ah && report_version < 5 {
+        return Err(Error::Node(
+            "Family 1Ah requires SNP attestation report version 5 or newer".into(),
+        ));
+    }
+    Ok((Some(family), Some(model), Some(stepping), Some(product)))
+}
+
 #[cfg(feature = "staging")]
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -513,14 +605,20 @@ pub fn verify_amd_collateral_admission(
 /// Returns an error for a malformed, unsupported, or incorrectly sized quote envelope/report.
 pub fn inspect_snp_quote(quote: &str) -> Result<InspectedSnpQuote, Error> {
     let report = decode_snp_report(quote, "heartbeat")?;
-    if !(2..=5).contains(&u32::from_le_bytes(
-        report[0x00..0x04].try_into().unwrap_or_default(),
-    )) {
+    let report_version = u32::from_le_bytes(report[0x00..0x04].try_into().unwrap_or_default());
+    if !(2..=5).contains(&report_version) {
         return Err(Error::Node("unsupported SNP report version".into()));
     }
+    let (cpuid_family, cpuid_model, cpuid_stepping, product_name) =
+        inspect_report_product(&report, report_version)?;
     Ok(InspectedSnpQuote {
         chip_id: hex::encode(&report[0x1a0..0x1e0]),
+        cpuid_family,
+        cpuid_model,
+        cpuid_stepping,
+        product_name: product_name.map(|profile| profile.product_name.into()),
         release_measurement: hex::encode(&report[0x90..0xc0]),
+        report_version,
         reported_tcb: hex::encode(&report[0x180..0x188]),
     })
 }
@@ -2171,6 +2269,7 @@ fn verify_snp_node(
         bundle_created_at,
         bundle_expires_at,
     )?;
+    validate_report_product_binding(&collateral.vek, &report_bytes)?;
     let chain = Chain::from_der(&collateral.ark, &collateral.ask, &collateral.vek)
         .map_err(|error| Error::Node(format!("{} AMD chain: {error}", node.node_id)))?;
     (&chain, &report)
@@ -2277,11 +2376,6 @@ fn validate_amd_x509(
 ) -> Result<(), Error> {
     use sha2::Sha384;
     use x509_parser::{parse_x509_certificate, parse_x509_crl};
-    const ROOT_HASHES: [&str; 3] = [
-        "1249f67f15cf229a4069195e1a9ce537d1765ef706a1f4a123c36be9518786515d25ecc007f366b564d2b3f31c48082e",
-        "32ab53a6ce5ec14926207396e5c475ae768a6a9831b7e860b5acf2e1c1dff222bc5a8bfc43eb5e06393189c1f246d880",
-        "3475f08a9727f8ac9a1deaea5f2a2097aa59d64d05c2a678c229c873e6359d3a6926287a2a22cd5f88a385e333a2fcc5",
-    ];
     let (_, ark) = parse_x509_certificate(&collateral.ark)
         .map_err(|error| Error::Node(format!("AMD ARK: {error}")))?;
     let (_, ask) = parse_x509_certificate(&collateral.ask)
@@ -2297,8 +2391,9 @@ fn validate_amd_x509(
             )));
         }
     }
+    let product = validate_vcek_extensions(&vek, chip_id, reported_tcb)?;
     let root_hash = hex::encode(Sha384::digest(ark.public_key().raw));
-    if !ROOT_HASHES.contains(&root_hash.as_str())
+    if root_hash != product.root_spki_sha384
         || ark.subject() != ark.issuer()
         || ask.issuer() != ark.subject()
         || vek.issuer() != ask.subject()
@@ -2329,7 +2424,7 @@ fn validate_amd_x509(
         return Err(Error::Node("AMD CRL issuer differs".into()));
     };
     verify_amd_crl_signature(&crl, crl_signer)?;
-    validate_vcek_extensions(&vek, chip_id, reported_tcb)
+    Ok(())
 }
 
 #[cfg(feature = "snp")]
@@ -2393,28 +2488,78 @@ fn validate_vcek_extensions(
     vek: &x509_parser::certificate::X509Certificate<'_>,
     chip_id: &str,
     reported_tcb: &str,
-) -> Result<(), Error> {
+) -> Result<&'static AmdProductProfile, Error> {
     let expected_tcb =
         hex::decode(reported_tcb).map_err(|_| Error::Node("reported TCB is invalid".into()))?;
-    let expected = [
-        expected_tcb[0],
-        expected_tcb[1],
-        expected_tcb[6],
-        expected_tcb[7],
-    ];
-    let oids = [
-        "1.3.6.1.4.1.3704.1.3.1",
-        "1.3.6.1.4.1.3704.1.3.2",
-        "1.3.6.1.4.1.3704.1.3.3",
-        "1.3.6.1.4.1.3704.1.3.8",
-    ];
-    for (oid, expected_value) in oids.into_iter().zip(expected) {
-        let extension = vek
-            .extensions()
-            .iter()
-            .find(|extension| extension.oid.to_id_string() == oid)
-            .ok_or_else(|| Error::Node(format!("AMD VCEK extension {oid} is absent")))?;
-        let value = parse_der_u8(extension.value)
+    if expected_tcb.len() != 8 {
+        return Err(Error::Node("reported TCB has the wrong length".into()));
+    }
+
+    let mut extensions = BTreeMap::new();
+    for extension in vek.extensions().iter().filter(|extension| {
+        extension
+            .oid
+            .to_id_string()
+            .starts_with("1.3.6.1.4.1.3704.1.")
+    }) {
+        let oid = extension.oid.to_id_string();
+        if extensions.insert(oid.clone(), extension.value).is_some() {
+            return Err(Error::Node(format!(
+                "AMD VCEK extension {oid} is duplicated"
+            )));
+        }
+    }
+    let required = |oid: &str| {
+        extensions
+            .get(oid)
+            .copied()
+            .ok_or_else(|| Error::Node(format!("AMD VCEK extension {oid} is absent")))
+    };
+
+    let struct_version_oid = "1.3.6.1.4.1.3704.1.1";
+    let struct_version = parse_der_u8(required(struct_version_oid)?)
+        .ok_or_else(|| Error::Node("AMD VCEK structVersion is malformed".into()))?;
+    let product_name = parse_der_ia5_string(required("1.3.6.1.4.1.3704.1.2")?)
+        .ok_or_else(|| Error::Node("AMD VCEK productName is malformed".into()))?;
+    let profile = amd_product_from_vcek_name(product_name)
+        .ok_or_else(|| Error::Node("AMD VCEK productName is unsupported".into()))?;
+    if struct_version != profile.struct_version {
+        return Err(Error::Node(format!(
+            "AMD VCEK structVersion differs for {}",
+            profile.product_name
+        )));
+    }
+
+    let tcb_extensions: &[(&str, usize)] = match profile.tcb_layout {
+        AmdTcbLayout::Family19h => &[
+            ("1.3.6.1.4.1.3704.1.3.1", 0),
+            ("1.3.6.1.4.1.3704.1.3.2", 1),
+            ("1.3.6.1.4.1.3704.1.3.4", 2),
+            ("1.3.6.1.4.1.3704.1.3.5", 3),
+            ("1.3.6.1.4.1.3704.1.3.6", 4),
+            ("1.3.6.1.4.1.3704.1.3.7", 5),
+            ("1.3.6.1.4.1.3704.1.3.3", 6),
+            ("1.3.6.1.4.1.3704.1.3.8", 7),
+        ],
+        AmdTcbLayout::Family1ah => &[
+            ("1.3.6.1.4.1.3704.1.3.9", 0),
+            ("1.3.6.1.4.1.3704.1.3.1", 1),
+            ("1.3.6.1.4.1.3704.1.3.2", 2),
+            ("1.3.6.1.4.1.3704.1.3.3", 3),
+            ("1.3.6.1.4.1.3704.1.3.5", 4),
+            ("1.3.6.1.4.1.3704.1.3.6", 5),
+            ("1.3.6.1.4.1.3704.1.3.7", 6),
+            ("1.3.6.1.4.1.3704.1.3.8", 7),
+        ],
+    };
+    for &(oid, tcb_index) in tcb_extensions {
+        let expected_value = expected_tcb[tcb_index];
+        if tcb_index != 7 && expected_value > 127 {
+            return Err(Error::Node(format!(
+                "reported TCB byte {tcb_index} exceeds AMD KDS policy"
+            )));
+        }
+        let value = parse_der_u8(required(oid)?)
             .ok_or_else(|| Error::Node(format!("AMD VCEK extension {oid} is malformed")))?;
         if value != expected_value {
             return Err(Error::Node(format!(
@@ -2422,22 +2567,78 @@ fn validate_vcek_extensions(
             )));
         }
     }
-    let hwid = vek
-        .extensions()
-        .iter()
-        .find(|extension| extension.oid.to_id_string() == "1.3.6.1.4.1.3704.1.4")
-        .ok_or_else(|| Error::Node("AMD VCEK chip-id extension is absent".into()))?;
     let chip = hex::decode(chip_id).map_err(|_| Error::Node("chip id is invalid".into()))?;
-    let certificate_chip = parse_der_octet_string(hwid.value).ok_or_else(|| {
-        Error::Node(format!(
-            "AMD VCEK chip id is malformed ({})",
-            hwid.value.len()
-        ))
-    })?;
-    if certificate_chip != chip {
+    if chip.len() != 64 {
+        return Err(Error::Node("chip id has the wrong length".into()));
+    }
+    let hwid = required("1.3.6.1.4.1.3704.1.4")?;
+    let certificate_chip = parse_der_octet_string(hwid)
+        .ok_or_else(|| Error::Node(format!("AMD VCEK chip id is malformed ({})", hwid.len())))?;
+    let expected_hwid = match profile.tcb_layout {
+        AmdTcbLayout::Family19h => chip.as_slice(),
+        AmdTcbLayout::Family1ah => {
+            if chip[8..].iter().any(|byte| *byte != 0) || chip[..8].iter().all(|byte| *byte == 0) {
+                return Err(Error::Node(
+                    "Family 1Ah report CHIP_ID is not an 8-byte PSN followed by zeros".into(),
+                ));
+            }
+            &chip[..8]
+        }
+    };
+    if certificate_chip != expected_hwid {
         return Err(Error::Node("AMD VCEK chip id differs".into()));
     }
-    Ok(())
+    Ok(profile)
+}
+
+#[cfg(feature = "snp")]
+fn amd_product_from_vcek_name(value: &str) -> Option<&'static AmdProductProfile> {
+    AMD_PRODUCT_PROFILES.iter().find(|profile| {
+        value == profile.product_name
+            || value
+                .strip_prefix(profile.product_name)
+                .and_then(|suffix| suffix.strip_prefix('-'))
+                .is_some_and(|stepping| {
+                    !stepping.is_empty()
+                        && stepping.len() <= 8
+                        && stepping.bytes().all(|byte| byte.is_ascii_alphanumeric())
+                })
+    })
+}
+
+#[cfg(feature = "snp")]
+fn validate_report_product_binding(vek_der: &[u8], report: &[u8]) -> Result<(), Error> {
+    use x509_parser::parse_x509_certificate;
+
+    let (_, vek) = parse_x509_certificate(vek_der)
+        .map_err(|error| Error::Node(format!("AMD VEK: {error}")))?;
+    let product_name = vek
+        .extensions()
+        .iter()
+        .find(|extension| extension.oid.to_id_string() == "1.3.6.1.4.1.3704.1.2")
+        .and_then(|extension| parse_der_ia5_string(extension.value))
+        .ok_or_else(|| Error::Node("AMD VCEK productName is malformed".into()))?;
+    let certificate_product = amd_product_from_vcek_name(product_name)
+        .ok_or_else(|| Error::Node("AMD VCEK productName is unsupported".into()))?;
+    let report_version = u32::from_le_bytes(
+        report[0x00..0x04]
+            .try_into()
+            .map_err(|_| Error::Node("SNP report version is absent".into()))?,
+    );
+    if !(2..=5).contains(&report_version) {
+        return Err(Error::Node("unsupported SNP report version".into()));
+    }
+    let (_, _, _, report_product) = inspect_report_product(report, report_version)?;
+    match report_product {
+        Some(report_product) if report_product == certificate_product => Ok(()),
+        Some(_) => Err(Error::Node(
+            "AMD VCEK product differs from the report CPUID".into(),
+        )),
+        None if certificate_product.tcb_layout == AmdTcbLayout::Family19h => Ok(()),
+        None => Err(Error::Node(
+            "Family 1Ah VCEK requires report CPUID fields".into(),
+        )),
+    }
 }
 
 #[cfg(feature = "snp")]
@@ -2450,8 +2651,19 @@ fn parse_der_u8(value: &[u8]) -> Option<u8> {
 }
 
 #[cfg(feature = "snp")]
+fn parse_der_ia5_string(value: &[u8]) -> Option<&str> {
+    let [0x16, length, bytes @ ..] = value else {
+        return None;
+    };
+    if usize::from(*length) != bytes.len() || *length >= 0x80 || !bytes.is_ascii() {
+        return None;
+    }
+    std::str::from_utf8(bytes).ok()
+}
+
+#[cfg(feature = "snp")]
 fn parse_der_octet_string(value: &[u8]) -> Option<&[u8]> {
-    if value.len() == 64 {
+    if matches!(value.len(), 8 | 64) {
         return Some(value);
     }
     match value {
@@ -2607,10 +2819,25 @@ mod tests {
     use super::*;
 
     fn quote_with_identity(chip: [u8; 64], measurement: [u8; 48], tcb: [u8; 8]) -> String {
+        quote_with_product_identity(2, chip, measurement, tcb, None)
+    }
+
+    fn quote_with_product_identity(
+        version: u32,
+        chip: [u8; 64],
+        measurement: [u8; 48],
+        tcb: [u8; 8],
+        cpuid: Option<(u8, u8, u8)>,
+    ) -> String {
         let mut report = vec![0_u8; 0x4a0];
-        report[0x00..0x04].copy_from_slice(&2_u32.to_le_bytes());
+        report[0x00..0x04].copy_from_slice(&version.to_le_bytes());
         report[0x90..0xc0].copy_from_slice(&measurement);
         report[0x180..0x188].copy_from_slice(&tcb);
+        if let Some((family, model, stepping)) = cpuid {
+            report[0x188] = family;
+            report[0x189] = model;
+            report[0x18a] = stepping;
+        }
         report[0x1a0..0x1e0].copy_from_slice(&chip);
         URL_SAFE_NO_PAD.encode(
             serde_json::to_vec(&serde_json::json!({
@@ -2646,8 +2873,74 @@ mod tests {
         let identity =
             inspect_snp_quote(&quote_with_identity([0x11; 64], [0x22; 48], [0x33; 8])).unwrap();
         assert_eq!(identity.chip_id, "11".repeat(64));
+        assert_eq!(identity.cpuid_family, None);
+        assert_eq!(identity.product_name, None);
         assert_eq!(identity.release_measurement, "22".repeat(48));
+        assert_eq!(identity.report_version, 2);
         assert_eq!(identity.reported_tcb, "33".repeat(8));
+    }
+
+    #[test]
+    fn maps_report_cpuid_to_milan_and_turin_without_guessing_future_products() {
+        let milan = inspect_snp_quote(&quote_with_product_identity(
+            5,
+            [0x11; 64],
+            [0x22; 48],
+            [0x33; 8],
+            Some((0x19, 0x0f, 0x2)),
+        ))
+        .unwrap();
+        assert_eq!(milan.product_name.as_deref(), Some("Milan"));
+        assert_eq!(milan.cpuid_family, Some(0x19));
+        assert_eq!(milan.cpuid_model, Some(0x0f));
+        assert_eq!(milan.cpuid_stepping, Some(0x2));
+
+        let mut turin_chip = [0_u8; 64];
+        turin_chip[..8].copy_from_slice(&[1, 2, 3, 4, 5, 6, 7, 8]);
+        let turin = inspect_snp_quote(&quote_with_product_identity(
+            5,
+            turin_chip,
+            [0x22; 48],
+            [0x33; 8],
+            Some((0x1a, 0x11, 0x0)),
+        ))
+        .unwrap();
+        assert_eq!(turin.product_name.as_deref(), Some("Turin"));
+
+        assert!(
+            inspect_snp_quote(&quote_with_product_identity(
+                5,
+                [0x11; 64],
+                [0x22; 48],
+                [0x33; 8],
+                Some((0x1a, 0x50, 0x0)),
+            ))
+            .is_err()
+        );
+        assert!(
+            inspect_snp_quote(&quote_with_product_identity(
+                2, turin_chip, [0x22; 48], [0x33; 8], None,
+            ))
+            .is_err()
+        );
+    }
+
+    #[cfg(feature = "snp")]
+    #[test]
+    fn validates_turin_vcek_structure_tcb_and_psn_extensions() {
+        use x509_parser::parse_x509_certificate;
+
+        let der = STANDARD
+            .decode(include_str!("../tests/fixtures/vcek-turin.der.base64").trim())
+            .unwrap();
+        let (_, vcek) = parse_x509_certificate(&der).unwrap();
+        let chip_id = format!("{}{}", "1e550a8ee5cf9f4d", "00".repeat(56));
+        let profile = validate_vcek_extensions(&vcek, &chip_id, "0000000000000009").unwrap();
+        assert_eq!(profile.product_name, "Turin");
+        assert_eq!(profile.struct_version, 1);
+        assert_eq!(profile.tcb_layout, AmdTcbLayout::Family1ah);
+        assert!(validate_vcek_extensions(&vcek, &chip_id, "0000000000000008").is_err());
+        assert!(validate_vcek_extensions(&vcek, &"11".repeat(64), "0000000000000009").is_err());
     }
 
     #[test]
