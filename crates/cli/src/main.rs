@@ -1,6 +1,7 @@
 use anyhow::{Context, Result, bail};
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use clap::{Parser, Subcommand};
+use sha2::{Digest as _, Sha256};
 use std::{
     io::Read as _,
     path::PathBuf,
@@ -8,9 +9,7 @@ use std::{
 };
 use stogas::SecurityMode;
 use stogas_verifier::{
-    MAX_INPUT_BYTES, VerificationOutput, Verifier,
-    response_proof::{MAX_BODY_BYTES, MAX_PROOF_BYTES},
-    verify_bundle,
+    MAX_INPUT_BYTES, VerificationOutput, Verifier, response_proof::MAX_PROOF_BYTES, verify_bundle,
 };
 use tokio::io::AsyncReadExt as _;
 
@@ -37,6 +36,7 @@ struct ProofCommandInput {
     response: PathBuf,
     bundle: Option<PathBuf>,
     ledger: Option<PathBuf>,
+    catalog: Option<PathBuf>,
     e2ee_transcript_sha256: Option<String>,
     json: bool,
     now_unix_ms: Option<i64>,
@@ -66,7 +66,7 @@ enum Command {
         /// Exact plaintext request body sent to the inference endpoint.
         #[arg(long)]
         request: PathBuf,
-        /// Exact response body, excluding the `stogas.proof` SSE event itself.
+        /// Exact response body, excluding the final `stogas` SSE comment itself.
         #[arg(long)]
         response: PathBuf,
         /// Currently valid bundle used for the request.
@@ -75,6 +75,9 @@ enum Command {
         /// Immutable historical node-ledger record.
         #[arg(long, required_unless_present = "bundle", conflicts_with = "bundle")]
         ledger: Option<PathBuf>,
+        /// Immutable catalog approval selected by the signed catalog sequence.
+        #[arg(long, required_unless_present = "bundle", conflicts_with = "bundle")]
+        catalog: Option<PathBuf>,
         /// Exact E2EE transcript SHA-256 for an encrypted exchange.
         #[arg(long)]
         e2ee_transcript_sha256: Option<String>,
@@ -94,8 +97,8 @@ enum Command {
         #[arg(long, default_value = "127.0.0.1:8787")]
         listen: String,
         /// How often to fetch and verify the latest bundle.
-        #[arg(long, default_value_t = 60, value_parser = clap::value_parser!(u16).range(1..=840))]
-        bundle_refresh_seconds: u16,
+        #[arg(long, default_value_t = 300, value_parser = clap::value_parser!(u64).range(1..))]
+        bundle_refresh_seconds: u64,
         /// Protect inference with verified TLS, application E2EE, or both.
         #[arg(long, value_enum)]
         security: Option<SecurityMode>,
@@ -152,6 +155,7 @@ async fn main() -> Result<()> {
             response,
             bundle,
             ledger,
+            catalog,
             e2ee_transcript_sha256,
             json,
             now_unix_ms,
@@ -162,6 +166,7 @@ async fn main() -> Result<()> {
                 response,
                 bundle,
                 ledger,
+                catalog,
                 e2ee_transcript_sha256,
                 json,
                 now_unix_ms,
@@ -209,17 +214,17 @@ async fn main() -> Result<()> {
 
 async fn run_proof(input: ProofCommandInput) -> Result<()> {
     let proof = read_proof(&input.proof).await?;
-    let request = read_bounded_file(&input.request, MAX_BODY_BYTES, "request body").await?;
-    let response = read_bounded_file(&input.response, MAX_BODY_BYTES, "response body").await?;
+    let request_sha256 = hash_file(&input.request, "request body").await?;
+    let response_sha256 = hash_file(&input.response, "response body").await?;
     let now = input.now_unix_ms.unwrap_or_else(wall_clock_ms);
     let mut verifier = Verifier::default();
     let output = if let Some(bundle) = input.bundle {
         let bundle = read_bounded_file(&bundle, MAX_INPUT_BYTES, "bundle").await?;
         verifier.verify_bundle(&bundle, now, &stogas_verifier::Environment::stogas())?;
-        verifier.verify_response_proof(
+        verifier.verify_response_proof_hashes(
             &proof,
-            &request,
-            &response,
+            &request_sha256,
+            &response_sha256,
             input.e2ee_transcript_sha256.as_deref(),
             now,
         )?
@@ -228,14 +233,19 @@ async fn run_proof(input: ProofCommandInput) -> Result<()> {
             .ledger
             .context("a bundle or historical ledger is required")?;
         let ledger = read_bounded_file(&ledger, MAX_INPUT_BYTES, "ledger record").await?;
-        verifier.verify_historical_response_proof(
-            &stogas_verifier::HistoricalResponseProofInput {
+        let catalog = input
+            .catalog
+            .context("a historical catalog approval is required with a ledger")?;
+        let catalog = read_bounded_file(&catalog, MAX_INPUT_BYTES, "catalog approval").await?;
+        verifier.verify_historical_response_proof_hashes(
+            &stogas_verifier::HistoricalResponseProofHashInput {
                 proof_bytes: &proof,
-                request_body: &request,
-                response_body: &response,
+                request_sha256: &request_sha256,
+                response_sha256: &response_sha256,
                 expected_e2ee_transcript_sha256: input.e2ee_transcript_sha256.as_deref(),
                 now_unix_ms: now,
                 ledger_bytes: &ledger,
+                catalog_approval_bytes: &catalog,
                 environment: &stogas_verifier::Environment::stogas(),
             },
         )?
@@ -245,10 +255,28 @@ async fn run_proof(input: ProofCommandInput) -> Result<()> {
     } else {
         println!("Verified response");
         println!("  node: {}", output.node_id);
-        println!("  catalog: {}", output.catalog_digest);
-        println!("  catalog nodes: {}", output.catalog_node_ids.join(", "));
+        println!("  catalog: {}", output.catalog.digest);
     }
     Ok(())
+}
+
+async fn hash_file(path: &PathBuf, label: &str) -> Result<String> {
+    let mut file = tokio::fs::File::open(path)
+        .await
+        .with_context(|| format!("could not read {}", path.display()))?;
+    let mut hasher = Sha256::new();
+    let mut buffer = vec![0_u8; 64 * 1024].into_boxed_slice();
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .await
+            .with_context(|| format!("could not read {label} from {}", path.display()))?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(hex::encode(hasher.finalize()))
 }
 
 async fn read_proof(path: &PathBuf) -> Result<Vec<u8>> {
@@ -288,7 +316,7 @@ async fn serve(
     upstream: String,
     listen: String,
     environment: stogas_verifier::Environment,
-    bundle_refresh_seconds: u16,
+    bundle_refresh_seconds: u64,
     security: Option<SecurityMode>,
     browser_origin: Option<String>,
 ) -> Result<()> {
@@ -297,7 +325,7 @@ async fn serve(
         &upstream,
         &listen,
         environment,
-        Duration::from_secs(u64::from(bundle_refresh_seconds)),
+        Duration::from_secs(bundle_refresh_seconds),
         resolved_security(security, browser_origin.as_deref()),
         browser_origin.as_deref(),
     )
@@ -345,7 +373,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn serve_refresh_interval_defaults_to_one_minute() {
+    fn serve_refresh_interval_defaults_to_five_minutes() {
         let cli = Cli::try_parse_from(["stogas-verify", "serve"]).unwrap();
         let Command::Serve {
             bundle_refresh_seconds,
@@ -354,12 +382,12 @@ mod tests {
         else {
             panic!("serve command was not parsed");
         };
-        assert_eq!(bundle_refresh_seconds, 60);
+        assert_eq!(bundle_refresh_seconds, 300);
     }
 
     #[test]
-    fn serve_refresh_interval_accepts_the_safe_whole_second_range() {
-        for seconds in ["1", "840"] {
+    fn serve_refresh_interval_accepts_any_positive_whole_seconds() {
+        for seconds in ["1", "841", "86400"] {
             assert!(
                 Cli::try_parse_from([
                     "stogas-verify",
@@ -370,7 +398,7 @@ mod tests {
                 .is_ok()
             );
         }
-        for seconds in ["0", "841"] {
+        for seconds in ["0", "-1"] {
             assert!(
                 Cli::try_parse_from([
                     "stogas-verify",
@@ -408,7 +436,19 @@ mod tests {
             "response.json",
         ];
         assert!(Cli::try_parse_from(base.into_iter().chain(["--bundle", "bundle.json"])).is_ok());
-        assert!(Cli::try_parse_from(base.into_iter().chain(["--ledger", "ledger.json"])).is_ok());
+        assert!(
+            Cli::try_parse_from(base.into_iter().chain([
+                "--ledger",
+                "ledger.json",
+                "--catalog",
+                "catalog.json"
+            ]))
+            .is_ok()
+        );
+        assert!(Cli::try_parse_from(base.into_iter().chain(["--ledger", "ledger.json"])).is_err());
+        assert!(
+            Cli::try_parse_from(base.into_iter().chain(["--catalog", "catalog.json"])).is_err()
+        );
         assert!(Cli::try_parse_from(base).is_err());
         assert!(
             Cli::try_parse_from(base.into_iter().chain([

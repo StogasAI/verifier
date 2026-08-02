@@ -12,9 +12,11 @@ use stogas_verifier::e2ee::{
 use url::Url;
 
 const REQUEST_ACCEPTANCE_WINDOW: Duration = Duration::from_mins(1);
-const RETURN_EXTRA_FIELDS_HEADER: &str = "x-stogas-return-extra-fields";
+const EXTRA_FIELDS_HEADER: &str = "x-stogas-extra-fields";
 const E2EE_RESPONSE_HEADER: &str = "x-stogas-e2ee";
 const E2EE_TRANSCRIPT_HEADER: &str = "x-stogas-e2ee-transcript-sha256";
+const E2EE_HTTPS_CONNECTION_ERROR: &str =
+    "E2EE HTTPS connection failed. Check the upstream URL, network, and WebPKI certificate.";
 
 type TransportError = (StatusCode, &'static str);
 type UpstreamStream = Pin<Box<dyn Stream<Item = reqwest::Result<Bytes>> + Send + 'static>>;
@@ -63,7 +65,11 @@ pub async fn send(request: RequestContext<'_>) -> Result<Response<Body>, Transpo
         .await
         .map_err(|error| {
             eprintln!("encrypted upstream request failed: {error:?}");
-            (StatusCode::BAD_GATEWAY, "encrypted upstream request failed")
+            if error.is_connect() {
+                (StatusCode::BAD_GATEWAY, E2EE_HTTPS_CONNECTION_ERROR)
+            } else {
+                (StatusCode::BAD_GATEWAY, "encrypted upstream request failed")
+            }
         })?;
     if upstream.status() != StatusCode::OK
         || upstream
@@ -100,11 +106,21 @@ fn seal(
         &header::ACCEPT,
         "invalid Accept header",
     )?;
-    let return_extra_fields = optional_header(
+    let extra_fields = match optional_header(
         &request.parts.headers,
-        &HeaderName::from_static(RETURN_EXTRA_FIELDS_HEADER),
+        &HeaderName::from_static(EXTRA_FIELDS_HEADER),
         "invalid Stogas response field header",
-    )?;
+    )? {
+        None => false,
+        Some(value) if value.eq_ignore_ascii_case("true") => true,
+        Some(value) if value.eq_ignore_ascii_case("false") => false,
+        Some(_) => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "X-Stogas-Extra-Fields must be true or false",
+            ));
+        }
+    };
     let expires_at_unix_ms = request
         .now_unix_ms
         .saturating_add(i64::try_from(REQUEST_ACCEPTANCE_WINDOW.as_millis()).unwrap_or(i64::MAX));
@@ -117,7 +133,7 @@ fn seal(
         recipients: request.recipients,
         api_key,
         accept,
-        return_extra_fields,
+        extra_fields,
         body: &request.body,
     })
     .map_err(|_| {

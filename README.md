@@ -23,11 +23,12 @@ stogas-verify serve
 
 Point any OpenAI-compatible client at `http://127.0.0.1:8787/v1`. The proxy:
 
-- randomly polls one independent evidence origin every minute by default, falls back to the other
-  after network, HTTP, local-verification, or sequence-regression failure, and avoids reverifying
+- randomly polls one independent evidence origin every five minutes by default, falls back to the other
+  after network, HTTP, local-verification, or snapshot-order failure, and avoids reverifying
   identical bytes;
 - supports attested TLS, E2EE, or both on the normal inference endpoints;
-- defaults to WebPKI plus certificate and public-key pinning in native mode;
+- requires TLS 1.3 with X25519MLKEM768, WebPKI, and certificate and public-key pinning in native `tls` and `both` modes;
+- sends E2EE over ordinary WebPKI HTTPS when hybrid TLS is unavailable;
 - forwards `/v1/*` requests and streaming responses without installing a local CA.
 
 The official origins are `https://evidence.stogas.ai/bundles/latest.json` on Cloudflare/R2 and
@@ -43,7 +44,7 @@ stogas-verify serve --browser-origin https://app.example.com
 
 The CLI prints a capability-protected base URL for that browser session. It handles CORS and local-network preflights without allowing other origins or forwarding local access headers upstream, and defaults browser-origin traffic to E2EE.
 
-Use `--security tls|e2ee|both` to select the transport policy. Use `--bundle-refresh-seconds` to select 1 to 840 seconds; zero is not accepted. The proxy also fetches before the hard bundle expiry, so a long interval cannot skip the final replacement window.
+Use `--security tls|e2ee|both` to select the transport policy. Bundle refresh defaults to five minutes; `--bundle-refresh-seconds` accepts any positive whole-second interval. The proxy also fetches before the hard bundle expiry, so a long interval cannot skip the final replacement window.
 
 ### Verify a file
 
@@ -72,6 +73,11 @@ const result = verifier.verify_bundle(new Uint8Array(await response.arrayBuffer(
 console.log(result.bundle.nodes);
 ```
 
+`result.bundle.catalogs` contains the verified catalog approvals. Each approval requires one
+GitHub Actions attestation over the runtime and public hashes and one separate Stogas-signed
+manifest from an independent build with the same hashes. Every accepted node's
+`report_data.catalog` sequence and runtime digest must match one of those approvals.
+
 Browser code imports `@stogas/verifier/browser` and calls its default WebAssembly initializer once. Its `StogasTransport` verifies bundles, encrypts requests to every accepted node, and supplies a custom `fetch` for the OpenAI JavaScript client. Browser `fetch` does not expose the peer certificate, so direct browser mode provides E2EE rather than attested TLS.
 
 `StogasTransport.bundleURLs` exposes the configured evidence origins.
@@ -88,15 +94,36 @@ Both verifier forms read the platform clock once. Neither fetches, schedules ref
 
 ### Verify a response receipt
 
-The same verifier checks compact response receipts against the active bundle:
+Send `X-Stogas-Extra-Fields: true` with the inference request. A buffered response returns base64url
+JSON in `X-Stogas-Proof`. A stream returns the same value in one final
+`: stogas <base64url-json>` SSE comment immediately before `[DONE]`.
+
+The same verifier checks the decoded signed result against the active bundle:
 
 ```js
 const receipt = verifier.verify_response_proof(proofBytes, requestBytes, responseBytes);
 ```
 
-Use `verify_historical_response_proof` with an immutable node-ledger record when the signing gateway is no longer in the active bundle.
+Use `verify_historical_response_proof` with the immutable node record and catalog approval when the
+signing node is no longer in the active bundle.
 
-The receipt requires the exact plaintext request and response bytes. For streaming, omit the final `stogas.proof` event from the response bytes. When the exchange was encrypted, preserve the locally computed `X-Stogas-E2EE-Transcript-SHA256` response header and supply it during verification.
+The receipt requires the exact plaintext request and response bytes. Active-bundle verification
+also requires its exact node and catalog to be in the verified bundle. The signed result includes the
+request and node IDs, catalog identity, resolved catalog node IDs, settled pricing, timing, hashes,
+and signature. For streaming, hash every exact SSE byte except the Stogas comment. Include the
+`[DONE]` frame. When the exchange was encrypted, preserve the locally computed
+`X-Stogas-E2EE-Transcript-SHA256` response header and supply it during verification.
+
+Browser clients can verify a stream without retaining one response buffer:
+
+```js
+const stream = verifier.start_response_proof(requestBytes);
+stream.write(frameBytes); // Call for each non-Stogas frame, including [DONE].
+const receipt = stream.finish(proofBytes, e2eeTranscriptSHA256);
+```
+
+The one-shot body API has a 64 MiB limit. The stream API keeps only a running hash. The CLI also
+hashes request and response files incrementally.
 
 `StogasTransport.verifyResponseProof(...)` performs the same check against the transport's
 already accepted bundle, avoiding a second bundle fetch and verification in managed clients.

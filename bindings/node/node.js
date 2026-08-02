@@ -26,12 +26,20 @@ export class Verifier {
 		return this.#core.verify_response_proof(proof, requestBody, responseBody, e2eeTranscriptSHA256);
 	}
 
-	verify_historical_response_proof(proof, requestBody, responseBody, ledger, e2eeTranscriptSHA256) {
+	verify_historical_response_proof(
+		proof,
+		requestBody,
+		responseBody,
+		ledger,
+		catalog,
+		e2eeTranscriptSHA256
+	) {
 		return this.#core.verify_historical_response_proof(
 			proof,
 			requestBody,
 			responseBody,
 			ledger,
+			catalog,
 			e2eeTranscriptSHA256
 		);
 	}

@@ -23,7 +23,7 @@ void stogas_verifier_free(StogasVerifier *verifier);
  * Start one managed SDK transport. Configuration is UTF-8 JSON:
  * {
  *   "security": "tls" | "e2ee" | "both",
- *   "bundle_refresh_interval_seconds": 60,
+ *   "bundle_refresh_interval_seconds": 300,
  *   "base_url": "https://api.stogas.ai",
  *   "bundle_url": "https://evidence.stogas.ai/bundles/latest.json"
  * }
@@ -73,6 +73,8 @@ char *stogas_verifier_verify_historical_response_proof(
     size_t response_body_len,
     const uint8_t *ledger,
     size_t ledger_len,
+    const uint8_t *catalog,
+    size_t catalog_len,
     const uint8_t *e2ee_transcript_sha256,
     size_t e2ee_transcript_sha256_len,
     int64_t now_unix_ms

@@ -18,7 +18,7 @@ StogasVerifier *stogas_verifier_new(void);
 void stogas_verifier_free(StogasVerifier *verifier);
 char *stogas_verifier_verify_bundle(const StogasVerifier *verifier, const uint8_t *bundle, size_t bundle_len, int64_t now_unix_ms);
 char *stogas_verifier_verify_response_proof(const StogasVerifier *verifier, const uint8_t *proof, size_t proof_len, const uint8_t *request_body, size_t request_body_len, const uint8_t *response_body, size_t response_body_len, const uint8_t *e2ee_transcript_sha256, size_t e2ee_transcript_sha256_len, int64_t now_unix_ms);
-char *stogas_verifier_verify_historical_response_proof(const StogasVerifier *verifier, const uint8_t *proof, size_t proof_len, const uint8_t *request_body, size_t request_body_len, const uint8_t *response_body, size_t response_body_len, const uint8_t *ledger, size_t ledger_len, const uint8_t *e2ee_transcript_sha256, size_t e2ee_transcript_sha256_len, int64_t now_unix_ms);
+char *stogas_verifier_verify_historical_response_proof(const StogasVerifier *verifier, const uint8_t *proof, size_t proof_len, const uint8_t *request_body, size_t request_body_len, const uint8_t *response_body, size_t response_body_len, const uint8_t *ledger, size_t ledger_len, const uint8_t *catalog, size_t catalog_len, const uint8_t *e2ee_transcript_sha256, size_t e2ee_transcript_sha256_len, int64_t now_unix_ms);
 void stogas_verifier_string_free(char *value);
 char *stogas_transport_start(const uint8_t *configuration, size_t configuration_len, StogasTransport **transport_out);
 char *stogas_transport_refresh(const StogasTransport *transport);
@@ -44,7 +44,7 @@ var ErrTransportClosed = errors.New("stogas transport is closed")
 // TransportOptions controls one in-process managed Stogas connection.
 type TransportOptions struct {
 	Security                     string `json:"security,omitempty"`
-	BundleRefreshIntervalSeconds uint16 `json:"bundle_refresh_interval_seconds,omitempty"`
+	BundleRefreshIntervalSeconds uint64 `json:"bundle_refresh_interval_seconds,omitempty"`
 	BaseURL                      string `json:"base_url,omitempty"`
 	BundleURL                    string `json:"bundle_url,omitempty"`
 }
@@ -62,7 +62,7 @@ func NewTransport(options TransportOptions) (*Transport, error) {
 		options.Security = "tls"
 	}
 	if options.BundleRefreshIntervalSeconds == 0 {
-		options.BundleRefreshIntervalSeconds = 60
+		options.BundleRefreshIntervalSeconds = 300
 	}
 	configuration, err := json.Marshal(options)
 	if err != nil {
@@ -224,6 +224,7 @@ func (verifier *Verifier) VerifyHistoricalResponseProof(
 	requestBody []byte,
 	responseBody []byte,
 	ledger []byte,
+	catalog []byte,
 	e2eeTranscriptSHA256 string,
 ) (json.RawMessage, error) {
 	verifier.mu.Lock()
@@ -242,6 +243,8 @@ func (verifier *Verifier) VerifyHistoricalResponseProof(
 		C.size_t(len(responseBody)),
 		bytePointer(ledger),
 		C.size_t(len(ledger)),
+		bytePointer(catalog),
+		C.size_t(len(catalog)),
 		bytePointer(transcript),
 		C.size_t(len(transcript)),
 		C.int64_t(time.Now().UnixMilli()),

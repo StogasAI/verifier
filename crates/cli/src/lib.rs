@@ -37,7 +37,7 @@ pub enum SecurityMode {
 pub struct TransportOptions {
     /// Connection protection. Native SDKs default to attested TLS.
     pub security: SecurityMode,
-    /// Scheduled bundle refresh interval. Must be between 1 and 840 seconds.
+    /// Scheduled bundle refresh interval. Any positive duration is accepted.
     pub bundle_refresh_interval: Duration,
     /// Evidence snapshot URL.
     pub bundle_url: String,
@@ -49,7 +49,7 @@ impl Default for TransportOptions {
     fn default() -> Self {
         Self {
             security: SecurityMode::Tls,
-            bundle_refresh_interval: Duration::from_mins(1),
+            bundle_refresh_interval: Duration::from_mins(5),
             bundle_url: PRODUCTION_BUNDLE_URL.to_owned(),
             base_url: PRODUCTION_UPSTREAM.to_owned(),
         }
@@ -58,10 +58,8 @@ impl Default for TransportOptions {
 
 impl TransportOptions {
     fn validate(&self) -> Result<()> {
-        let refresh_seconds = self.bundle_refresh_interval.as_secs();
-        if !(1..=840).contains(&refresh_seconds) || self.bundle_refresh_interval.subsec_nanos() != 0
-        {
-            bail!("bundle refresh interval must be a whole number from 1 through 840 seconds");
+        if self.bundle_refresh_interval.is_zero() {
+            bail!("bundle refresh interval must be positive");
         }
         Ok(())
     }
@@ -238,24 +236,22 @@ mod tests {
     use super::*;
 
     #[test]
-    fn transport_options_enforce_the_public_refresh_range() {
-        for seconds in [1, 300, 840] {
-            let options = TransportOptions {
-                bundle_refresh_interval: Duration::from_secs(seconds),
-                ..TransportOptions::default()
-            };
-            assert!(options.validate().is_ok());
-        }
+    fn transport_options_accept_any_positive_refresh_interval() {
         for interval in [
-            Duration::ZERO,
-            Duration::from_millis(1_500),
-            Duration::from_secs(841),
+            Duration::from_nanos(1),
+            Duration::from_mins(5),
+            Duration::from_secs(u64::MAX),
         ] {
             let options = TransportOptions {
                 bundle_refresh_interval: interval,
                 ..TransportOptions::default()
             };
-            assert!(options.validate().is_err());
+            assert!(options.validate().is_ok());
         }
+        let options = TransportOptions {
+            bundle_refresh_interval: Duration::ZERO,
+            ..TransportOptions::default()
+        };
+        assert!(options.validate().is_err());
     }
 }

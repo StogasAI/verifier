@@ -12,8 +12,7 @@ const PRODUCTION_BUNDLE_FALLBACK_URL = 'https://evidence2.stogas.ai/bundles/late
 const STAGING_API_BASE_URL = 'https://api-staging.stogas.ai/v1';
 const STAGING_BUNDLE_URL = 'https://evidence-staging.stogas.ai/bundles/latest.json';
 const STAGING_BUNDLE_FALLBACK_URL = 'https://evidence2-staging.stogas.ai/bundles/latest.json';
-const DEFAULT_REFRESH_SECONDS = 60;
-const MAX_REFRESH_SECONDS = 840;
+const DEFAULT_REFRESH_SECONDS = 300;
 const MAX_BUNDLE_BYTES = 16 * 1024 * 1024;
 const MAX_E2EE_REQUEST_BYTES = 64 * 1024 * 1024;
 const BUNDLE_ORIGIN_TIMEOUT_MS = 5_000;
@@ -37,12 +36,24 @@ export class Verifier {
 		return this.#core.verify_response_proof(proof, requestBody, responseBody, e2eeTranscriptSHA256);
 	}
 
-	verify_historical_response_proof(proof, requestBody, responseBody, ledger, e2eeTranscriptSHA256) {
+	start_response_proof(requestBody) {
+		return new ResponseProofStream(this.#core.start_response_proof(requestBody), this.#core);
+	}
+
+	verify_historical_response_proof(
+		proof,
+		requestBody,
+		responseBody,
+		ledger,
+		catalog,
+		e2eeTranscriptSHA256
+	) {
 		return this.#core.verify_historical_response_proof(
 			proof,
 			requestBody,
 			responseBody,
 			ledger,
+			catalog,
 			e2eeTranscriptSHA256
 		);
 	}
@@ -51,8 +62,65 @@ export class Verifier {
 		return this.#core.verify_node_ledger_record(ledger);
 	}
 
+	verify_release_approval(release) {
+		return this.#core.verify_release_approval(release);
+	}
+
+	verify_catalog_approval(catalog) {
+		return this.#core.verify_catalog_approval(catalog);
+	}
+
 	free() {
 		this.#core.free();
+	}
+}
+
+export class ResponseProofStream {
+	#core;
+	#verifier;
+
+	constructor(core, verifier) {
+		this.#core = core;
+		this.#verifier = verifier;
+	}
+
+	write(chunk) {
+		this.#assertOpen();
+		this.#core.write(chunk);
+	}
+
+	finish(proof, e2eeTranscriptSHA256) {
+		this.#assertOpen();
+		try {
+			return this.#core.finish(this.#verifier, proof, e2eeTranscriptSHA256);
+		} finally {
+			this.free();
+		}
+	}
+
+	finishHistorical(proof, ledger, catalog, e2eeTranscriptSHA256) {
+		this.#assertOpen();
+		try {
+			return this.#core.finish_historical(
+				this.#verifier,
+				proof,
+				ledger,
+				catalog,
+				e2eeTranscriptSHA256
+			);
+		} finally {
+			this.free();
+		}
+	}
+
+	free() {
+		this.#core?.free();
+		this.#core = undefined;
+		this.#verifier = undefined;
+	}
+
+	#assertOpen() {
+		if (!this.#core || !this.#verifier) throw new Error('ResponseProofStream is closed');
 	}
 }
 
@@ -100,11 +168,9 @@ export class StogasTransport {
 		if (
 			!Number.isInteger(refreshIntervalSeconds) ||
 			refreshIntervalSeconds < 1 ||
-			refreshIntervalSeconds > MAX_REFRESH_SECONDS
+			!Number.isSafeInteger(refreshIntervalSeconds)
 		) {
-			throw new RangeError(
-				`bundleRefreshIntervalSeconds must be an integer between 1 and ${MAX_REFRESH_SECONDS}`
-			);
+			throw new RangeError('bundleRefreshIntervalSeconds must be a positive safe integer');
 		}
 		this.#baseURL = normalizeBaseURL(
 			options.baseURL ??
@@ -175,9 +241,24 @@ export class StogasTransport {
 		return this.#core.verify_response_proof(proof, requestBody, responseBody, e2eeTranscriptSHA256);
 	}
 
+	createResponseProofStream(requestBody) {
+		this.#assertOpen();
+		return new ResponseProofStream(this.#core.start_response_proof(requestBody), this.#core);
+	}
+
 	verifyNodeLedgerRecord(ledger) {
 		this.#assertOpen();
 		return this.#core.verify_node_ledger_record(ledger);
+	}
+
+	verifyReleaseApproval(release) {
+		this.#assertOpen();
+		return this.#core.verify_release_approval(release);
+	}
+
+	verifyCatalogApproval(catalog) {
+		this.#assertOpen();
+		return this.#core.verify_catalog_approval(catalog);
 	}
 
 	async refreshBundle() {
@@ -212,7 +293,7 @@ export class StogasTransport {
 			apiKey,
 			body,
 			request.headers.get('accept') ?? undefined,
-			request.headers.get('x-stogas-return-extra-fields') ?? undefined
+			extraFieldsEnabled(request.headers)
 		);
 		let response;
 		try {
@@ -274,14 +355,8 @@ export class StogasTransport {
 						? this.#active.verificationDurationMs
 						: monotonicNow() - verificationStartedAt;
 					const verifiedAtUnixMs = unchangedBytes ? this.#active.verifiedAtUnixMs : Date.now();
-					if (this.#active && output.bundle.sequence < this.#active.bundle.sequence) {
-						throw new Error('origin returned an older bundle sequence');
-					}
 					const fetchedAtUnixMs = Date.now();
-					if (this.#active && output.bundle.sequence === this.#active.bundle.sequence) {
-						if (!unchangedBytes) {
-							throw new Error('origin returned different bytes for the active bundle sequence');
-						}
+					if (this.#active && unchangedBytes) {
 						this.#active.bundleURL = url;
 						this.#active.fetchedAtUnixMs = fetchedAtUnixMs;
 						this.#publish({
@@ -294,6 +369,12 @@ export class StogasTransport {
 						this.#retryCount = 0;
 						this.#scheduleRefresh();
 						return false;
+					}
+					if (
+						this.#active &&
+						output.bundle.created_at_unix_ms <= this.#active.bundle.created_at_unix_ms
+					) {
+						throw new Error('origin returned a non-advancing verified snapshot');
 					}
 					this.#active = {
 						bundle: output.bundle,
@@ -449,6 +530,15 @@ function bearerAPIKey(value) {
 	const match = /^Bearer ([^\s]+)$/i.exec(value);
 	if (!match) throw new TypeError('a Bearer authorization value is required');
 	return match[1];
+}
+
+function extraFieldsEnabled(headers) {
+	const raw = headers.get('x-stogas-extra-fields');
+	if (raw === null) return false;
+	const value = raw.trim().toLowerCase();
+	if (value === 'true') return true;
+	if (value === 'false') return false;
+	throw new TypeError('X-Stogas-Extra-Fields must be true or false');
 }
 
 async function sha256Hex(bytes) {

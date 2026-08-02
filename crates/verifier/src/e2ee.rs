@@ -13,8 +13,8 @@ use aes_gcm::{
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use hkdf::Hkdf;
 use hpke::{
-    Deserializable as _, OpModeS, Serializable as _, aead::AesGcm256, kdf::HkdfSha256,
-    kem::DhP256HkdfSha256, setup_sender,
+    Deserializable as _, OpModeS, Serializable as _, aead::AesGcm256, kdf::HkdfSha256, kem::XWing,
+    setup_sender,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue;
@@ -41,6 +41,7 @@ pub const CLOCK_SKEW_ALLOWANCE_MS: i64 = 30 * 1_000;
 
 const CONTENT_KEY_BYTES: usize = 32;
 const KEY_ID_BYTES: usize = 32;
+const RECIPIENT_PUBLIC_KEY_BYTES: usize = 1_216;
 const RESPONSE_TAG_BYTES: usize = 16;
 const RESPONSE_FRAME_HEADER_BYTES: usize = 13;
 const MAX_RESPONSE_DATA_BYTES: usize = 64 * 1024;
@@ -50,7 +51,7 @@ const RESPONSE_FRAME_METADATA: u8 = 2;
 const RESPONSE_FRAME_FINAL: u8 = 3;
 const RESPONSE_MAGIC: [u8; 5] = [b'S', b'T', b'G', b'E', VERSION];
 
-type Kem = DhP256HkdfSha256;
+type Kem = XWing;
 
 /// E2EE protocol failure. No partially decrypted request or response is returned after an error.
 #[derive(Debug, Error)]
@@ -72,7 +73,7 @@ pub enum Error {
 /// One quote-bound HPKE public key selected from a verified bundle.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Recipient {
-    /// Uncompressed SEC1 P-256 public key bytes.
+    /// Serialized MLKEM768-X25519 (X-Wing) public key bytes.
     pub public_key: Vec<u8>,
 }
 
@@ -94,8 +95,8 @@ pub struct Request<'a> {
     pub api_key: &'a str,
     /// Optional desired response media type.
     pub accept: Option<&'a str>,
-    /// Optional Stogas response-proof field selection.
-    pub return_extra_fields: Option<&'a str>,
+    /// Include the compact signed Stogas response fields.
+    pub extra_fields: bool,
     /// Ordinary JSON body for the selected inference endpoint.
     pub body: &'a [u8],
 }
@@ -169,7 +170,7 @@ struct InnerRequest<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     accept: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    return_extra_fields: Option<&'a str>,
+    extra_fields: Option<bool>,
     body: &'a RawValue,
 }
 
@@ -199,9 +200,9 @@ pub fn recipients_from_verified_bundle(
         .map(|node| {
             let public_key =
                 decode_canonical_base64(&node.report_data.hpke_public_key, "node HPKE public key")?;
-            if public_key.len() != 65 {
+            if public_key.len() != RECIPIENT_PUBLIC_KEY_BYTES {
                 return Err(Error::InvalidRequest(
-                    "node HPKE public key must contain 65 bytes".into(),
+                    "node HPKE public key must contain 1216 bytes".into(),
                 ));
             }
             Ok(Recipient { public_key })
@@ -251,7 +252,7 @@ pub fn seal_request(request: &Request<'_>) -> Result<SealedRequest, Error> {
         serde_json::to_vec(&InnerRequest {
             api_key: request.api_key,
             accept: request.accept,
-            return_extra_fields: request.return_extra_fields,
+            extra_fields: request.extra_fields.then_some(true),
             body: &raw_body,
         })
         .map_err(|_| Error::InvalidRequest("inner request could not be encoded".into()))?,
@@ -337,10 +338,7 @@ fn validate_request(request: &Request<'_>) -> Result<(), Error> {
         ));
     }
     reject_header_controls(request.api_key, "api_key")?;
-    for (name, value, max) in [
-        ("accept", request.accept, 256),
-        ("return_extra_fields", request.return_extra_fields, 1024),
-    ] {
+    for (name, value, max) in [("accept", request.accept, 256)] {
         if let Some(value) = value {
             if value.len() > max {
                 return Err(Error::InvalidRequest(format!("{name} is too large")));
@@ -374,13 +372,13 @@ fn prepare_recipients(recipients: &[Recipient]) -> Result<Vec<PreparedRecipient>
     let mut prepared = recipients
         .iter()
         .map(|recipient| {
-            if recipient.public_key.len() != 65 {
+            if recipient.public_key.len() != RECIPIENT_PUBLIC_KEY_BYTES {
                 return Err(Error::InvalidRequest(
-                    "recipient P-256 public key must contain 65 bytes".into(),
+                    "recipient X-Wing public key must contain 1216 bytes".into(),
                 ));
             }
             let public_key = <Kem as hpke::Kem>::PublicKey::from_bytes(&recipient.public_key)
-                .map_err(|_| Error::InvalidRequest("invalid recipient P-256 public key".into()))?;
+                .map_err(|_| Error::InvalidRequest("invalid recipient X-Wing public key".into()))?;
             Ok(PreparedRecipient {
                 key_id: Sha256::digest(&recipient.public_key).into(),
                 public_key,
@@ -870,7 +868,7 @@ mod tests {
             recipients: &recipients,
             api_key: "sk-stogas-secret",
             accept: Some("text/event-stream"),
-            return_extra_fields: Some("provider"),
+            extra_fields: true,
             body: br#"{"model":"gpt-5","input":"hello"}"#,
         })
         .unwrap();
@@ -912,7 +910,7 @@ mod tests {
             recipients: &recipients,
             api_key: "sk-stogas-secret",
             accept: None,
-            return_extra_fields: None,
+            extra_fields: false,
             body: br#"{"model":"gpt-5","messages":[]}"#,
         })
         .unwrap();
@@ -1174,7 +1172,7 @@ mod tests {
             recipients: &recipients,
             api_key: "sk-test",
             accept: None,
-            return_extra_fields: None,
+            extra_fields: false,
             body: b"{}",
         })
         .unwrap()
@@ -1190,7 +1188,7 @@ mod tests {
             recipients: std::slice::from_ref(recipient),
             api_key: "sk-test",
             accept: None,
-            return_extra_fields: None,
+            extra_fields: false,
             body: b"{}",
         }
     }

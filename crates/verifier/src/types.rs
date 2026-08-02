@@ -12,6 +12,7 @@ pub struct BundleEnvelope {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct BundleBody {
+    pub allowed_catalogs: Vec<AllowedCatalog>,
     pub allowed_igvms: Vec<AllowedIgvm>,
     pub created_at: String,
     pub expires_at: String,
@@ -20,6 +21,44 @@ pub struct BundleBody {
     pub sequence: u64,
     pub ttl_ms: u64,
     pub vendor_collateral: Vec<VendorCollateral>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AllowedCatalog {
+    pub github_in_toto: Vec<Value>,
+    pub signed_release: SignedCatalogRelease,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SignedCatalogRelease {
+    #[serde(rename = "keyId")]
+    pub key_id: String,
+    pub manifest: CatalogReleaseManifest,
+    pub schema: String,
+    pub signature: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CatalogReleaseManifest {
+    #[serde(rename = "catalogSchema")]
+    pub catalog_schema: u16,
+    pub public: String,
+    pub runtime: String,
+    pub schema: String,
+    pub sequence: u64,
+    pub source: CatalogSource,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CatalogSource {
+    pub commit: String,
+    pub repository: String,
+    pub tag: String,
+    pub tree: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -84,7 +123,6 @@ pub struct CatalogIdentity {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Node {
-    pub catalog: CatalogIdentity,
     pub cert_expires_at: String,
     pub chip_id: String,
     pub health: NodeHealth,
@@ -111,7 +149,6 @@ pub struct NodeHealth {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct HeartbeatCandidate {
-    pub catalog: CatalogIdentity,
     pub cert_expires_at: String,
     pub health: NodeHealth,
     pub node_id: String,
@@ -186,6 +223,7 @@ pub struct VerifiedAdmission {
 pub struct ReportData {
     pub active_cert_sha256: String,
     pub accepted_cert_sha256: Vec<String>,
+    pub catalog: CatalogIdentity,
     pub drand: DrandBeacon,
     pub ed25519_public_key: String,
     pub hpke_public_key: String,
@@ -260,9 +298,22 @@ pub struct VerifiedRelease {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct VerifiedCatalogRelease {
+    pub evidence: AllowedCatalog,
+    pub github_integrated_time_unix_ms: i64,
+    pub public_digest: String,
+    pub runtime_digest: String,
+    pub sequence: u64,
+    pub source_commit: String,
+    pub source_repository: String,
+    pub source_tag: String,
+    pub source_tree: String,
+    pub stogas_signing_key_id: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct VerifiedNode {
     pub chip_id: String,
-    pub catalog: CatalogIdentity,
     pub drand_round: u64,
     pub drand_round_time_unix_ms: i64,
     pub evidence_age_ms: i64,
@@ -287,6 +338,7 @@ pub struct ExcludedNode {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct VerifiedBundle {
+    pub catalogs: Vec<VerifiedCatalogRelease>,
     pub sequence: u64,
     pub created_at_unix_ms: i64,
     pub expires_at_unix_ms: i64,
@@ -307,7 +359,7 @@ pub struct NodeLedgerRecord {
     pub admitted_at: String,
     pub admission: NodeLedgerAdmission,
     pub certificate_history: Vec<NodeLedgerCertificate>,
-    pub generation_id: String,
+    pub node_id: String,
     pub release: AllowedIgvm,
     pub schema: String,
 }
@@ -322,7 +374,6 @@ pub struct NodeLedgerCertificate {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct NodeLedgerAdmission {
-    pub catalog: CatalogIdentity,
     pub cert_expires_at: String,
     pub chip_id: String,
     pub collateral: Vec<VendorCollateral>,
@@ -337,7 +388,7 @@ pub struct NodeLedgerAdmission {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct VerifiedNodeLedgerRecord {
     pub admitted_at_unix_ms: i64,
-    pub generation_id: String,
+    pub node_id: String,
     pub node: VerifiedNode,
     pub release: VerifiedRelease,
 }

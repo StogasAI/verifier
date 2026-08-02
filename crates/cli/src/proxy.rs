@@ -43,6 +43,7 @@ const PRODUCTION_BUNDLE_URL: &str = "https://evidence.stogas.ai/bundles/latest.j
 const PRODUCTION_BUNDLE_FALLBACK_URL: &str = "https://evidence2.stogas.ai/bundles/latest.json";
 const STAGING_BUNDLE_URL: &str = "https://evidence-staging.stogas.ai/bundles/latest.json";
 const STAGING_BUNDLE_FALLBACK_URL: &str = "https://evidence2-staging.stogas.ai/bundles/latest.json";
+const VERIFIED_TLS_CONNECTION_ERROR: &str = "Verified TLS connection failed. TLS mode requires TLS 1.3 with X25519MLKEM768 and a certificate in the active verified bundle. Select E2EE mode if hybrid TLS is unavailable.";
 
 pub struct ServeConfig {
     bundle_urls: Vec<Url>,
@@ -79,11 +80,13 @@ impl ServeConfig {
     pub fn new(input: ServeConfigInput<'_>) -> Result<Self> {
         let bundle_urls = secure_bundle_urls(input.bundle_url)?;
         let bundle_fetcher = reqwest::Client::builder()
+            .use_preconfigured_tls(compatible_webpki_tls_config()?)
             .redirect(reqwest::redirect::Policy::none())
             .connect_timeout(Duration::from_secs(5))
             .timeout(Duration::from_secs(BUNDLE_ORIGIN_TIMEOUT_SECONDS))
             .build()?;
         let upstream_client = reqwest::Client::builder()
+            .use_preconfigured_tls(compatible_webpki_tls_config()?)
             .redirect(reqwest::redirect::Policy::none())
             .connect_timeout(Duration::from_secs(5))
             .build()?;
@@ -214,13 +217,13 @@ struct ActiveBundle {
     output: VerificationOutput,
     client: reqwest::Client,
     recipients: Vec<Recipient>,
-    version: BundleVersion,
+    bundle_sha256: [u8; 32],
 }
 
 #[derive(Clone)]
-struct BundleVersion {
+struct OriginCacheState {
     etag: Option<String>,
-    sha256: [u8; 32],
+    bundle_sha256: [u8; 32],
 }
 
 enum BundleFetch {
@@ -230,12 +233,12 @@ enum BundleFetch {
 
 struct BundleCandidate {
     bytes: Vec<u8>,
-    version: BundleVersion,
+    origin_cache: OriginCacheState,
 }
 
 struct ProxyState {
     active: RwLock<Arc<ActiveBundle>>,
-    bundle_versions: Mutex<HashMap<String, BundleVersion>>,
+    origin_caches: Mutex<HashMap<String, OriginCacheState>>,
     config: Arc<ServeConfig>,
     refresh_lock: Mutex<()>,
     verifier: Mutex<Verifier>,
@@ -244,10 +247,10 @@ struct ProxyState {
 pub async fn serve(config: ServeConfig) -> Result<()> {
     let config = Arc::new(config);
     let mut verifier = Verifier::default();
-    let (initial, bundle_versions) = fetch_initial_bundle(&config, &mut verifier).await?;
+    let (initial, origin_caches) = fetch_initial_bundle(&config, &mut verifier).await?;
     let state = Arc::new(ProxyState {
         active: RwLock::new(Arc::new(initial)),
-        bundle_versions: Mutex::new(bundle_versions),
+        origin_caches: Mutex::new(origin_caches),
         config: Arc::clone(&config),
         refresh_lock: Mutex::new(()),
         verifier: Mutex::new(verifier),
@@ -288,10 +291,10 @@ pub async fn serve_embedded(
     let config = Arc::new(config);
     let mut verifier = Verifier::default();
     let initialized = async {
-        let (initial, bundle_versions) = fetch_initial_bundle(&config, &mut verifier).await?;
+        let (initial, origin_caches) = fetch_initial_bundle(&config, &mut verifier).await?;
         let state = Arc::new(ProxyState {
             active: RwLock::new(Arc::new(initial)),
-            bundle_versions: Mutex::new(bundle_versions),
+            origin_caches: Mutex::new(origin_caches),
             config: Arc::clone(&config),
             refresh_lock: Mutex::new(()),
             verifier: Mutex::new(verifier),
@@ -396,21 +399,21 @@ async fn sleep_until_wall_clock(deadline_ms: i64) {
 async fn fetch_initial_bundle(
     config: &ServeConfig,
     verifier: &mut Verifier,
-) -> Result<(ActiveBundle, HashMap<String, BundleVersion>)> {
+) -> Result<(ActiveBundle, HashMap<String, OriginCacheState>)> {
     let mut errors = Vec::new();
     for bundle_url in randomized_bundle_urls(config) {
         match fetch_bundle_origin(config, bundle_url.clone(), None).await {
             Ok(BundleFetch::Changed(candidate)) => match activate_bundle(
                 config,
                 &candidate.bytes,
-                candidate.version.clone(),
+                candidate.origin_cache.bundle_sha256,
                 wall_clock_ms(),
                 verifier,
             ) {
                 Ok(active) => {
-                    let mut versions = HashMap::new();
-                    versions.insert(bundle_url.to_string(), candidate.version);
-                    return Ok((active, versions));
+                    let mut origin_caches = HashMap::new();
+                    origin_caches.insert(bundle_url.to_string(), candidate.origin_cache);
+                    return Ok((active, origin_caches));
                 }
                 Err(error) => errors.push(format!("{bundle_url}: {error}")),
             },
@@ -434,26 +437,27 @@ async fn refresh_once(state: &ProxyState) -> Result<bool> {
     let mut errors = Vec::new();
     for bundle_url in randomized_bundle_urls(&state.config) {
         let previous = {
-            let versions = state.bundle_versions.lock().await;
-            versions.get(bundle_url.as_str()).cloned()
+            let origin_caches = state.origin_caches.lock().await;
+            origin_caches.get(bundle_url.as_str()).cloned()
         };
         match fetch_bundle_origin(&state.config, bundle_url.clone(), previous).await {
             Ok(BundleFetch::Unchanged) => return Ok(false),
             Ok(BundleFetch::Changed(candidate)) => {
-                if candidate.version.sha256 == current.version.sha256 {
+                if candidate.origin_cache.bundle_sha256 == current.bundle_sha256 {
                     state
-                        .bundle_versions
+                        .origin_caches
                         .lock()
                         .await
-                        .insert(bundle_url.to_string(), candidate.version);
+                        .insert(bundle_url.to_string(), candidate.origin_cache);
                     return Ok(false);
                 }
+                let origin_cache = candidate.origin_cache.clone();
                 let activated = {
                     let mut verifier = state.verifier.lock().await;
                     activate_bundle(
                         &state.config,
                         &candidate.bytes,
-                        candidate.version.clone(),
+                        candidate.origin_cache.bundle_sha256,
                         wall_clock_ms(),
                         &mut verifier,
                     )
@@ -465,22 +469,16 @@ async fn refresh_once(state: &ProxyState) -> Result<bool> {
                         continue;
                     }
                 };
-                if candidate.output.bundle.sequence < current.output.bundle.sequence {
-                    errors.push(format!("{bundle_url}: returned an older bundle sequence"));
+                if !candidate_snapshot_advances(&current.output, &candidate.output) {
+                    errors.push(format!(
+                        "{bundle_url}: returned a non-advancing verified snapshot"
+                    ));
                     continue;
                 }
-                if candidate.output.bundle.sequence == current.output.bundle.sequence {
-                    state
-                        .bundle_versions
-                        .lock()
-                        .await
-                        .insert(bundle_url.to_string(), candidate.version);
-                    return Ok(false);
-                }
                 {
-                    let mut versions = state.bundle_versions.lock().await;
-                    versions.clear();
-                    versions.insert(bundle_url.to_string(), candidate.version.clone());
+                    let mut origin_caches = state.origin_caches.lock().await;
+                    origin_caches.clear();
+                    origin_caches.insert(bundle_url.to_string(), origin_cache);
                 }
                 *state.active.write().await = Arc::new(candidate);
                 return Ok(true);
@@ -499,16 +497,20 @@ fn randomized_bundle_urls(config: &ServeConfig) -> Vec<Url> {
     urls
 }
 
+const fn candidate_snapshot_advances(
+    current: &VerificationOutput,
+    candidate: &VerificationOutput,
+) -> bool {
+    candidate.bundle.created_at_unix_ms > current.bundle.created_at_unix_ms
+}
+
 async fn fetch_bundle_origin(
     config: &ServeConfig,
     bundle_url: Url,
-    previous: Option<BundleVersion>,
+    previous: Option<OriginCacheState>,
 ) -> Result<BundleFetch> {
     let mut request = config.bundle_fetcher.get(bundle_url.clone());
-    if let Some(etag) = previous
-        .as_ref()
-        .and_then(|version| version.etag.as_deref())
-    {
+    if let Some(etag) = previous.as_ref().and_then(|cache| cache.etag.as_deref()) {
         request = request.header(reqwest::header::IF_NONE_MATCH, etag);
     }
     let response = request.send().await.with_context(|| {
@@ -538,13 +540,16 @@ async fn fetch_bundle_origin(
     let sha256 = bundle_sha256(&bytes);
     if previous
         .as_ref()
-        .is_some_and(|version| version_matches(version, sha256))
+        .is_some_and(|cache| cache.bundle_sha256 == sha256)
     {
         return Ok(BundleFetch::Unchanged);
     }
     Ok(BundleFetch::Changed(BundleCandidate {
         bytes,
-        version: BundleVersion { etag, sha256 },
+        origin_cache: OriginCacheState {
+            etag,
+            bundle_sha256: sha256,
+        },
     }))
 }
 
@@ -552,14 +557,10 @@ fn bundle_sha256(bytes: &[u8]) -> [u8; 32] {
     Sha256::digest(bytes).into()
 }
 
-fn version_matches(version: &BundleVersion, sha256: [u8; 32]) -> bool {
-    version.sha256 == sha256
-}
-
 fn activate_bundle(
     config: &ServeConfig,
     bytes: &[u8],
-    version: BundleVersion,
+    bundle_sha256: [u8; 32],
     now_unix_ms: i64,
     verifier: &mut Verifier,
 ) -> Result<ActiveBundle> {
@@ -570,7 +571,7 @@ fn activate_bundle(
         output,
         client,
         recipients,
-        version,
+        bundle_sha256,
     })
 }
 
@@ -687,7 +688,7 @@ async fn proxy_request_inner(
             path: &upstream_path,
             parts: &parts,
             body,
-            bundle_sha256: &active.version.sha256,
+            bundle_sha256: &active.bundle_sha256,
             recipients: &active.recipients,
             now_unix_ms,
         })
@@ -703,8 +704,10 @@ async fn proxy_request_inner(
         .await
         .map_err(|error| {
             if error.is_connect() && state.config.security != SecurityMode::E2ee {
-                (StatusCode::BAD_GATEWAY, "upstream TLS verification failed")
+                eprintln!("verified upstream TLS connection failed: {error:#}");
+                (StatusCode::BAD_GATEWAY, VERIFIED_TLS_CONNECTION_ERROR)
             } else {
+                eprintln!("upstream request failed: {error:#}");
                 (StatusCode::BAD_GATEWAY, "upstream request failed")
             }
         })
@@ -956,8 +959,13 @@ impl ServerCertVerifier for PinnedServerVerifier {
 }
 
 fn validate_leaf_pin(certificate_der: &[u8], nodes: &[NodePins]) -> Result<(), RustlsError> {
-    let (_, certificate) = x509_parser::parse_x509_certificate(certificate_der)
+    let (remaining, certificate) = x509_parser::parse_x509_certificate(certificate_der)
         .map_err(|_| RustlsError::InvalidCertificate(CertificateError::BadEncoding))?;
+    if !remaining.is_empty() {
+        return Err(RustlsError::InvalidCertificate(
+            CertificateError::BadEncoding,
+        ));
+    }
     let cert_hash: [u8; 32] = Sha256::digest(certificate_der).into();
     let spki_hash: [u8; 32] = Sha256::digest(certificate.public_key().raw).into();
     if nodes
@@ -986,7 +994,7 @@ fn pinned_client_with_roots(
     if nodes.is_empty() {
         bail!("a proxy trust bundle must contain at least one verified node");
     }
-    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let provider = post_quantum_tls_provider();
     let webpki = rustls::client::WebPkiServerVerifier::builder_with_provider(
         Arc::new(roots),
         Arc::clone(&provider),
@@ -1000,7 +1008,7 @@ fn pinned_client_with_roots(
             .collect::<Result<Vec<_>>>()?,
     });
     let mut tls = ClientConfig::builder_with_provider(provider)
-        .with_safe_default_protocol_versions()?
+        .with_protocol_versions(&[&rustls::version::TLS13])?
         .dangerous()
         .with_custom_certificate_verifier(verifier)
         .with_no_client_auth();
@@ -1009,6 +1017,29 @@ fn pinned_client_with_roots(
         .redirect(reqwest::redirect::Policy::none())
         .use_preconfigured_tls(tls)
         .build()?)
+}
+
+fn post_quantum_tls_provider() -> Arc<rustls::crypto::CryptoProvider> {
+    let mut provider = rustls::crypto::aws_lc_rs::default_provider();
+    provider.kx_groups = vec![rustls::crypto::aws_lc_rs::kx_group::X25519MLKEM768];
+    Arc::new(provider)
+}
+
+fn compatible_webpki_tls_config() -> Result<ClientConfig> {
+    let roots = RootCertStore {
+        roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
+    };
+    compatible_webpki_tls_config_with_roots(roots)
+}
+
+fn compatible_webpki_tls_config_with_roots(roots: RootCertStore) -> Result<ClientConfig> {
+    let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+    let mut tls = ClientConfig::builder_with_provider(provider)
+        .with_protocol_versions(&[&rustls::version::TLS13, &rustls::version::TLS12])?
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    tls.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+    Ok(tls)
 }
 
 fn wall_clock_ms() -> i64 {
@@ -1024,9 +1055,11 @@ fn wall_clock_ms() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+    use hpke::{Kem as _, Serializable as _, kem::XWing};
     use rcgen::{BasicConstraints, CertificateParams, CertifiedIssuer, IsCa, KeyPair};
     use rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
-    use stogas_verifier::{DrandBeacon, ReportData};
+    use stogas_verifier::{AllowedCatalog, DrandBeacon, ReportData, VerifiedCatalogRelease};
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
     use tokio::sync::oneshot;
     use tokio_rustls::TlsAcceptor;
@@ -1056,10 +1089,6 @@ mod tests {
             chain: vec![leaf_der, ca.der().clone()],
             key: PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(leaf_key.serialize_der())),
             node: VerifiedNode {
-                catalog: stogas_verifier::CatalogIdentity {
-                    digest: format!("sha256:{}", "00".repeat(32)),
-                    sequence: 0,
-                },
                 chip_id: "00".repeat(64),
                 drand_round: 0,
                 drand_round_time_unix_ms: 0,
@@ -1071,6 +1100,10 @@ mod tests {
                 report_data: ReportData {
                     active_cert_sha256: cert_hash.clone(),
                     accepted_cert_sha256: vec![cert_hash],
+                    catalog: stogas_verifier::CatalogIdentity {
+                        digest: format!("sha256:{}", "22".repeat(32)),
+                        sequence: 1,
+                    },
                     drand: DrandBeacon {
                         chain_hash: String::new(),
                         network: String::new(),
@@ -1080,7 +1113,7 @@ mod tests {
                     },
                     ed25519_public_key: String::new(),
                     hpke_public_key: String::new(),
-                    schema: "stogas.node-report.v2".into(),
+                    schema: "stogas.node-report.v3".into(),
                     tls_spki_sha256: spki_hash,
                 },
                 report_data_sha512: "00".repeat(64),
@@ -1093,10 +1126,32 @@ mod tests {
     fn test_output(expires_at_unix_ms: i64) -> VerificationOutput {
         let mut node = test_certificate().node;
         node.report_data.hpke_public_key =
-            "BGn8DU65A_k1uW7rcnRbFwefL32ZjA94AYLFaVDP6RHEZ3BXsZ3WAsDq00JijkYQ0yswDe5fpxhtbDozQqUK8-U"
-                .into();
+            URL_SAFE_NO_PAD.encode(XWing::gen_keypair().1.to_bytes());
+        let catalog_evidence: AllowedCatalog = serde_json::from_value(serde_json::json!({
+            "github_in_toto": [{}],
+            "signed_release": {
+                "keyId": "test",
+                "manifest": {
+                    "catalogSchema": 5,
+                    "public": format!("sha256:{}", "11".repeat(32)),
+                    "runtime": format!("sha256:{}", "22".repeat(32)),
+                    "schema": "stogas.catalog.release.v3",
+                    "sequence": 1,
+                    "source": {
+                        "commit": "33".repeat(20),
+                        "repository": "https://github.com/StogasAI/catalog",
+                        "tag": "catalog-v1",
+                        "tree": "44".repeat(20)
+                    }
+                },
+                "schema": "stogas.catalog.signed.v3",
+                "signature": "test"
+            }
+        }))
+        .unwrap();
         let original = serde_json::from_value(serde_json::json!({
             "body": {
+                "allowed_catalogs": [catalog_evidence],
                 "allowed_igvms": [],
                 "created_at": "2026-07-23T16:00:00.000Z",
                 "expires_at": "2026-07-23T16:15:00.000Z",
@@ -1111,6 +1166,18 @@ mod tests {
         .unwrap();
         VerificationOutput {
             bundle: stogas_verifier::VerifiedBundle {
+                catalogs: vec![VerifiedCatalogRelease {
+                    evidence: catalog_evidence,
+                    github_integrated_time_unix_ms: 0,
+                    public_digest: format!("sha256:{}", "11".repeat(32)),
+                    runtime_digest: format!("sha256:{}", "22".repeat(32)),
+                    sequence: 1,
+                    source_commit: "33".repeat(20),
+                    source_repository: "https://github.com/StogasAI/catalog".into(),
+                    source_tag: "catalog-v1".into(),
+                    source_tree: "44".repeat(20),
+                    stogas_signing_key_id: "test".into(),
+                }],
                 sequence: 1,
                 created_at_unix_ms: 0,
                 expires_at_unix_ms,
@@ -1123,14 +1190,34 @@ mod tests {
     }
 
     async fn tls_server(certificate: TestCertificate, attempts: usize) -> SocketAddr {
-        let config = rustls::ServerConfig::builder_with_provider(Arc::new(
-            rustls::crypto::ring::default_provider(),
-        ))
-        .with_safe_default_protocol_versions()
-        .unwrap()
-        .with_no_client_auth()
-        .with_single_cert(certificate.chain, certificate.key)
-        .unwrap();
+        tls_server_with_provider(certificate, attempts, post_quantum_tls_provider()).await
+    }
+
+    async fn tls_server_with_provider(
+        certificate: TestCertificate,
+        attempts: usize,
+        provider: Arc<rustls::crypto::CryptoProvider>,
+    ) -> SocketAddr {
+        let config = rustls::ServerConfig::builder_with_provider(provider)
+            .with_protocol_versions(&[&rustls::version::TLS13])
+            .unwrap()
+            .with_no_client_auth()
+            .with_single_cert(certificate.chain, certificate.key)
+            .unwrap();
+        tls_server_with_config(config, attempts).await
+    }
+
+    async fn tls12_server(certificate: TestCertificate, attempts: usize) -> SocketAddr {
+        let config = rustls::ServerConfig::builder_with_provider(classical_tls_provider())
+            .with_protocol_versions(&[&rustls::version::TLS12])
+            .unwrap()
+            .with_no_client_auth()
+            .with_single_cert(certificate.chain, certificate.key)
+            .unwrap();
+        tls_server_with_config(config, attempts).await
+    }
+
+    async fn tls_server_with_config(config: rustls::ServerConfig, attempts: usize) -> SocketAddr {
         let acceptor = TlsAcceptor::from(Arc::new(config));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
@@ -1152,17 +1239,21 @@ mod tests {
         address
     }
 
+    fn classical_tls_provider() -> Arc<rustls::crypto::CryptoProvider> {
+        let mut provider = rustls::crypto::aws_lc_rs::default_provider();
+        provider.kx_groups = vec![rustls::crypto::aws_lc_rs::kx_group::X25519];
+        Arc::new(provider)
+    }
+
     async fn capturing_tls_server(
         certificate: TestCertificate,
     ) -> (SocketAddr, oneshot::Receiver<Vec<u8>>) {
-        let config = rustls::ServerConfig::builder_with_provider(Arc::new(
-            rustls::crypto::ring::default_provider(),
-        ))
-        .with_safe_default_protocol_versions()
-        .unwrap()
-        .with_no_client_auth()
-        .with_single_cert(certificate.chain, certificate.key)
-        .unwrap();
+        let config = rustls::ServerConfig::builder_with_provider(post_quantum_tls_provider())
+            .with_protocol_versions(&[&rustls::version::TLS13])
+            .unwrap()
+            .with_no_client_auth()
+            .with_single_cert(certificate.chain, certificate.key)
+            .unwrap();
         let acceptor = TlsAcceptor::from(Arc::new(config));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
@@ -1214,6 +1305,13 @@ mod tests {
         roots
     }
 
+    fn test_http_client() -> reqwest::Client {
+        reqwest::Client::builder()
+            .use_preconfigured_tls(compatible_webpki_tls_config().unwrap())
+            .build()
+            .unwrap()
+    }
+
     fn proxy_state(
         client: reqwest::Client,
         upstream: &str,
@@ -1232,19 +1330,15 @@ mod tests {
     ) -> ProxyState {
         let output = test_output(expires_at_unix_ms);
         let bundle = b"test bundle";
-        let version = BundleVersion {
-            etag: None,
-            sha256: bundle_sha256(bundle),
-        };
         let recipients = recipients_from_verified_bundle(&output).unwrap();
         ProxyState {
             active: RwLock::new(Arc::new(ActiveBundle {
                 output,
                 client,
                 recipients,
-                version,
+                bundle_sha256: bundle_sha256(bundle),
             })),
-            bundle_versions: Mutex::new(HashMap::new()),
+            origin_caches: Mutex::new(HashMap::new()),
             config: Arc::new(
                 ServeConfig::new(ServeConfigInput {
                     bundle_url,
@@ -1270,6 +1364,52 @@ mod tests {
         let node = certificate.node.clone();
         let address = tls_server(certificate, 1).await;
         let client = pinned_client_with_roots(&[node], roots(ca)).unwrap();
+        let response = client
+            .get(format!("https://localhost:{}/v1/test", address.port()))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.bytes().await.unwrap(), "ok");
+    }
+
+    #[tokio::test]
+    async fn managed_transport_rejects_classical_tls_fallback() {
+        let certificate = test_certificate();
+        let ca = certificate.ca.clone();
+        let node = certificate.node.clone();
+        let address = tls_server_with_provider(certificate, 1, classical_tls_provider()).await;
+        let client = pinned_client_with_roots(&[node], roots(ca)).unwrap();
+        let state = proxy_state(
+            client,
+            &format!("https://localhost:{}", address.port()),
+            "https://evidence.example/bundles/latest.json",
+            i64::MAX,
+        );
+        let request = Request::builder()
+            .method(Method::GET)
+            .uri("/v1/test")
+            .header(header::HOST, "127.0.0.1:8787")
+            .body(Body::empty())
+            .unwrap();
+        let Err(error) = proxy_request_inner(&state, request).await else {
+            panic!("classical TLS fallback was accepted");
+        };
+        assert_eq!(
+            error,
+            (StatusCode::BAD_GATEWAY, VERIFIED_TLS_CONNECTION_ERROR)
+        );
+    }
+
+    #[tokio::test]
+    async fn e2ee_https_client_accepts_modern_tls12() {
+        let certificate = test_certificate();
+        let ca = certificate.ca.clone();
+        let address = tls12_server(certificate, 1).await;
+        let tls = compatible_webpki_tls_config_with_roots(roots(ca)).unwrap();
+        let client = reqwest::Client::builder()
+            .use_preconfigured_tls(tls)
+            .build()
+            .unwrap();
         let response = client
             .get(format!("https://localhost:{}/v1/test", address.port()))
             .send()
@@ -1391,7 +1531,7 @@ mod tests {
     #[tokio::test]
     async fn rejects_browser_origin_bad_host_non_v1_path_and_expired_trust() {
         let state = proxy_state(
-            reqwest::Client::new(),
+            test_http_client(),
             "https://api.example",
             "https://evidence.example/bundles/latest.json",
             i64::MAX,
@@ -1458,7 +1598,7 @@ mod tests {
         assert!(state.config.refresh_url().ends_with(&refresh_path));
 
         let expired = proxy_state(
-            reqwest::Client::new(),
+            test_http_client(),
             "https://api.example",
             "https://evidence.example/bundles/latest.json",
             0,
@@ -1475,7 +1615,7 @@ mod tests {
     #[tokio::test]
     async fn browser_access_requires_exact_origin_and_capability_and_handles_preflight() {
         let state = proxy_state_with_browser(
-            reqwest::Client::new(),
+            test_http_client(),
             "https://api.example",
             "https://evidence.example/bundles/latest.json",
             i64::MAX,
@@ -1542,7 +1682,7 @@ mod tests {
         let address = listener.local_addr().unwrap();
         drop(listener);
         let state = proxy_state(
-            reqwest::Client::new(),
+            test_http_client(),
             "https://api.example",
             &format!("https://127.0.0.1:{}/bundles/latest.json", address.port()),
             i64::MAX,
@@ -1646,11 +1786,29 @@ mod tests {
 
     #[test]
     fn identical_bundle_bytes_reuse_the_active_verification() {
-        let version = BundleVersion {
+        let cache = OriginCacheState {
             etag: Some("\"bundle-etag\"".into()),
-            sha256: bundle_sha256(b"same bundle"),
+            bundle_sha256: bundle_sha256(b"same bundle"),
         };
-        assert!(version_matches(&version, bundle_sha256(b"same bundle")));
-        assert!(!version_matches(&version, bundle_sha256(b"new bundle")));
+        assert_eq!(cache.bundle_sha256, bundle_sha256(b"same bundle"));
+        assert_ne!(cache.bundle_sha256, bundle_sha256(b"new bundle"));
+    }
+
+    #[test]
+    fn snapshot_order_ignores_untrusted_sequence_values() {
+        let mut current = test_output(1_000_000);
+        current.bundle.created_at_unix_ms = 100_000;
+        current.bundle.sequence = u64::MAX;
+        let mut candidate = test_output(1_000_000);
+        candidate.bundle.created_at_unix_ms = 100_001;
+        candidate.bundle.sequence = 1;
+        assert!(candidate_snapshot_advances(&current, &candidate));
+
+        candidate.bundle.created_at_unix_ms = 100_000;
+        assert!(!candidate_snapshot_advances(&current, &candidate));
+
+        candidate.bundle.created_at_unix_ms = 99_999;
+        candidate.bundle.sequence = u64::MAX;
+        assert!(!candidate_snapshot_advances(&current, &candidate));
     }
 }

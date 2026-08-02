@@ -40,7 +40,7 @@ pub struct StogasTransport {
 #[serde(default, deny_unknown_fields)]
 struct AbiTransportOptions {
     security: String,
-    bundle_refresh_interval_seconds: u16,
+    bundle_refresh_interval_seconds: u64,
     #[serde(alias = "baseURL")]
     base_url: Option<String>,
     #[serde(alias = "bundleURL")]
@@ -51,7 +51,7 @@ impl Default for AbiTransportOptions {
     fn default() -> Self {
         Self {
             security: "tls".into(),
-            bundle_refresh_interval_seconds: 60,
+            bundle_refresh_interval_seconds: 300,
             base_url: None,
             bundle_url: None,
         }
@@ -147,9 +147,9 @@ pub unsafe extern "C" fn stogas_transport_start(
                 "both" => SecurityMode::Both,
                 _ => return Err("security must be tls, e2ee, or both".into()),
             },
-            bundle_refresh_interval: std::time::Duration::from_secs(u64::from(
+            bundle_refresh_interval: std::time::Duration::from_secs(
                 configuration.bundle_refresh_interval_seconds,
-            )),
+            ),
             base_url: configuration.base_url.unwrap_or(defaults.base_url),
             bundle_url: configuration.bundle_url.unwrap_or(defaults.bundle_url),
         };
@@ -325,6 +325,8 @@ pub unsafe extern "C" fn stogas_verifier_verify_historical_response_proof(
     response_body_len: usize,
     ledger: *const u8,
     ledger_len: usize,
+    catalog: *const u8,
+    catalog_len: usize,
     e2ee_transcript_sha256: *const u8,
     e2ee_transcript_sha256_len: usize,
     now_unix_ms: i64,
@@ -362,6 +364,15 @@ pub unsafe extern "C" fn stogas_verifier_verify_historical_response_proof(
             )?
         };
         // SAFETY: each pointer and bound is validated by `input_slice`.
+        let catalog = unsafe {
+            input_slice(
+                catalog,
+                catalog_len,
+                stogas_verifier::MAX_INPUT_BYTES,
+                "catalog approval",
+            )?
+        };
+        // SAFETY: each pointer and bound is validated by `input_slice`.
         let transcript = unsafe {
             input_slice(
                 e2ee_transcript_sha256,
@@ -385,6 +396,7 @@ pub unsafe extern "C" fn stogas_verifier_verify_historical_response_proof(
                 expected_e2ee_transcript_sha256: transcript,
                 now_unix_ms,
                 ledger_bytes: ledger,
+                catalog_approval_bytes: catalog,
                 environment: &environment,
             })
             .map_err(|error| error.to_string())
@@ -530,7 +542,12 @@ mod tests {
             ))
         };
         assert_eq!(result["ok"], false);
-        assert!(result["error"].as_str().unwrap().contains("1 through 840"));
+        assert!(
+            result["error"]
+                .as_str()
+                .unwrap()
+                .contains("must be positive")
+        );
         assert!(transport.is_null());
     }
 

@@ -1,4 +1,7 @@
-import type { Verifier as CoreVerifier } from '../../pkg/browser/stogas_verifier.js';
+import type {
+	ResponseProofStream as CoreResponseProofStream,
+	Verifier as CoreVerifier
+} from '../../pkg/browser/stogas_verifier.js';
 
 export { default, verify_bundle } from '../../pkg/browser/stogas_verifier.js';
 
@@ -11,16 +14,39 @@ export declare class Verifier {
 		responseBody: Uint8Array,
 		e2eeTranscriptSHA256?: string
 	): ReturnType<CoreVerifier['verify_response_proof']>;
+	start_response_proof(requestBody: Uint8Array): ResponseProofStream;
 	verify_historical_response_proof(
 		proof: Uint8Array,
 		requestBody: Uint8Array,
 		responseBody: Uint8Array,
 		ledger: Uint8Array,
+		catalog: Uint8Array,
 		e2eeTranscriptSHA256?: string
 	): ReturnType<CoreVerifier['verify_historical_response_proof']>;
 	verify_node_ledger_record(
 		ledger: Uint8Array
 	): ReturnType<CoreVerifier['verify_node_ledger_record']>;
+	verify_release_approval(
+		release: Uint8Array
+	): ReturnType<CoreVerifier['verify_release_approval']>;
+	verify_catalog_approval(
+		catalog: Uint8Array
+	): ReturnType<CoreVerifier['verify_catalog_approval']>;
+	free(): void;
+}
+
+export declare class ResponseProofStream {
+	write(chunk: Uint8Array): void;
+	finish(
+		proof: Uint8Array,
+		e2eeTranscriptSHA256?: string
+	): ReturnType<CoreResponseProofStream['finish']>;
+	finishHistorical(
+		proof: Uint8Array,
+		ledger: Uint8Array,
+		catalog: Uint8Array,
+		e2eeTranscriptSHA256?: string
+	): ReturnType<CoreResponseProofStream['finish_historical']>;
 	free(): void;
 }
 
@@ -64,7 +90,10 @@ export declare class StogasTransport {
 		responseBody: Uint8Array,
 		e2eeTranscriptSHA256?: string
 	): ReturnType<CoreVerifier['verify_response_proof']>;
+	createResponseProofStream(requestBody: Uint8Array): ResponseProofStream;
 	verifyNodeLedgerRecord(ledger: Uint8Array): ReturnType<CoreVerifier['verify_node_ledger_record']>;
+	verifyReleaseApproval(release: Uint8Array): ReturnType<CoreVerifier['verify_release_approval']>;
+	verifyCatalogApproval(catalog: Uint8Array): ReturnType<CoreVerifier['verify_catalog_approval']>;
 	refreshBundle(): Promise<boolean>;
 	subscribe(listener: (snapshot: StogasBundleSnapshot) => void): () => void;
 	close(): void;

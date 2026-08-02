@@ -12,4 +12,4 @@ assert.throws(
 verifier.free();
 
 assert.throws(() => verify_bundle(new TextEncoder().encode('{"body":')), /invalid bundle JSON/);
-assert.throws(() => new StogasTransport({ bundleRefreshIntervalSeconds: 0 }), /between 1 and 840/);
+assert.throws(() => new StogasTransport({ bundleRefreshIntervalSeconds: 0 }), /positive safe integer/);

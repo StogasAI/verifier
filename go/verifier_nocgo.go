@@ -20,7 +20,7 @@ var ErrTransportClosed = errors.New("stogas transport is closed")
 type TransportOptions struct {
 	Staging                      bool
 	Security                     string
-	BundleRefreshIntervalSeconds uint16
+	BundleRefreshIntervalSeconds uint64
 	BaseURL                      string
 	BundleURL                    string
 }
@@ -63,7 +63,7 @@ func (*Verifier) VerifyResponseProof([]byte, []byte, []byte, string) (json.RawMe
 }
 
 // VerifyHistoricalResponseProof reports that the packaged native verifier is unavailable.
-func (*Verifier) VerifyHistoricalResponseProof([]byte, []byte, []byte, []byte, string) (json.RawMessage, error) {
+func (*Verifier) VerifyHistoricalResponseProof([]byte, []byte, []byte, []byte, []byte, string) (json.RawMessage, error) {
 	return nil, ErrNativeLibraryUnavailable
 }
 

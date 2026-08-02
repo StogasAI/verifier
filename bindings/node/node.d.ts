@@ -17,6 +17,7 @@ export declare class Verifier {
 		requestBody: Uint8Array,
 		responseBody: Uint8Array,
 		ledger: Uint8Array,
+		catalog: Uint8Array,
 		e2eeTranscriptSHA256?: string
 	): ReturnType<CoreVerifier['verify_historical_response_proof']>;
 	verify_node_ledger_record(

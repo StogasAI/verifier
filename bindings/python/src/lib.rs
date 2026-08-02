@@ -24,13 +24,13 @@ impl PythonTransport {
     #[new]
     #[pyo3(signature = (
         security = "tls",
-        bundle_refresh_interval_seconds = 60,
+        bundle_refresh_interval_seconds = 300,
         base_url = None,
         bundle_url = None
     ))]
     fn new(
         security: &str,
-        bundle_refresh_interval_seconds: u16,
+        bundle_refresh_interval_seconds: u64,
         base_url: Option<String>,
         bundle_url: Option<String>,
     ) -> PyResult<Self> {
@@ -42,9 +42,9 @@ impl PythonTransport {
                 "both" => SecurityMode::Both,
                 _ => return Err(PyValueError::new_err("security must be tls, e2ee, or both")),
             },
-            bundle_refresh_interval: std::time::Duration::from_secs(u64::from(
+            bundle_refresh_interval: std::time::Duration::from_secs(
                 bundle_refresh_interval_seconds,
-            )),
+            ),
             base_url: base_url.unwrap_or(defaults.base_url),
             bundle_url: bundle_url.unwrap_or(defaults.bundle_url),
         };
@@ -114,7 +114,8 @@ impl PythonVerifier {
         json_bytes(py, &output)
     }
 
-    #[pyo3(signature = (proof, request_body, response_body, ledger, e2ee_transcript_sha256=None))]
+    #[pyo3(signature = (proof, request_body, response_body, ledger, catalog, e2ee_transcript_sha256=None))]
+    #[allow(clippy::too_many_arguments)]
     fn verify_historical_response_proof<'py>(
         &self,
         py: Python<'py>,
@@ -122,6 +123,7 @@ impl PythonVerifier {
         request_body: &[u8],
         response_body: &[u8],
         ledger: &[u8],
+        catalog: &[u8],
         e2ee_transcript_sha256: Option<&str>,
     ) -> PyResult<Bound<'py, PyBytes>> {
         let output = self
@@ -133,6 +135,7 @@ impl PythonVerifier {
                 expected_e2ee_transcript_sha256: e2ee_transcript_sha256,
                 now_unix_ms: wall_clock_ms()?,
                 ledger_bytes: ledger,
+                catalog_approval_bytes: catalog,
                 environment: &self.environment,
             })
             .map_err(|error| PyValueError::new_err(error.to_string()))?;

@@ -5,11 +5,15 @@ import init, { StogasTransport } from '../../bindings/browser/browser.js';
 const wasm = await readFile(new URL('../../pkg/browser/stogas_verifier_bg.wasm', import.meta.url));
 await init({ module_or_path: wasm });
 
-assert.throws(() => new StogasTransport({ bundleRefreshIntervalSeconds: 0 }), /between 1 and 840/);
 assert.throws(
-	() => new StogasTransport({ bundleRefreshIntervalSeconds: 841 }),
-	/between 1 and 840/
+	() => new StogasTransport({ bundleRefreshIntervalSeconds: 0 }),
+	/positive safe integer/
 );
+assert.throws(
+	() => new StogasTransport({ bundleRefreshIntervalSeconds: Number.MAX_SAFE_INTEGER + 1 }),
+	/positive safe integer/
+);
+new StogasTransport({ bundleRefreshIntervalSeconds: 86_400 }).close();
 assert.throws(
 	() =>
 		new StogasTransport({
@@ -82,7 +86,10 @@ try {
 		new Set(attemptedOrigins),
 		new Set(['evidence.stogas.ai', 'evidence2.stogas.ai'])
 	);
-	assert.equal(bundleRequestOptions.every((options) => options.cache === undefined), true);
+	assert.equal(
+		bundleRequestOptions.every((options) => options.cache === undefined),
+		true
+	);
 	assert.equal(
 		bundleRequestOptions.every((options) => !new Headers(options.headers).has('cache-control')),
 		true
@@ -110,7 +117,28 @@ try {
 		() => transport.verifyResponseProof(new Uint8Array(), new Uint8Array(), new Uint8Array()),
 		/a bundle must be verified before a response proof/
 	);
+	assert.throws(
+		() => transport.createResponseProofStream(new Uint8Array()),
+		/a bundle must be verified before a response proof/
+	);
 	assert.throws(() => transport.verifyNodeLedgerRecord(new Uint8Array()), /invalid bundle JSON/);
+	assert.throws(() => transport.verifyReleaseApproval(new Uint8Array()), /invalid bundle JSON/);
+	assert.throws(() => transport.verifyCatalogApproval(new Uint8Array()), /invalid bundle JSON/);
 } finally {
 	transport.close();
 }
+
+const browserSource = await readFile(
+	new URL('../../bindings/browser/browser.js', import.meta.url),
+	'utf8'
+);
+assert.doesNotMatch(
+	browserSource,
+	/bundle\.sequence\s*[<=>]/,
+	'an unsigned bundle sequence must not control refresh activation'
+);
+assert.match(
+	browserSource,
+	/if \(raw === null\) return false;/,
+	'response fields must remain opt-in when the header is absent'
+);

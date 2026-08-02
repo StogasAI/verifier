@@ -5,6 +5,7 @@ mod types;
 
 pub mod e2ee;
 pub mod response_proof;
+pub mod secret_release;
 pub use types::*;
 
 use base64::{
@@ -23,10 +24,11 @@ use std::collections::{BTreeMap, BTreeSet};
 use stogas_offline_sigstore::{GithubPolicy, Subject, verify_github_attestation};
 use thiserror::Error;
 use x509_parser::{
+    cri_attributes::ParsedCriAttribute,
     oid_registry::{OID_EC_P256, OID_KEY_TYPE_EC_PUBLIC_KEY, OID_SIG_ECDSA_WITH_SHA256},
     prelude::{
         FromDer as _, GeneralName, ParsedExtension, X509CertificationRequest,
-        X509CertificationRequestInfo,
+        X509CertificationRequestInfo, X509Version,
     },
 };
 
@@ -43,12 +45,23 @@ const DRAND_PERIOD_SECONDS: i64 = 3;
 const DRAND_MAX_AGE_AT_QUOTE_VERIFICATION_MS: i64 = 2 * 60 * 1000;
 const MAX_NODE_EVIDENCE_AGE_MS: i64 = 2 * 60 * 1000;
 const AMD_COLLATERAL_VALIDITY_MS: i64 = 24 * 60 * 60 * 1000;
+const SNP_POLICY_PAGE_SWAP_DISABLE: u64 = 1 << 25;
+const SNP_POLICY_MEM_AES_256_XTS: u64 = 1 << 22;
+const SNP_POLICY_CXL_ALLOW: u64 = 1 << 21;
+const SNP_POLICY_SINGLE_SOCKET: u64 = 1 << 20;
+const SNP_POLICY_DEBUG: u64 = 1 << 19;
+const SNP_POLICY_MIGRATE_MA: u64 = 1 << 18;
+const SNP_POLICY_RESERVED_MUST_BE_ONE: u64 = 1 << 17;
+const SNP_POLICY_COMMON_REQUIRED: u64 =
+    SNP_POLICY_PAGE_SWAP_DISABLE | SNP_POLICY_SINGLE_SOCKET | SNP_POLICY_RESERVED_MUST_BE_ONE;
+const SNP_POLICY_COMMON_FORBIDDEN: u64 =
+    SNP_POLICY_CXL_ALLOW | SNP_POLICY_DEBUG | SNP_POLICY_MIGRATE_MA;
 const STOGAS_RELEASE_KEY_ID: &str = "stogas-ed25519-stamp-v1";
 const STOGAS_RELEASE_PUBLIC_KEY_DER_BASE64: &str =
     "MCowBQYDK2VwAyEAByVn3LvWVbf3YkokMZPvir70vcDu0nNflgXoM0Y8aQU=";
 #[cfg(feature = "staging")]
 const STAGING_PROVENANCE_TYPE: &str = "https://stogas.ai/attestations/staging-development/v1";
-const HEARTBEAT_SIGNATURE_DOMAIN: &[u8] = b"stogas.gateway-heartbeat.v2\0";
+const HEARTBEAT_SIGNATURE_DOMAIN: &[u8] = b"stogas.gateway-heartbeat.v3\0";
 const CSR_SIGNATURE_DOMAIN: &[u8] = b"stogas.gateway-csr-submission.v1\0";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -63,6 +76,8 @@ struct AmdProductProfile {
     root_spki_sha384: &'static str,
     struct_version: u8,
     tcb_layout: AmdTcbLayout,
+    minimum_policy_abi: (u8, u8),
+    required_policy_bits: u64,
 }
 
 // AMD publication 57230 product policy. Future products remain fail-closed until their CPUID
@@ -73,26 +88,67 @@ const AMD_PRODUCT_PROFILES: [AmdProductProfile; 4] = [
         root_spki_sha384: "1249f67f15cf229a4069195e1a9ce537d1765ef706a1f4a123c36be9518786515d25ecc007f366b564d2b3f31c48082e",
         struct_version: 0,
         tcb_layout: AmdTcbLayout::Family19h,
+        minimum_policy_abi: (1, 58),
+        required_policy_bits: 0,
     },
     AmdProductProfile {
         product_name: "Genoa",
         root_spki_sha384: "32ab53a6ce5ec14926207396e5c475ae768a6a9831b7e860b5acf2e1c1dff222bc5a8bfc43eb5e06393189c1f246d880",
         struct_version: 0,
         tcb_layout: AmdTcbLayout::Family19h,
+        minimum_policy_abi: (1, 58),
+        required_policy_bits: SNP_POLICY_MEM_AES_256_XTS,
     },
     AmdProductProfile {
         product_name: "Siena",
         root_spki_sha384: "32ab53a6ce5ec14926207396e5c475ae768a6a9831b7e860b5acf2e1c1dff222bc5a8bfc43eb5e06393189c1f246d880",
         struct_version: 0,
         tcb_layout: AmdTcbLayout::Family19h,
+        minimum_policy_abi: (1, 58),
+        required_policy_bits: SNP_POLICY_MEM_AES_256_XTS,
     },
     AmdProductProfile {
         product_name: "Turin",
         root_spki_sha384: "3475f08a9727f8ac9a1deaea5f2a2097aa59d64d05c2a678c229c873e6359d3a6926287a2a22cd5f88a385e333a2fcc5",
         struct_version: 1,
         tcb_layout: AmdTcbLayout::Family1ah,
+        minimum_policy_abi: (1, 58),
+        required_policy_bits: SNP_POLICY_MEM_AES_256_XTS,
     },
 ];
+
+fn validate_snp_launch_policy(
+    policy: u64,
+    product: Option<&AmdProductProfile>,
+) -> Result<(), Error> {
+    if policy >> 26 != 0 {
+        return Err(Error::Node(
+            "authorized SNP launch policy sets reserved high bits".into(),
+        ));
+    }
+    let required =
+        SNP_POLICY_COMMON_REQUIRED | product.map_or(0, |profile| profile.required_policy_bits);
+    if policy & required != required {
+        let product_name = product.map_or("admitted platform", |profile| profile.product_name);
+        return Err(Error::Node(format!(
+            "authorized SNP launch policy lacks required {product_name} protections"
+        )));
+    }
+    if policy & SNP_POLICY_COMMON_FORBIDDEN != 0 {
+        return Err(Error::Node(
+            "authorized SNP launch policy permits CXL, debugging, or migration".into(),
+        ));
+    }
+    let minimum_abi = product.map_or((1, 58), |profile| profile.minimum_policy_abi);
+    let policy_abi = (((policy >> 8) & 0xff) as u8, (policy & 0xff) as u8);
+    if policy_abi < minimum_abi {
+        return Err(Error::Node(format!(
+            "authorized SNP launch policy ABI {}.{} is older than required {}.{}",
+            policy_abi.0, policy_abi.1, minimum_abi.0, minimum_abi.1
+        )));
+    }
+    Ok(())
+}
 
 fn amd_product_from_cpuid(family: u8, model: u8) -> Option<&'static AmdProductProfile> {
     let extended_model = model >> 4;
@@ -172,15 +228,22 @@ struct StagingDevelopmentSubject {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct CertificateCsrVerificationRequest {
+struct CertificateCsrSubmission {
     csr_der: String,
+    node_id: String,
+    order_id: String,
+    signature: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CertificateCsrTrustedContext {
+    attested_node_ed25519_public_key: String,
     expected_common_name: Option<String>,
     expected_dns_names: Vec<String>,
     expected_tls_spki_sha256: String,
-    generation_id: String,
-    node_ed25519_public_key: String,
+    node_id: String,
     order_id: String,
-    signature: String,
 }
 
 /// Runtime-independent trust configuration.
@@ -247,7 +310,13 @@ pub enum Error {
 #[derive(Debug, Default)]
 pub struct Verifier {
     active_bundle: Option<VerificationOutput>,
+    verified_catalogs: BTreeMap<String, VerifiedCatalogRelease>,
     verified_releases: BTreeMap<String, VerifiedRelease>,
+}
+
+struct VerificationCache {
+    catalogs: BTreeMap<String, VerifiedCatalogRelease>,
+    releases: BTreeMap<String, VerifiedRelease>,
 }
 
 /// Exact bytes and trust context required to verify one historical response receipt.
@@ -264,6 +333,28 @@ pub struct HistoricalResponseProofInput<'a> {
     pub now_unix_ms: i64,
     /// Immutable node-admission ledger bytes.
     pub ledger_bytes: &'a [u8],
+    /// Immutable catalog approval bytes selected by the signed catalog sequence.
+    pub catalog_approval_bytes: &'a [u8],
+    /// Release and hardware trust policy.
+    pub environment: &'a Environment,
+}
+
+/// Locally computed hashes and trust context for constant-memory historical verification.
+pub struct HistoricalResponseProofHashInput<'a> {
+    /// Compact response receipt bytes.
+    pub proof_bytes: &'a [u8],
+    /// SHA-256 of the exact plaintext request body.
+    pub request_sha256: &'a str,
+    /// SHA-256 of the exact plaintext response body.
+    pub response_sha256: &'a str,
+    /// Expected E2EE transcript hash when application encryption was used.
+    pub expected_e2ee_transcript_sha256: Option<&'a str>,
+    /// One captured verification wall-clock value.
+    pub now_unix_ms: i64,
+    /// Immutable node-admission ledger bytes.
+    pub ledger_bytes: &'a [u8],
+    /// Immutable catalog approval bytes selected by the signed catalog sequence.
+    pub catalog_approval_bytes: &'a [u8],
     /// Release and hardware trust policy.
     pub environment: &'a Environment,
 }
@@ -284,9 +375,11 @@ impl Verifier {
             bundle_bytes,
             now_unix_ms,
             environment,
+            &self.verified_catalogs,
             &self.verified_releases,
         )?;
-        self.verified_releases = next_cache;
+        self.verified_catalogs = next_cache.catalogs;
+        self.verified_releases = next_cache.releases;
         self.active_bundle = Some(output.clone());
         Ok(output)
     }
@@ -318,6 +411,33 @@ impl Verifier {
         )
     }
 
+    /// Verify one response receipt from body hashes computed by the local caller.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if no bundle has been accepted or any receipt, hash, signature, node,
+    /// drand, or E2EE transcript binding differs.
+    pub fn verify_response_proof_hashes(
+        &self,
+        proof_bytes: &[u8],
+        request_sha256: &str,
+        response_sha256: &str,
+        expected_e2ee_transcript_sha256: Option<&str>,
+        now_unix_ms: i64,
+    ) -> Result<response_proof::VerifiedResponseProof, Error> {
+        let bundle = self.active_bundle.as_ref().ok_or_else(|| {
+            Error::ResponseProof("a bundle must be verified before a response proof".into())
+        })?;
+        response_proof::verify_with_bundle_hashes(
+            proof_bytes,
+            request_sha256,
+            response_sha256,
+            expected_e2ee_transcript_sha256,
+            now_unix_ms,
+            bundle,
+        )
+    }
+
     /// Verify a response receipt and its immutable historical node ledger together.
     ///
     /// # Errors
@@ -327,14 +447,37 @@ impl Verifier {
         &self,
         input: &HistoricalResponseProofInput<'_>,
     ) -> Result<response_proof::VerifiedResponseProof, Error> {
-        response_proof::verify_with_ledger_bytes(
+        let ledger = verify_node_ledger_record(input.ledger_bytes, input.environment)?;
+        let catalog = verify_catalog_approval(input.catalog_approval_bytes, input.now_unix_ms)?;
+        response_proof::verify_with_ledger(
             input.proof_bytes,
             input.request_body,
             input.response_body,
             input.expected_e2ee_transcript_sha256,
-            input.now_unix_ms,
-            input.ledger_bytes,
-            input.environment,
+            &ledger,
+            &catalog,
+        )
+    }
+
+    /// Verify historical evidence from body hashes computed by the local caller.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when either cryptographic trust chain, body hash, or signing-key binding
+    /// fails.
+    pub fn verify_historical_response_proof_hashes(
+        &self,
+        input: &HistoricalResponseProofHashInput<'_>,
+    ) -> Result<response_proof::VerifiedResponseProof, Error> {
+        let ledger = verify_node_ledger_record(input.ledger_bytes, input.environment)?;
+        let catalog = verify_catalog_approval(input.catalog_approval_bytes, input.now_unix_ms)?;
+        response_proof::verify_with_ledger_hashes(
+            input.proof_bytes,
+            input.request_sha256,
+            input.response_sha256,
+            input.expected_e2ee_transcript_sha256,
+            &ledger,
+            &catalog,
         )
     }
 }
@@ -375,6 +518,29 @@ pub fn verify_release_approval(
     verify_release(&release, &Environment::stogas(), now_unix_ms)
 }
 
+/// Verify one catalog authorization before Control persists it.
+///
+/// This verifies the Stogas signature over the independently produced manifest, the GitHub
+/// Actions provenance over both catalog artifacts, and equality of both parties' hashes.
+///
+/// # Errors
+///
+/// Returns an error when the shape, signature, source identity, provenance, or artifact hashes
+/// differ.
+pub fn verify_catalog_approval(
+    approval_bytes: &[u8],
+    now_unix_ms: i64,
+) -> Result<VerifiedCatalogRelease, Error> {
+    if approval_bytes.len() > MAX_INPUT_BYTES {
+        return Err(Error::TooLarge);
+    }
+    let value = strict_json::from_slice(approval_bytes)
+        .map_err(|error| Error::InvalidJson(error.to_string()))?;
+    let catalog: AllowedCatalog =
+        serde_json::from_value(value).map_err(|error| Error::InvalidBundle(error.to_string()))?;
+    verify_catalog(&catalog, &Environment::stogas(), now_unix_ms)
+}
+
 #[cfg(feature = "staging")]
 #[doc(hidden)]
 pub fn verify_staging_release_approval(
@@ -394,13 +560,13 @@ pub fn verify_staging_release_approval(
 /// Verify one immutable historical node-admission ledger record.
 ///
 /// Verification is anchored to the recorded admission time, so an expired certificate or AMD
-/// collateral does not invalidate evidence that was valid when Control admitted the generation.
-/// The generation id is independently re-derived from the quote-bound chip and TLS identities.
+/// collateral does not invalidate evidence that was valid when Control admitted the node.
+/// The node ID is independently re-derived from the quote-bound chip and TLS identities.
 ///
 /// # Errors
 ///
 /// Returns an error when the release provenance, SNP quote, AMD collateral, report data, drand
-/// evidence, or generation identity is invalid.
+/// evidence, or node identity is invalid.
 pub fn verify_node_ledger_record(
     record_bytes: &[u8],
     environment: &Environment,
@@ -412,7 +578,7 @@ pub fn verify_node_ledger_record(
         .map_err(|error| Error::InvalidJson(error.to_string()))?;
     let record: NodeLedgerRecord = serde_json::from_value(value)
         .map_err(|error| Error::InvalidBundle(format!("invalid node ledger record: {error}")))?;
-    if record.schema != "stogas.node-ledger.v1" || !is_lower_hex(&record.generation_id, 32) {
+    if record.schema != "stogas.node-ledger.v2" || !is_lower_hex(&record.node_id, 32) {
         return Err(Error::InvalidBundle(
             "unsupported or invalid node ledger record".into(),
         ));
@@ -432,14 +598,14 @@ pub fn verify_node_ledger_record(
     let release = verify_release(&record.release, environment, admitted_at)?;
     let node = ledger_record_node(&record);
     validate_node_shape(&node)?;
-    let generation_preimage = format!(
+    let node_preimage = format!(
         "{{\"chip_id\":\"{}\",\"tls_spki_sha256\":\"{}\"}}",
         node.chip_id, node.report_data.tls_spki_sha256
     );
-    let derived_generation_id = hex::encode(Sha256::digest(generation_preimage.as_bytes()));
-    if derived_generation_id != record.generation_id {
+    let derived_node_id = hex::encode(Sha256::digest(node_preimage.as_bytes()));
+    if derived_node_id != record.node_id {
         return Err(Error::Node(
-            "node ledger generation id differs from its attested identity".into(),
+            "node ledger node ID differs from its attested identity".into(),
         ));
     }
     let launch_policies = BTreeMap::from([(
@@ -462,7 +628,7 @@ pub fn verify_node_ledger_record(
     )?;
     Ok(VerifiedNodeLedgerRecord {
         admitted_at_unix_ms: admitted_at,
-        generation_id: record.generation_id,
+        node_id: record.node_id,
         node: verified_node,
         release,
     })
@@ -515,7 +681,6 @@ fn validate_ledger_certificate_history(
 
 fn ledger_record_node(record: &NodeLedgerRecord) -> Node {
     Node {
-        catalog: record.admission.catalog.clone(),
         cert_expires_at: record.admission.cert_expires_at.clone(),
         chip_id: record.admission.chip_id.clone(),
         health: NodeHealth {
@@ -523,7 +688,7 @@ fn ledger_record_node(record: &NodeLedgerRecord) -> Node {
             ready: true,
             secret_versions: BTreeMap::new(),
         },
-        node_id: record.generation_id.clone(),
+        node_id: record.node_id.clone(),
         quote: record.admission.quote.clone(),
         quote_verified_at: record.admission.quote_verified_at.clone(),
         region: record.admission.region.clone(),
@@ -687,7 +852,6 @@ pub fn verify_heartbeat_admission(
         return Err(Error::Node("active certificate is expired".into()));
     }
     let node = Node {
-        catalog: heartbeat.catalog.clone(),
         cert_expires_at: heartbeat.cert_expires_at.clone(),
         chip_id: identity.chip_id,
         health: heartbeat.health.clone(),
@@ -744,25 +908,35 @@ pub fn verify_recognized_heartbeat_signature(
 }
 
 /// Verify a gateway CSR, its proof of possession, its exact requested identity, and the
-/// generation-key authorization over the submission.
+/// node-key authorization over the submission.
 ///
 /// # Errors
 ///
 /// Returns an error unless the CSR is a complete canonical P-256/SHA-256 request whose SPKI,
 /// subject, and DNS SAN set exactly match Control's independently loaded certificate order.
-pub fn verify_certificate_csr_submission(request_bytes: &[u8]) -> Result<(), Error> {
-    if request_bytes.len() > MAX_INPUT_BYTES {
+pub fn verify_certificate_csr_submission(
+    submission_bytes: &[u8],
+    trusted_context_bytes: &[u8],
+) -> Result<(), Error> {
+    if submission_bytes.len() > MAX_INPUT_BYTES || trusted_context_bytes.len() > MAX_INPUT_BYTES {
         return Err(Error::TooLarge);
     }
-    let value = strict_json::from_slice(request_bytes)
+    let value = strict_json::from_slice(submission_bytes)
         .map_err(|error| Error::InvalidJson(error.to_string()))?;
-    let request: CertificateCsrVerificationRequest =
-        serde_json::from_value(value).map_err(|error| {
-            Error::InvalidBundle(format!("invalid CSR verification request: {error}"))
-        })?;
+    let submission: CertificateCsrSubmission = serde_json::from_value(value)
+        .map_err(|error| Error::InvalidBundle(format!("invalid CSR submission: {error}")))?;
+    let value = strict_json::from_slice(trusted_context_bytes)
+        .map_err(|error| Error::InvalidJson(error.to_string()))?;
+    let trusted: CertificateCsrTrustedContext = serde_json::from_value(value)
+        .map_err(|error| Error::InvalidBundle(format!("invalid trusted CSR context: {error}")))?;
+    if submission.node_id != trusted.node_id || submission.order_id != trusted.order_id {
+        return Err(Error::Node(
+            "certificate CSR submission differs from the trusted certificate order".into(),
+        ));
+    }
 
     let csr_der = URL_SAFE_NO_PAD
-        .decode(&request.csr_der)
+        .decode(&submission.csr_der)
         .map_err(|_| Error::Node("certificate CSR is not base64url".into()))?;
     if csr_der.is_empty() {
         return Err(Error::Node("certificate CSR is empty".into()));
@@ -770,16 +944,16 @@ pub fn verify_certificate_csr_submission(request_bytes: &[u8]) -> Result<(), Err
     let mut authorization = Vec::with_capacity(160);
     authorization.extend_from_slice(CSR_SIGNATURE_DOMAIN);
     for field in [
-        request.generation_id.as_bytes(),
-        request.order_id.as_bytes(),
+        submission.node_id.as_bytes(),
+        submission.order_id.as_bytes(),
         &Sha256::digest(&csr_der)[..],
     ] {
         append_transcript_field(&mut authorization, field)?;
     }
     verify_raw_ed25519(
-        &request.node_ed25519_public_key,
+        &trusted.attested_node_ed25519_public_key,
         &authorization,
-        &request.signature,
+        &submission.signature,
         "certificate CSR submission",
     )?;
 
@@ -788,21 +962,29 @@ pub fn verify_certificate_csr_submission(request_bytes: &[u8]) -> Result<(), Err
     if !remaining.is_empty() || csr.as_raw().len() != csr_der.len() {
         return Err(Error::Node("certificate CSR contains trailing data".into()));
     }
-    verify_certificate_csr_key_and_signature(&csr, &request.expected_tls_spki_sha256)?;
+    verify_certificate_csr_key_and_signature(&csr, &trusted.expected_tls_spki_sha256)?;
     verify_certificate_csr_subject(
         &csr.certification_request_info,
-        request.expected_common_name.as_deref(),
+        trusted.expected_common_name.as_deref(),
     )?;
-    verify_certificate_csr_dns_names(&csr, request.expected_dns_names)
+    verify_certificate_csr_dns_names(&csr, trusted.expected_dns_names)
 }
 
 fn verify_certificate_csr_key_and_signature(
     csr: &X509CertificationRequest<'_>,
     expected_tls_spki_sha256: &str,
 ) -> Result<(), Error> {
-    if csr.signature_algorithm.algorithm != OID_SIG_ECDSA_WITH_SHA256 {
+    if csr.certification_request_info.version != X509Version::V1 {
         return Err(Error::Node(
-            "certificate CSR must use ECDSA with SHA-256".into(),
+            "certificate CSR must use PKCS #10 version 1".into(),
+        ));
+    }
+    if csr.signature_algorithm.algorithm != OID_SIG_ECDSA_WITH_SHA256
+        || csr.signature_algorithm.parameters().is_some()
+        || csr.signature_value.unused_bits != 0
+    {
+        return Err(Error::Node(
+            "certificate CSR must use canonical ECDSA with SHA-256".into(),
         ));
     }
     let spki = &csr.certification_request_info.subject_pki;
@@ -813,6 +995,7 @@ fn verify_certificate_csr_key_and_signature(
             .and_then(|parameters| parameters.as_oid().ok())
             .as_ref()
             != Some(&OID_EC_P256)
+        || spki.subject_public_key.unused_bits != 0
     {
         return Err(Error::Node(
             "certificate CSR must contain a P-256 public key".into(),
@@ -829,7 +1012,7 @@ fn verify_certificate_csr_key_and_signature(
     let derived_spki_sha256 = hex::encode(Sha256::digest(spki.raw));
     if derived_spki_sha256 != expected_tls_spki_sha256 {
         return Err(Error::Node(
-            "certificate CSR SPKI does not match the attested generation key".into(),
+            "certificate CSR SPKI does not match the attested node key".into(),
         ));
     }
     Ok(())
@@ -874,11 +1057,18 @@ fn verify_certificate_csr_dns_names(
 ) -> Result<(), Error> {
     let mut dns_names = BTreeSet::new();
     let mut san_extensions = 0_u8;
-    let extensions = csr
-        .requested_extensions()
-        .ok_or_else(|| Error::Node("certificate CSR has no requested extensions".into()))?;
-    for extension in extensions {
-        match extension {
+    let [attribute] = csr.certification_request_info.attributes() else {
+        return Err(Error::Node(
+            "certificate CSR must contain exactly one extension-request attribute".into(),
+        ));
+    };
+    let ParsedCriAttribute::ExtensionRequest(requested) = attribute.parsed_attribute() else {
+        return Err(Error::Node(
+            "certificate CSR contains an unexpected attribute".into(),
+        ));
+    };
+    for extension in &requested.extensions {
+        match extension.parsed_extension() {
             ParsedExtension::SubjectAlternativeName(san) => {
                 san_extensions = san_extensions.saturating_add(1);
                 for name in &san.general_names {
@@ -965,7 +1155,6 @@ pub fn verify_local_heartbeat_admission(
         .ok_or_else(|| Error::Node("captured time is out of range".into()))?
         .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
     let node = Node {
-        catalog: heartbeat.catalog.clone(),
         cert_expires_at: heartbeat.cert_expires_at.clone(),
         chip_id: identity.chip_id,
         health: heartbeat.health.clone(),
@@ -1000,7 +1189,6 @@ pub fn verify_local_heartbeat_admission(
     };
 
     let verified = VerifiedNode {
-        catalog: node.catalog.clone(),
         chip_id: node.chip_id.clone(),
         drand_round: node.report_data.drand.round,
         drand_round_time_unix_ms,
@@ -1046,11 +1234,8 @@ fn heartbeat_signature_transcript(heartbeat: &HeartbeatCandidate) -> Result<Vec<
 
     let mut transcript = Vec::with_capacity(512);
     transcript.extend_from_slice(HEARTBEAT_SIGNATURE_DOMAIN);
-    let catalog_sequence = heartbeat.catalog.sequence.to_string();
     for field in [
         heartbeat.node_id.as_bytes(),
-        heartbeat.catalog.digest.as_bytes(),
-        catalog_sequence.as_bytes(),
         heartbeat.cert_expires_at.as_bytes(),
         heartbeat.observed_at.as_bytes(),
         heartbeat.quote_generated_at.as_bytes(),
@@ -1367,8 +1552,9 @@ fn verify_bundle_inner(
     bundle_bytes: &[u8],
     now_unix_ms: i64,
     environment: &Environment,
+    verified_catalogs: &BTreeMap<String, VerifiedCatalogRelease>,
     verified_releases: &BTreeMap<String, VerifiedRelease>,
-) -> Result<(VerificationOutput, BTreeMap<String, VerifiedRelease>), Error> {
+) -> Result<(VerificationOutput, VerificationCache), Error> {
     if bundle_bytes.len() > MAX_INPUT_BYTES {
         return Err(Error::TooLarge);
     }
@@ -1389,6 +1575,21 @@ fn verify_bundle_inner(
     let expires_at = parse_time(&envelope.body.expires_at)?;
     validate_time(created_at, expires_at, envelope.body.ttl_ms, now_unix_ms)?;
 
+    let mut next_catalog_cache = BTreeMap::new();
+    let catalogs = envelope
+        .body
+        .allowed_catalogs
+        .iter()
+        .map(|catalog| {
+            let key = catalog_cache_key(catalog, environment)?;
+            let verified = verified_catalogs.get(&key).map_or_else(
+                || verify_catalog(catalog, environment, now_unix_ms),
+                |catalog| Ok(catalog.clone()),
+            )?;
+            next_catalog_cache.insert(key, verified.clone());
+            Ok(verified)
+        })
+        .collect::<Result<Vec<_>, Error>>()?;
     let mut next_release_cache = BTreeMap::new();
     let releases = envelope
         .body
@@ -1404,6 +1605,10 @@ fn verify_bundle_inner(
             Ok(verified)
         })
         .collect::<Result<Vec<_>, Error>>()?;
+    let catalog_policies: BTreeMap<_, _> = catalogs
+        .iter()
+        .map(|catalog| (catalog.runtime_digest.as_str(), catalog.sequence))
+        .collect();
     let launch_policies: BTreeMap<_, _> = envelope
         .body
         .allowed_igvms
@@ -1428,10 +1633,12 @@ fn verify_bundle_inner(
         now_unix_ms,
         &launch_policies,
         &amd_stacks,
+        &catalog_policies,
     )?;
     Ok((
         VerificationOutput {
             bundle: VerifiedBundle {
+                catalogs,
                 sequence: envelope.body.sequence,
                 created_at_unix_ms: created_at,
                 expires_at_unix_ms: expires_at,
@@ -1441,7 +1648,10 @@ fn verify_bundle_inner(
                 original: envelope.clone(),
             },
         },
-        next_release_cache,
+        VerificationCache {
+            catalogs: next_catalog_cache,
+            releases: next_release_cache,
+        },
     ))
 }
 
@@ -1453,10 +1663,12 @@ fn verify_and_partition_nodes(
     now_unix_ms: i64,
     launch_policies: &BTreeMap<&str, &LaunchPolicy>,
     amd_stacks: &BTreeMap<String, AmdCollateralStack>,
+    catalog_policies: &BTreeMap<&str, u64>,
 ) -> Result<(Vec<VerifiedNode>, Vec<ExcludedNode>), Error> {
     let mut nodes = Vec::new();
     let mut excluded = Vec::new();
     for node in bundle_nodes {
+        verify_node_catalog_policy(&node.node_id, &node.report_data.catalog, catalog_policies)?;
         let verified = verify_node(
             node,
             created_at,
@@ -1484,6 +1696,19 @@ fn verify_and_partition_nodes(
     Ok((nodes, excluded))
 }
 
+fn verify_node_catalog_policy(
+    node_id: &str,
+    catalog: &CatalogIdentity,
+    catalog_policies: &BTreeMap<&str, u64>,
+) -> Result<(), Error> {
+    if catalog_policies.get(catalog.digest.as_str()) != Some(&catalog.sequence) {
+        return Err(Error::Node(format!(
+            "{node_id} catalog identity is absent from the verified catalog stack"
+        )));
+    }
+    Ok(())
+}
+
 fn release_cache_key(release: &AllowedIgvm, environment: &Environment) -> Result<String, Error> {
     let trusted_key = environment
         .release_keys
@@ -1498,14 +1723,29 @@ fn release_cache_key(release: &AllowedIgvm, environment: &Environment) -> Result
     Ok(hex::encode(digest.finalize()))
 }
 
+fn catalog_cache_key(catalog: &AllowedCatalog, environment: &Environment) -> Result<String, Error> {
+    let trusted_key = environment
+        .release_keys
+        .get(&catalog.signed_release.key_id)
+        .ok_or_else(|| Error::Release("catalog signing key is not trusted".into()))?;
+    let encoded = serde_json::to_vec(catalog).map_err(|error| Error::Release(error.to_string()))?;
+    let mut digest = Sha256::new();
+    digest.update(b"stogas verified catalog cache v1\0");
+    digest.update(trusted_key.as_bytes());
+    digest.update([0]);
+    digest.update(encoded);
+    Ok(hex::encode(digest.finalize()))
+}
+
 fn validate_shape(envelope: &BundleEnvelope) -> Result<(), Error> {
     if envelope.body.schema != "stogas.confidential-bundle.v1" {
         return Err(Error::InvalidBundle("unsupported schema".into()));
     }
-    if envelope.body.sequence == 0 || !(1..=2).contains(&envelope.body.allowed_igvms.len()) {
-        return Err(Error::InvalidBundle(
-            "invalid sequence or release count".into(),
-        ));
+    if !(1..=2).contains(&envelope.body.allowed_igvms.len()) {
+        return Err(Error::InvalidBundle("invalid release count".into()));
+    }
+    if !(1..=2).contains(&envelope.body.allowed_catalogs.len()) {
+        return Err(Error::InvalidBundle("invalid catalog release count".into()));
     }
     if envelope.body.nodes.len() > MAX_NODES
         || envelope.body.vendor_collateral.len() > MAX_VENDOR_COLLATERAL
@@ -1519,6 +1759,19 @@ fn validate_shape(envelope: &BundleEnvelope) -> Result<(), Error> {
             return Err(Error::InvalidBundle("duplicate release measurement".into()));
         }
     }
+    let mut catalog_digests = BTreeSet::new();
+    let mut catalog_sequences = BTreeSet::new();
+    for catalog in &envelope.body.allowed_catalogs {
+        validate_catalog_shape(catalog)?;
+        let manifest = &catalog.signed_release.manifest;
+        if !catalog_digests.insert(manifest.runtime.as_str())
+            || !catalog_sequences.insert(manifest.sequence)
+        {
+            return Err(Error::InvalidBundle(
+                "duplicate catalog runtime digest or sequence".into(),
+            ));
+        }
+    }
     let mut node_ids = BTreeSet::new();
     for node in &envelope.body.nodes {
         validate_node_shape(node)?;
@@ -1527,6 +1780,34 @@ fn validate_shape(envelope: &BundleEnvelope) -> Result<(), Error> {
         }
     }
     Ok(())
+}
+
+fn validate_catalog_shape(catalog: &AllowedCatalog) -> Result<(), Error> {
+    let release = &catalog.signed_release;
+    let manifest = &release.manifest;
+    if catalog.github_in_toto.len() != 1
+        || release.schema != "stogas.catalog.signed.v3"
+        || manifest.schema != "stogas.catalog.release.v3"
+        || manifest.catalog_schema != 5
+        || manifest.sequence == 0
+        || manifest.source.repository != "https://github.com/StogasAI/catalog"
+        || manifest.source.tag != format!("catalog-v{}", manifest.sequence)
+        || !is_lower_hex(&manifest.source.commit, 20)
+        || !is_lower_hex(&manifest.source.tree, 20)
+        || !is_sha256_identity(&manifest.runtime)
+        || !is_sha256_identity(&manifest.public)
+        || release.key_id.is_empty()
+        || release.key_id.len() > 200
+    {
+        return Err(Error::InvalidBundle("invalid catalog release shape".into()));
+    }
+    Ok(())
+}
+
+fn is_sha256_identity(value: &str) -> bool {
+    value
+        .strip_prefix("sha256:")
+        .is_some_and(|digest| is_lower_hex(digest, 32))
 }
 
 fn validate_release_shape(release: &AllowedIgvm) -> Result<(), Error> {
@@ -1564,7 +1845,7 @@ fn validate_release_shape(release: &AllowedIgvm) -> Result<(), Error> {
 fn validate_node_shape(node: &Node) -> Result<(), Error> {
     let report = &node.report_data;
     let checks = [
-        (report.schema == "stogas.node-report.v2", "report schema"),
+        (report.schema == "stogas.node-report.v3", "report schema"),
         (is_lower_hex(&node.node_id, 32), "node id"),
         (is_lower_hex(&node.chip_id, 64), "chip id"),
         (is_lower_hex(&node.reported_tcb, 8), "reported TCB"),
@@ -1575,11 +1856,6 @@ fn validate_node_shape(node: &Node) -> Result<(), Error> {
         (
             is_lower_hex(&node.report_data_sha512, 64),
             "report-data digest",
-        ),
-        (
-            node.catalog.digest.starts_with("sha256:")
-                && is_lower_hex(&node.catalog.digest["sha256:".len()..], 32),
-            "catalog digest",
         ),
         (is_lower_hex(&report.tls_spki_sha256, 32), "TLS SPKI hash"),
         (
@@ -1594,12 +1870,16 @@ fn validate_node_shape(node: &Node) -> Result<(), Error> {
             "accepted certificate hash",
         ),
         (
-            is_p256_uncompressed_b64url(&report.hpke_public_key),
+            is_xwing_public_key_b64url(&report.hpke_public_key),
             "HPKE public key",
         ),
         (
             decode_b64url_len(&report.ed25519_public_key) == Some(32),
             "Ed25519 public key",
+        ),
+        (
+            is_sha256_identity(&report.catalog.digest),
+            "catalog identity",
         ),
         (!node.region.is_empty() && node.region.len() <= 64, "region"),
     ];
@@ -1639,10 +1919,10 @@ fn decode_b64url_len(value: &str) -> Option<usize> {
     URL_SAFE_NO_PAD.decode(value).ok().map(|bytes| bytes.len())
 }
 
-fn is_p256_uncompressed_b64url(value: &str) -> bool {
+fn is_xwing_public_key_b64url(value: &str) -> bool {
     URL_SAFE_NO_PAD
         .decode(value)
-        .is_ok_and(|bytes| bytes.len() == 65 && bytes[0] == 0x04)
+        .is_ok_and(|bytes| bytes.len() == 1_216 && URL_SAFE_NO_PAD.encode(bytes) == value)
 }
 
 fn verify_envelope(envelope: &BundleEnvelope, signed_body: &[u8]) -> Result<(), Error> {
@@ -1651,6 +1931,85 @@ fn verify_envelope(envelope: &BundleEnvelope, signed_body: &[u8]) -> Result<(), 
         return Err(Error::BundleChecksum("body SHA-256 differs".into()));
     }
     Ok(())
+}
+
+fn verify_catalog(
+    catalog: &AllowedCatalog,
+    environment: &Environment,
+    now_unix_ms: i64,
+) -> Result<VerifiedCatalogRelease, Error> {
+    validate_catalog_shape(catalog)?;
+    let signed = &catalog.signed_release;
+    let manifest = &signed.manifest;
+    let key = environment
+        .release_keys
+        .get(&signed.key_id)
+        .ok_or_else(|| Error::Release("catalog signing key is not trusted".into()))?;
+    let manifest_value =
+        serde_json::to_value(manifest).map_err(|error| Error::Release(error.to_string()))?;
+    let canonical = canonical_json(&manifest_value)?;
+    let mut payload = b"stogas catalog release v3\n".to_vec();
+    payload.extend_from_slice(canonical.as_bytes());
+    verify_ed25519(key, &payload, &signed.signature).map_err(Error::Release)?;
+
+    let attestation = catalog
+        .github_in_toto
+        .first()
+        .ok_or_else(|| Error::Release("catalog GitHub attestation is absent".into()))?;
+    let attestation_bytes =
+        serde_json::to_vec(attestation).map_err(|error| Error::Release(error.to_string()))?;
+    let runtime_digest = manifest
+        .runtime
+        .strip_prefix("sha256:")
+        .ok_or_else(|| Error::Release("catalog runtime digest is invalid".into()))?;
+    let public_digest = manifest
+        .public
+        .strip_prefix("sha256:")
+        .ok_or_else(|| Error::Release("catalog public digest is invalid".into()))?;
+    let workflow_identity = format!(
+        "https://github.com/StogasAI/catalog/.github/workflows/catalog-release.yml@refs/tags/{}",
+        manifest.source.tag
+    );
+    let verified = verify_github_attestation(
+        &attestation_bytes,
+        &[
+            Subject {
+                name: "catalog.runtime.json",
+                sha256: runtime_digest,
+            },
+            Subject {
+                name: "catalog.public.json",
+                sha256: public_digest,
+            },
+        ],
+        &GithubPolicy {
+            repository: manifest.source.repository.clone(),
+            workflow_identity,
+            source_ref: format!("refs/tags/{}", manifest.source.tag),
+            source_commit: manifest.source.commit.clone(),
+            predicate_type: "https://slsa.dev/provenance/v1".into(),
+            require_github_hosted: true,
+        },
+        now_unix_ms,
+    )
+    .map_err(|error| Error::Release(format!("catalog provenance: {error}")))?;
+    let github_integrated_time_unix_ms = verified
+        .integrated_time
+        .checked_mul(1000)
+        .ok_or_else(|| Error::Release("catalog GitHub integration time overflows".into()))?;
+
+    Ok(VerifiedCatalogRelease {
+        evidence: catalog.clone(),
+        github_integrated_time_unix_ms,
+        public_digest: manifest.public.clone(),
+        runtime_digest: manifest.runtime.clone(),
+        sequence: manifest.sequence,
+        source_commit: manifest.source.commit.clone(),
+        source_repository: manifest.source.repository.clone(),
+        source_tag: manifest.source.tag.clone(),
+        source_tree: manifest.source.tree.clone(),
+        stogas_signing_key_id: signed.key_id.clone(),
+    })
 }
 
 fn verify_release(
@@ -1892,7 +2251,6 @@ fn verify_node(
         amd_stack,
     )?;
     Ok(VerifiedNode {
-        catalog: node.catalog.clone(),
         chip_id: node.chip_id.clone(),
         drand_round: round,
         drand_round_time_unix_ms,
@@ -2269,7 +2627,10 @@ fn verify_snp_node(
         bundle_created_at,
         bundle_expires_at,
     )?;
-    validate_report_product_binding(&collateral.vek, &report_bytes)?;
+    let product = validate_report_product_binding(&collateral.vek, &report_bytes)?;
+    let expected_policy = u64::from_str_radix(policy.launch.policy.trim_start_matches("0x"), 16)
+        .map_err(|_| Error::Node("invalid launch policy value".into()))?;
+    validate_snp_launch_policy(expected_policy, Some(product))?;
     let chain = Chain::from_der(&collateral.ark, &collateral.ask, &collateral.vek)
         .map_err(|error| Error::Node(format!("{} AMD chain: {error}", node.node_id)))?;
     (&chain, &report)
@@ -2310,7 +2671,14 @@ fn check_raw_report_bindings(
     };
     let expected_policy = u64::from_str_radix(policy.launch.policy.trim_start_matches("0x"), 16)
         .map_err(|_| Error::Node("invalid launch policy value".into()))?;
+    validate_snp_launch_policy(expected_policy, None)?;
     let report_version = u32_at(0x00);
+    if (2..=5).contains(&report_version) {
+        let (_, _, _, report_product) = inspect_report_product(report, report_version)?;
+        if let Some(product) = report_product {
+            validate_snp_launch_policy(expected_policy, Some(product))?;
+        }
+    }
     let report_info = u32_at(0x48);
     let checks = [
         ((2..=5).contains(&report_version), "report version"),
@@ -2376,12 +2744,17 @@ fn validate_amd_x509(
 ) -> Result<(), Error> {
     use sha2::Sha384;
     use x509_parser::{parse_x509_certificate, parse_x509_crl};
-    let (_, ark) = parse_x509_certificate(&collateral.ark)
+    let (ark_remaining, ark) = parse_x509_certificate(&collateral.ark)
         .map_err(|error| Error::Node(format!("AMD ARK: {error}")))?;
-    let (_, ask) = parse_x509_certificate(&collateral.ask)
+    let (ask_remaining, ask) = parse_x509_certificate(&collateral.ask)
         .map_err(|error| Error::Node(format!("AMD ASK: {error}")))?;
-    let (_, vek) = parse_x509_certificate(&collateral.vek)
+    let (vek_remaining, vek) = parse_x509_certificate(&collateral.vek)
         .map_err(|error| Error::Node(format!("AMD VEK: {error}")))?;
+    if !ark_remaining.is_empty() || !ask_remaining.is_empty() || !vek_remaining.is_empty() {
+        return Err(Error::Node(
+            "AMD certificate collateral contains trailing data".into(),
+        ));
+    }
     for (label, cert) in [("ARK", &ark), ("ASK", &ask), ("VEK", &vek)] {
         if cert.validity().not_before.timestamp() * 1000 > bundle_created_at
             || cert.validity().not_after.timestamp() * 1000 < bundle_expires_at
@@ -2400,8 +2773,11 @@ fn validate_amd_x509(
     {
         return Err(Error::Node("AMD certificate identity chain differs".into()));
     }
-    let (_, crl) = parse_x509_crl(&collateral.crl)
+    let (crl_remaining, crl) = parse_x509_crl(&collateral.crl)
         .map_err(|error| Error::Node(format!("AMD CRL: {error}")))?;
+    if !crl_remaining.is_empty() {
+        return Err(Error::Node("AMD CRL contains trailing data".into()));
+    }
     if crl.tbs_cert_list.this_update.timestamp() * 1000 > bundle_created_at + MAX_CLOCK_SKEW_MS
         || crl
             .tbs_cert_list
@@ -2607,11 +2983,17 @@ fn amd_product_from_vcek_name(value: &str) -> Option<&'static AmdProductProfile>
 }
 
 #[cfg(feature = "snp")]
-fn validate_report_product_binding(vek_der: &[u8], report: &[u8]) -> Result<(), Error> {
+fn validate_report_product_binding(
+    vek_der: &[u8],
+    report: &[u8],
+) -> Result<&'static AmdProductProfile, Error> {
     use x509_parser::parse_x509_certificate;
 
-    let (_, vek) = parse_x509_certificate(vek_der)
+    let (remaining, vek) = parse_x509_certificate(vek_der)
         .map_err(|error| Error::Node(format!("AMD VEK: {error}")))?;
+    if !remaining.is_empty() {
+        return Err(Error::Node("AMD VEK contains trailing data".into()));
+    }
     let product_name = vek
         .extensions()
         .iter()
@@ -2630,11 +3012,13 @@ fn validate_report_product_binding(vek_der: &[u8], report: &[u8]) -> Result<(), 
     }
     let (_, _, _, report_product) = inspect_report_product(report, report_version)?;
     match report_product {
-        Some(report_product) if report_product == certificate_product => Ok(()),
+        Some(report_product) if report_product == certificate_product => Ok(certificate_product),
         Some(_) => Err(Error::Node(
             "AMD VCEK product differs from the report CPUID".into(),
         )),
-        None if certificate_product.tcb_layout == AmdTcbLayout::Family19h => Ok(()),
+        None if certificate_product.tcb_layout == AmdTcbLayout::Family19h => {
+            Ok(certificate_product)
+        }
         None => Err(Error::Node(
             "Family 1Ah VCEK requires report CPUID fields".into(),
         )),
@@ -2782,6 +3166,13 @@ fn canonical_report_data(report: &ReportData) -> Result<String, Error> {
     let mut value = serde_json::Map::new();
     value.insert("schema".into(), Value::String(report.schema.clone()));
     value.insert(
+        "catalog".into(),
+        serde_json::json!({
+            "digest": report.catalog.digest,
+            "sequence": report.catalog.sequence,
+        }),
+    );
+    value.insert(
         "tls_spki_sha256".into(),
         Value::String(report.tls_spki_sha256.clone()),
     );
@@ -2817,6 +3208,98 @@ fn canonical_report_data(report: &ReportData) -> Result<String, Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn csr_submission_cannot_supply_its_own_node_identity() {
+        let submission = serde_json::to_vec(&serde_json::json!({
+            "csr_der": URL_SAFE_NO_PAD.encode([1_u8]),
+            "node_id": "attacker-generation",
+            "node_ed25519_public_key": URL_SAFE_NO_PAD.encode([1_u8; 32]),
+            "order_id": "attacker-order",
+            "signature": URL_SAFE_NO_PAD.encode([0_u8; 64]),
+        }))
+        .unwrap();
+        let trusted = serde_json::to_vec(&serde_json::json!({
+            "attested_node_ed25519_public_key": URL_SAFE_NO_PAD.encode([2_u8; 32]),
+            "expected_common_name": null,
+            "expected_dns_names": ["api.stogas.ai"],
+            "expected_tls_spki_sha256": "00".repeat(32),
+            "node_id": "trusted-generation",
+            "order_id": "trusted-order",
+        }))
+        .unwrap();
+
+        let error = verify_certificate_csr_submission(&submission, &trusted).unwrap_err();
+        assert!(error.to_string().contains("unknown field"));
+    }
+
+    #[test]
+    fn csr_submission_must_match_the_trusted_order() {
+        let submission = serde_json::to_vec(&serde_json::json!({
+            "csr_der": URL_SAFE_NO_PAD.encode([1_u8]),
+            "node_id": "attacker-generation",
+            "order_id": "attacker-order",
+            "signature": URL_SAFE_NO_PAD.encode([0_u8; 64]),
+        }))
+        .unwrap();
+        let trusted = serde_json::to_vec(&serde_json::json!({
+            "attested_node_ed25519_public_key": URL_SAFE_NO_PAD.encode([2_u8; 32]),
+            "expected_common_name": null,
+            "expected_dns_names": ["api.stogas.ai"],
+            "expected_tls_spki_sha256": "00".repeat(32),
+            "node_id": "trusted-generation",
+            "order_id": "trusted-order",
+        }))
+        .unwrap();
+
+        let error = verify_certificate_csr_submission(&submission, &trusted).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("differs from the trusted certificate order")
+        );
+    }
+
+    #[test]
+    fn csr_submission_rejects_a_self_authorized_signature() {
+        use ed25519_dalek::{Signer as _, SigningKey};
+
+        let csr_der = [1_u8];
+        let mut authorization = Vec::new();
+        authorization.extend_from_slice(CSR_SIGNATURE_DOMAIN);
+        for field in [
+            b"trusted-generation".as_slice(),
+            b"trusted-order".as_slice(),
+            &Sha256::digest(csr_der)[..],
+        ] {
+            append_transcript_field(&mut authorization, field).unwrap();
+        }
+        let attacker_key = SigningKey::from_bytes(&[1_u8; 32]);
+        let trusted_key = SigningKey::from_bytes(&[2_u8; 32]);
+        let submission = serde_json::to_vec(&serde_json::json!({
+            "csr_der": URL_SAFE_NO_PAD.encode(csr_der),
+            "node_id": "trusted-generation",
+            "order_id": "trusted-order",
+            "signature": URL_SAFE_NO_PAD.encode(attacker_key.sign(&authorization).to_bytes()),
+        }))
+        .unwrap();
+        let trusted = serde_json::to_vec(&serde_json::json!({
+            "attested_node_ed25519_public_key": URL_SAFE_NO_PAD.encode(trusted_key.verifying_key().as_bytes()),
+            "expected_common_name": null,
+            "expected_dns_names": ["api.stogas.ai"],
+            "expected_tls_spki_sha256": "00".repeat(32),
+            "node_id": "trusted-generation",
+            "order_id": "trusted-order",
+        }))
+        .unwrap();
+
+        let error = verify_certificate_csr_submission(&submission, &trusted).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("certificate CSR submission signature is invalid")
+        );
+    }
 
     fn quote_with_identity(chip: [u8; 64], measurement: [u8; 48], tcb: [u8; 8]) -> String {
         quote_with_product_identity(2, chip, measurement, tcb, None)
@@ -2866,6 +3349,77 @@ mod tests {
             ))
             .unwrap(),
         }
+    }
+
+    fn catalog_fixture() -> AllowedCatalog {
+        serde_json::from_value(serde_json::json!({
+            "github_in_toto": [{}],
+            "signed_release": {
+                "keyId": "test",
+                "manifest": {
+                    "catalogSchema": 5,
+                    "public": format!("sha256:{}", "11".repeat(32)),
+                    "runtime": format!("sha256:{}", "22".repeat(32)),
+                    "schema": "stogas.catalog.release.v3",
+                    "sequence": 1,
+                    "source": {
+                        "commit": "33".repeat(20),
+                        "repository": "https://github.com/StogasAI/catalog",
+                        "tag": "catalog-v1",
+                        "tree": "44".repeat(20)
+                    }
+                },
+                "schema": "stogas.catalog.signed.v3",
+                "signature": "test"
+            }
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn bundle_sequence_is_not_a_trust_input() {
+        let envelope = BundleEnvelope {
+            body: BundleBody {
+                allowed_catalogs: vec![catalog_fixture()],
+                allowed_igvms: vec![release_fixture()],
+                created_at: "2026-07-23T16:00:00.000Z".into(),
+                expires_at: "2026-07-23T16:15:00.000Z".into(),
+                nodes: Vec::new(),
+                schema: "stogas.confidential-bundle.v1".into(),
+                sequence: 0,
+                ttl_ms: 900_000,
+                vendor_collateral: Vec::new(),
+            },
+            body_sha256: "00".repeat(32),
+        };
+
+        validate_shape(&envelope).unwrap();
+    }
+
+    #[test]
+    fn node_catalog_must_match_one_verified_catalog_policy() {
+        let digest = format!("sha256:{}", "22".repeat(32));
+        let catalog = CatalogIdentity {
+            digest: digest.clone(),
+            sequence: 7,
+        };
+        let policies = BTreeMap::from([(digest.as_str(), 7)]);
+
+        verify_node_catalog_policy("node-a", &catalog, &policies).unwrap();
+        let error = verify_node_catalog_policy(
+            "node-a",
+            &CatalogIdentity {
+                digest: digest.clone(),
+                sequence: 8,
+            },
+            &policies,
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("catalog identity is absent from the verified catalog stack")
+        );
     }
 
     #[test]
@@ -2975,6 +3529,10 @@ mod tests {
         let report_data = ReportData {
             active_cert_sha256: "11".repeat(32),
             accepted_cert_sha256: vec!["11".repeat(32)],
+            catalog: CatalogIdentity {
+                digest: format!("sha256:{}", "22".repeat(32)),
+                sequence: 7,
+            },
             drand: DrandBeacon {
                 chain_hash: DRAND_CHAIN_HASH.into(),
                 network: "quicknet".into(),
@@ -2984,7 +3542,7 @@ mod tests {
             },
             ed25519_public_key: URL_SAFE_NO_PAD.encode(heartbeat_signing_key.verifying_key()),
             hpke_public_key: "local-hpke".into(),
-            schema: "stogas.node-report.v2".into(),
+            schema: "stogas.node-report.v3".into(),
             tls_spki_sha256: "55".repeat(32),
         };
         let report_data_sha512 = hex::encode(Sha512::digest(
@@ -3005,10 +3563,6 @@ mod tests {
         let mut request = serde_json::json!({
             "attester_mode": "mock",
             "heartbeat": {
-                "catalog": {
-                    "digest": format!("sha256:{}", "22".repeat(32)),
-                    "sequence": 7
-                },
                 "cert_expires_at": "2026-08-01T00:00:00.000Z",
                 "health": { "ready": true, "secret_versions": {} },
                 "node_id": "local-node",
@@ -3033,6 +3587,59 @@ mod tests {
         request["heartbeat"]["signature"] =
             Value::String(URL_SAFE_NO_PAD.encode(signature.to_bytes()));
         request
+    }
+
+    #[cfg(feature = "snp")]
+    #[test]
+    fn raw_snp_binding_requires_the_hardened_launch_policy_baseline() {
+        let now = 1_784_246_400_000;
+        let request = local_admission_fixture(now);
+        let heartbeat: HeartbeatCandidate =
+            serde_json::from_value(request["heartbeat"].clone()).unwrap();
+        let mut policy = release_fixture().launch_policy;
+        let node = Node {
+            cert_expires_at: heartbeat.cert_expires_at,
+            chip_id: "00".repeat(64),
+            health: heartbeat.health,
+            node_id: heartbeat.node_id,
+            quote: heartbeat.quote,
+            quote_verified_at: heartbeat.observed_at,
+            region: "test".into(),
+            release_measurement: policy.measurement.clone(),
+            reported_tcb: "00".repeat(8),
+            report_data: heartbeat.report_data,
+            report_data_sha512: heartbeat.report_data_sha512,
+        };
+        let report = vec![0_u8; 0x4a0];
+
+        let error = check_raw_report_bindings(&node, &policy, &report).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("required admitted platform protections")
+        );
+
+        policy.launch.policy = "0x000000000213013a".into();
+        let error = check_raw_report_bindings(&node, &policy, &report).unwrap_err();
+        assert!(error.to_string().contains("SNP report version differs"));
+    }
+
+    #[test]
+    fn snp_policy_requirements_are_product_specific() {
+        let milan = AMD_PRODUCT_PROFILES
+            .iter()
+            .find(|profile| profile.product_name == "Milan")
+            .unwrap();
+        let genoa = AMD_PRODUCT_PROFILES
+            .iter()
+            .find(|profile| profile.product_name == "Genoa")
+            .unwrap();
+        let milan_policy = 0x0000_0000_0213_013a;
+
+        validate_snp_launch_policy(milan_policy, Some(milan)).unwrap();
+        let error = validate_snp_launch_policy(milan_policy, Some(genoa)).unwrap_err();
+        assert!(error.to_string().contains("required Genoa protections"));
+        validate_snp_launch_policy(milan_policy | SNP_POLICY_MEM_AES_256_XTS, Some(genoa)).unwrap();
     }
 
     #[test]
