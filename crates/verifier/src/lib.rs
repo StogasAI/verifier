@@ -61,7 +61,7 @@ const STOGAS_RELEASE_PUBLIC_KEY_DER_BASE64: &str =
     "MCowBQYDK2VwAyEAByVn3LvWVbf3YkokMZPvir70vcDu0nNflgXoM0Y8aQU=";
 #[cfg(feature = "staging")]
 const STAGING_PROVENANCE_TYPE: &str = "https://stogas.ai/attestations/staging-development/v1";
-const HEARTBEAT_SIGNATURE_DOMAIN: &[u8] = b"stogas.gateway-heartbeat.v3\0";
+const HEARTBEAT_SIGNATURE_DOMAIN: &[u8] = b"stogas.gateway-heartbeat.v1\0";
 const CSR_SIGNATURE_DOMAIN: &[u8] = b"stogas.gateway-csr-submission.v1\0";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -448,7 +448,11 @@ impl Verifier {
         input: &HistoricalResponseProofInput<'_>,
     ) -> Result<response_proof::VerifiedResponseProof, Error> {
         let ledger = verify_node_ledger_record(input.ledger_bytes, input.environment)?;
-        let catalog = verify_catalog_approval(input.catalog_approval_bytes, input.now_unix_ms)?;
+        let catalog = verify_catalog_approval_with_environment(
+            input.catalog_approval_bytes,
+            input.environment,
+            input.now_unix_ms,
+        )?;
         response_proof::verify_with_ledger(
             input.proof_bytes,
             input.request_body,
@@ -470,7 +474,11 @@ impl Verifier {
         input: &HistoricalResponseProofHashInput<'_>,
     ) -> Result<response_proof::VerifiedResponseProof, Error> {
         let ledger = verify_node_ledger_record(input.ledger_bytes, input.environment)?;
-        let catalog = verify_catalog_approval(input.catalog_approval_bytes, input.now_unix_ms)?;
+        let catalog = verify_catalog_approval_with_environment(
+            input.catalog_approval_bytes,
+            input.environment,
+            input.now_unix_ms,
+        )?;
         response_proof::verify_with_ledger_hashes(
             input.proof_bytes,
             input.request_sha256,
@@ -531,6 +539,23 @@ pub fn verify_catalog_approval(
     approval_bytes: &[u8],
     now_unix_ms: i64,
 ) -> Result<VerifiedCatalogRelease, Error> {
+    verify_catalog_approval_with_environment(approval_bytes, &Environment::stogas(), now_unix_ms)
+}
+
+#[cfg(feature = "staging")]
+#[doc(hidden)]
+pub fn verify_staging_catalog_approval(
+    approval_bytes: &[u8],
+    now_unix_ms: i64,
+) -> Result<VerifiedCatalogRelease, Error> {
+    verify_catalog_approval_with_environment(approval_bytes, &Environment::staging(), now_unix_ms)
+}
+
+fn verify_catalog_approval_with_environment(
+    approval_bytes: &[u8],
+    environment: &Environment,
+    now_unix_ms: i64,
+) -> Result<VerifiedCatalogRelease, Error> {
     if approval_bytes.len() > MAX_INPUT_BYTES {
         return Err(Error::TooLarge);
     }
@@ -538,7 +563,7 @@ pub fn verify_catalog_approval(
         .map_err(|error| Error::InvalidJson(error.to_string()))?;
     let catalog: AllowedCatalog =
         serde_json::from_value(value).map_err(|error| Error::InvalidBundle(error.to_string()))?;
-    verify_catalog(&catalog, &Environment::stogas(), now_unix_ms)
+    verify_catalog(&catalog, environment, now_unix_ms)
 }
 
 #[cfg(feature = "staging")]
@@ -578,9 +603,21 @@ pub fn verify_node_ledger_record(
         .map_err(|error| Error::InvalidJson(error.to_string()))?;
     let record: NodeLedgerRecord = serde_json::from_value(value)
         .map_err(|error| Error::InvalidBundle(format!("invalid node ledger record: {error}")))?;
-    if record.schema != "stogas.node-ledger.v2" || !is_lower_hex(&record.node_id, 32) {
+    if record.schema != "stogas.node-ledger.v1" || !is_lower_hex(&record.node_id, 32) {
         return Err(Error::InvalidBundle(
             "unsupported or invalid node ledger record".into(),
+        ));
+    }
+    if !is_lower_hex(&record.release_measurement, 32)
+        && !is_lower_hex(&record.release_measurement, 48)
+    {
+        return Err(Error::InvalidBundle(
+            "node ledger release measurement is invalid".into(),
+        ));
+    }
+    if record.release_measurement != record.release.launch_policy.measurement {
+        return Err(Error::InvalidBundle(
+            "node ledger release reference differs from its stapled provenance".into(),
         ));
     }
     let admitted_at = parse_time(&record.admitted_at)?;
@@ -609,11 +646,11 @@ pub fn verify_node_ledger_record(
         ));
     }
     let launch_policies = BTreeMap::from([(
-        record.release.launch_policy.measurement.as_str(),
+        record.release_measurement.as_str(),
         &record.release.launch_policy,
     )]);
     let amd_stacks = verified_amd_stacks(
-        &record.admission.collateral,
+        &record.admission.endorsements,
         std::slice::from_ref(&node),
         admitted_at,
         admitted_at,
@@ -692,7 +729,7 @@ fn ledger_record_node(record: &NodeLedgerRecord) -> Node {
         quote: record.admission.quote.clone(),
         quote_verified_at: record.admission.quote_verified_at.clone(),
         region: record.admission.region.clone(),
-        release_measurement: record.release.launch_policy.measurement.clone(),
+        release_measurement: record.release_measurement.clone(),
         reported_tcb: record.admission.reported_tcb.clone(),
         report_data: record.admission.report_data.clone(),
         report_data_sha512: record.admission.report_data_sha512.clone(),
@@ -1786,9 +1823,9 @@ fn validate_catalog_shape(catalog: &AllowedCatalog) -> Result<(), Error> {
     let release = &catalog.signed_release;
     let manifest = &release.manifest;
     if catalog.github_in_toto.len() != 1
-        || release.schema != "stogas.catalog.signed.v3"
-        || manifest.schema != "stogas.catalog.release.v3"
-        || manifest.catalog_schema != 5
+        || release.schema != "stogas.catalog.signed.v1"
+        || manifest.schema != "stogas.catalog.release.v1"
+        || manifest.catalog_schema != 1
         || manifest.sequence == 0
         || manifest.source.repository != "https://github.com/StogasAI/catalog"
         || manifest.source.tag != format!("catalog-v{}", manifest.sequence)
@@ -1845,7 +1882,7 @@ fn validate_release_shape(release: &AllowedIgvm) -> Result<(), Error> {
 fn validate_node_shape(node: &Node) -> Result<(), Error> {
     let report = &node.report_data;
     let checks = [
-        (report.schema == "stogas.node-report.v3", "report schema"),
+        (report.schema == "stogas.node-report.v1", "report schema"),
         (is_lower_hex(&node.node_id, 32), "node id"),
         (is_lower_hex(&node.chip_id, 64), "chip id"),
         (is_lower_hex(&node.reported_tcb, 8), "reported TCB"),
@@ -1948,7 +1985,10 @@ fn verify_catalog(
     let manifest_value =
         serde_json::to_value(manifest).map_err(|error| Error::Release(error.to_string()))?;
     let canonical = canonical_json(&manifest_value)?;
-    let mut payload = b"stogas catalog release v3\n".to_vec();
+    let canonical = canonical
+        .strip_suffix('\n')
+        .ok_or_else(|| Error::Release("catalog canonical manifest is invalid".into()))?;
+    let mut payload = b"stogas catalog release v1\n".to_vec();
     payload.extend_from_slice(canonical.as_bytes());
     verify_ed25519(key, &payload, &signed.signature).map_err(Error::Release)?;
 
@@ -1966,12 +2006,62 @@ fn verify_catalog(
         .public
         .strip_prefix("sha256:")
         .ok_or_else(|| Error::Release("catalog public digest is invalid".into()))?;
+    #[cfg(feature = "staging")]
+    let staging_development_provenance = environment.allow_staging_development_provenance
+        && is_staging_development_provenance(
+            &attestation_bytes,
+            &[
+                ("catalog.runtime.json", runtime_digest),
+                ("catalog.public.json", public_digest),
+            ],
+        )?;
+    #[cfg(not(feature = "staging"))]
+    let staging_development_provenance = false;
+    let (github_integrated_time_unix_ms, provenance) = verify_catalog_provenance(
+        &attestation_bytes,
+        manifest,
+        runtime_digest,
+        public_digest,
+        staging_development_provenance,
+        now_unix_ms,
+    )?;
+
+    Ok(VerifiedCatalogRelease {
+        evidence: catalog.clone(),
+        github_integrated_time_unix_ms,
+        provenance,
+        public_digest: manifest.public.clone(),
+        runtime_digest: manifest.runtime.clone(),
+        sequence: manifest.sequence,
+        source_commit: manifest.source.commit.clone(),
+        source_repository: manifest.source.repository.clone(),
+        source_tag: manifest.source.tag.clone(),
+        source_tree: manifest.source.tree.clone(),
+        stogas_signing_key_id: signed.key_id.clone(),
+    })
+}
+
+fn verify_catalog_provenance(
+    attestation_bytes: &[u8],
+    manifest: &CatalogReleaseManifest,
+    runtime_digest: &str,
+    public_digest: &str,
+    staging_development_provenance: bool,
+    now_unix_ms: i64,
+) -> Result<(Option<i64>, ReleaseProvenance), Error> {
+    #[cfg(feature = "staging")]
+    if staging_development_provenance {
+        return Ok((None, ReleaseProvenance::Staging));
+    }
+    #[cfg(not(feature = "staging"))]
+    let _ = staging_development_provenance;
+
     let workflow_identity = format!(
         "https://github.com/StogasAI/catalog/.github/workflows/catalog-release.yml@refs/tags/{}",
         manifest.source.tag
     );
     let verified = verify_github_attestation(
-        &attestation_bytes,
+        attestation_bytes,
         &[
             Subject {
                 name: "catalog.runtime.json",
@@ -1993,23 +2083,11 @@ fn verify_catalog(
         now_unix_ms,
     )
     .map_err(|error| Error::Release(format!("catalog provenance: {error}")))?;
-    let github_integrated_time_unix_ms = verified
+    let integrated_time = verified
         .integrated_time
         .checked_mul(1000)
         .ok_or_else(|| Error::Release("catalog GitHub integration time overflows".into()))?;
-
-    Ok(VerifiedCatalogRelease {
-        evidence: catalog.clone(),
-        github_integrated_time_unix_ms,
-        public_digest: manifest.public.clone(),
-        runtime_digest: manifest.runtime.clone(),
-        sequence: manifest.sequence,
-        source_commit: manifest.source.commit.clone(),
-        source_repository: manifest.source.repository.clone(),
-        source_tag: manifest.source.tag.clone(),
-        source_tree: manifest.source.tree.clone(),
-        stogas_signing_key_id: signed.key_id.clone(),
-    })
+    Ok((Some(integrated_time), ReleaseProvenance::Github))
 }
 
 fn verify_release(
@@ -2050,8 +2128,10 @@ fn verify_release(
     let staging_development_provenance = environment.allow_staging_development_provenance
         && is_staging_development_provenance(
             &attestation_bytes,
-            &policy.igvm_sha256,
-            &policy_digest,
+            &[
+                ("gateway.igvm", policy.igvm_sha256.as_str()),
+                ("gateway-launch-policy.json", policy_digest.as_str()),
+            ],
         )?;
     #[cfg(not(feature = "staging"))]
     let staging_development_provenance = false;
@@ -2132,8 +2212,7 @@ fn verify_release_provenance(
 #[cfg(feature = "staging")]
 fn is_staging_development_provenance(
     bytes: &[u8],
-    igvm_sha256: &str,
-    launch_policy_sha256: &str,
+    expected_subjects: &[(&str, &str)],
 ) -> Result<bool, Error> {
     let value: Value = serde_json::from_slice(bytes)
         .map_err(|error| Error::Release(format!("invalid provenance JSON: {error}")))?;
@@ -2147,16 +2226,16 @@ fn is_staging_development_provenance(
     if statement.statement_type != "https://in-toto.io/Statement/v1"
         || statement.predicate_type != STAGING_PROVENANCE_TYPE
         || statement.predicate.environment != "staging"
-        || statement.subject.len() != 2
+        || statement.subject.len() != expected_subjects.len()
     {
         return Err(Error::Release(
             "invalid staging development provenance policy".into(),
         ));
     }
-    let expected = BTreeMap::from([
-        ("gateway-launch-policy.json", launch_policy_sha256),
-        ("gateway.igvm", igvm_sha256),
-    ]);
+    let expected = expected_subjects
+        .iter()
+        .map(|(name, digest)| ((*name).to_owned(), (*digest).to_owned()))
+        .collect::<BTreeMap<_, _>>();
     let mut actual = BTreeMap::new();
     for subject in statement.subject {
         if subject.digest.len() != 1 {
@@ -2175,12 +2254,7 @@ fn is_staging_development_provenance(
             ));
         }
     }
-    if actual
-        != expected
-            .into_iter()
-            .map(|(name, digest)| (name.to_owned(), digest.to_owned()))
-            .collect()
-    {
+    if actual != expected {
         return Err(Error::Release(
             "staging development provenance subjects differ".into(),
         ));
@@ -3357,10 +3431,10 @@ mod tests {
             "signed_release": {
                 "keyId": "test",
                 "manifest": {
-                    "catalogSchema": 5,
+                    "catalogSchema": 1,
                     "public": format!("sha256:{}", "11".repeat(32)),
                     "runtime": format!("sha256:{}", "22".repeat(32)),
-                    "schema": "stogas.catalog.release.v3",
+                    "schema": "stogas.catalog.release.v1",
                     "sequence": 1,
                     "source": {
                         "commit": "33".repeat(20),
@@ -3369,7 +3443,7 @@ mod tests {
                         "tree": "44".repeat(20)
                     }
                 },
-                "schema": "stogas.catalog.signed.v3",
+                "schema": "stogas.catalog.signed.v1",
                 "signature": "test"
             }
         }))
@@ -3542,7 +3616,7 @@ mod tests {
             },
             ed25519_public_key: URL_SAFE_NO_PAD.encode(heartbeat_signing_key.verifying_key()),
             hpke_public_key: "local-hpke".into(),
-            schema: "stogas.node-report.v3".into(),
+            schema: "stogas.node-report.v1".into(),
             tls_spki_sha256: "55".repeat(32),
         };
         let report_data_sha512 = hex::encode(Sha512::digest(
@@ -3775,6 +3849,36 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "staging")]
+    fn resign_catalog(catalog: &mut AllowedCatalog) -> Environment {
+        use ed25519_dalek::{Signer as _, SigningKey, pkcs8::EncodePublicKey as _};
+
+        let signing_key = SigningKey::from_bytes(&[0x42; 32]);
+        let canonical =
+            canonical_json(&serde_json::to_value(&catalog.signed_release.manifest).unwrap())
+                .unwrap();
+        let canonical = canonical.strip_suffix('\n').unwrap();
+        let mut payload = b"stogas catalog release v1\n".to_vec();
+        payload.extend_from_slice(canonical.as_bytes());
+        catalog.signed_release.key_id = "test-release-key".into();
+        catalog.signed_release.signature =
+            URL_SAFE_NO_PAD.encode(signing_key.sign(&payload).to_bytes());
+        Environment {
+            release_keys: BTreeMap::from([(
+                "test-release-key".into(),
+                STANDARD.encode(
+                    signing_key
+                        .verifying_key()
+                        .to_public_key_der()
+                        .unwrap()
+                        .as_bytes(),
+                ),
+            )]),
+            #[cfg(feature = "staging")]
+            allow_staging_development_provenance: false,
+        }
+    }
+
     #[test]
     fn rejects_duplicate_keys() {
         let error = strict_json::from_slice(br#"{"body":1,"body":2}"#).unwrap_err();
@@ -3829,6 +3933,49 @@ mod tests {
         release.github_in_toto[0]["subject"][0]["digest"]["sha256"] =
             Value::String("00".repeat(32));
         assert!(verify_release(&release, &environment, 1_784_246_400_000).is_err());
+    }
+
+    #[cfg(feature = "staging")]
+    #[test]
+    fn staging_catalog_provenance_is_exact_and_never_accepted_by_production() {
+        let mut catalog = catalog_fixture();
+        let mut environment = resign_catalog(&mut catalog);
+        environment.allow_staging_development_provenance = true;
+        let runtime_digest = catalog
+            .signed_release
+            .manifest
+            .runtime
+            .strip_prefix("sha256:")
+            .unwrap()
+            .to_owned();
+        let public_digest = catalog
+            .signed_release
+            .manifest
+            .public
+            .strip_prefix("sha256:")
+            .unwrap()
+            .to_owned();
+        catalog.github_in_toto = vec![serde_json::json!({
+            "_type": "https://in-toto.io/Statement/v1",
+            "predicateType": STAGING_PROVENANCE_TYPE,
+            "predicate": { "environment": "staging" },
+            "subject": [
+                { "name": "catalog.runtime.json", "digest": { "sha256": runtime_digest } },
+                { "name": "catalog.public.json", "digest": { "sha256": public_digest } }
+            ]
+        })];
+
+        let verified = verify_catalog(&catalog, &environment, 1_784_246_400_000).unwrap();
+        assert!(verified.github_integrated_time_unix_ms.is_none());
+        assert!(matches!(verified.provenance, ReleaseProvenance::Staging));
+
+        environment.allow_staging_development_provenance = false;
+        assert!(verify_catalog(&catalog, &environment, 1_784_246_400_000).is_err());
+
+        environment.allow_staging_development_provenance = true;
+        catalog.github_in_toto[0]["subject"][1]["digest"]["sha256"] =
+            Value::String("00".repeat(32));
+        assert!(verify_catalog(&catalog, &environment, 1_784_246_400_000).is_err());
     }
 
     #[test]

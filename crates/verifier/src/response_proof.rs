@@ -10,13 +10,13 @@ use sha2::{Digest as _, Sha256};
 use std::collections::BTreeMap;
 
 /// Response-proof schema emitted by the gateway.
-pub const SCHEMA_V5: &str = "stogas.response-proof.v5";
+pub const SCHEMA_V1: &str = "stogas.response-proof.v1";
 /// Maximum serialized response-proof size.
 pub const MAX_PROOF_BYTES: usize = 8 * 1024;
 /// Maximum request or response body accepted by one-shot proof verification.
 pub const MAX_BODY_BYTES: usize = 64 * 1024 * 1024;
 
-const SIGNATURE_DOMAIN: &[u8] = b"stogas.response-proof.v5\0";
+const SIGNATURE_DOMAIN: &[u8] = b"stogas.response-proof.v1\0";
 const MAX_CATALOG_ID_BYTES: usize = 128;
 const MAX_METERS: usize = 64;
 const CATALOG_NODE_KINDS: [&str; 5] = ["author", "model", "deployment", "route", "provider"];
@@ -306,7 +306,7 @@ fn parse_and_validate_hashes(
 }
 
 fn validate_shape(proof: &ResponseProof) -> Result<(), Error> {
-    if proof.schema != SCHEMA_V5 {
+    if proof.schema != SCHEMA_V1 {
         return Err(Error::ResponseProof(
             "unsupported response proof schema".into(),
         ));
@@ -480,8 +480,8 @@ fn is_lower_hex(value: &str, bytes: usize) -> bool {
 mod tests {
     use super::*;
     use crate::{
-        AllowedCatalog, BundleEnvelope, CatalogIdentity, DrandBeacon, ReportData, VerifiedBundle,
-        VerifiedCatalogRelease, VerifiedNode,
+        AllowedCatalog, BundleEnvelope, CatalogIdentity, DrandBeacon, ReleaseProvenance,
+        ReportData, VerifiedBundle, VerifiedCatalogRelease, VerifiedNode,
     };
     use ed25519_dalek::{Signer as _, SigningKey};
     use serde_json::json;
@@ -517,7 +517,7 @@ mod tests {
                 },
                 ed25519_public_key: public_key,
                 hpke_public_key: URL_SAFE_NO_PAD.encode([4_u8; 1_216]),
-                schema: "stogas.node-report.v3".into(),
+                schema: "stogas.node-report.v1".into(),
                 tls_spki_sha256: "88".repeat(32),
             },
             report_data_sha512: "99".repeat(64),
@@ -532,10 +532,10 @@ mod tests {
             "signed_release": {
                 "keyId": "test",
                 "manifest": {
-                    "catalogSchema": 5,
+                    "catalogSchema": 1,
                     "public": format!("sha256:{}", "55".repeat(32)),
                     "runtime": format!("sha256:{}", "44".repeat(32)),
-                    "schema": "stogas.catalog.release.v3",
+                    "schema": "stogas.catalog.release.v1",
                     "sequence": 7,
                     "source": {
                         "commit": "11".repeat(20),
@@ -544,7 +544,7 @@ mod tests {
                         "tree": "22".repeat(20)
                     }
                 },
-                "schema": "stogas.catalog.signed.v3",
+                "schema": "stogas.catalog.signed.v1",
                 "signature": "test"
             }
         }))
@@ -568,7 +568,8 @@ mod tests {
             bundle: VerifiedBundle {
                 catalogs: vec![VerifiedCatalogRelease {
                     evidence: catalog_evidence,
-                    github_integrated_time_unix_ms: NOW - 10_000,
+                    github_integrated_time_unix_ms: Some(NOW - 10_000),
+                    provenance: ReleaseProvenance::Github,
                     public_digest: format!("sha256:{}", "55".repeat(32)),
                     runtime_digest: format!("sha256:{}", "44".repeat(32)),
                     sequence: 7,
@@ -596,7 +597,7 @@ mod tests {
         transcript: Option<&str>,
     ) -> Vec<u8> {
         let mut proof = ResponseProof {
-            schema: SCHEMA_V5.into(),
+            schema: SCHEMA_V1.into(),
             request_id: "018f4f70-7c88-7b9a-baf8-31a93d2cf613".into(),
             node_id: "33".repeat(32),
             catalog: ResponseCatalog {

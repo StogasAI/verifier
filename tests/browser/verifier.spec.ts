@@ -188,7 +188,7 @@ test('rejects an invalid Rekor inclusion proof without networking', async ({ pag
 	expect(requests).toEqual([]);
 });
 
-test('rejects the pre-v2 full staging bundle with networking disabled', async ({ page }) => {
+test('rejects the legacy full staging bundle with networking disabled', async ({ page }) => {
 	const requests = await initialize(page);
 	const fixture = await readFile(STAGING_BUNDLE_FIXTURE, 'utf8');
 	const error = await page.evaluate(
@@ -224,7 +224,7 @@ test('rejects the pre-v2 full staging bundle with networking disabled', async ({
 	expect(requests).toEqual([]);
 });
 
-test('does not activate or seal from a pre-v2 bundle', async ({ page }) => {
+test('does not activate or seal from a legacy bundle', async ({ page }) => {
 	const requests = await initialize(page);
 	const fixture = await readFile(STAGING_BUNDLE_FIXTURE, 'utf8');
 	const result = await page.evaluate(
@@ -284,7 +284,7 @@ test('does not activate or seal from a pre-v2 bundle', async ({ page }) => {
 	expect(requests).toEqual([]);
 });
 
-test('rejects deterministic pre-v2 mutations across the WASM bundle boundary', async ({ page }) => {
+test('rejects deterministic legacy mutations across the WASM bundle boundary', async ({ page }) => {
 	const requests = await initialize(page);
 	const fixture = await readFile(STAGING_BUNDLE_FIXTURE, 'utf8');
 	const result = await page.evaluate(

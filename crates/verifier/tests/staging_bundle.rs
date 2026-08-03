@@ -10,7 +10,7 @@ fn fixture() -> Value {
 }
 
 #[test]
-fn v2_rejects_quote_bound_v1_catalog_identity() {
+fn rejects_legacy_quote_without_catalog_binding() {
     let error = Verifier::default()
         .verify_bundle(LEGACY_BUNDLE, VERIFIED_AT_UNIX_MS, &Environment::stogas())
         .unwrap_err()
