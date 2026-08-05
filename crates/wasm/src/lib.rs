@@ -5,6 +5,8 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use stogas_offline_sigstore::{GithubPolicy, Subject, verify_github_attestation};
 #[cfg(feature = "staging")]
+use stogas_verifier::verify_staging_catalog_approval as verify_staging_catalog;
+#[cfg(feature = "staging")]
 use stogas_verifier::verify_staging_release_approval as verify_staging_release;
 use stogas_verifier::{
     Environment, HistoricalResponseProofHashInput, HistoricalResponseProofInput,
@@ -24,6 +26,13 @@ use stogas_verifier::{
     verify_release_approval as verify_release,
 };
 use wasm_bindgen::prelude::*;
+
+/// Report whether this artifact contains the private staging provenance policy.
+#[wasm_bindgen(js_name = verifierSupportsStagingProvenance)]
+#[must_use]
+pub fn verifier_supports_staging_provenance() -> bool {
+    cfg!(feature = "staging")
+}
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -86,18 +95,20 @@ pub struct WasmResponseProofStream {
 #[wasm_bindgen(js_class = Verifier)]
 impl WasmVerifier {
     /// Construct a verifier for public Stogas evidence.
-    #[cfg(not(feature = "staging"))]
-    #[wasm_bindgen(constructor)]
-    #[must_use]
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    #[cfg(feature = "staging")]
+    ///
+    /// A staging-enabled build can select the private staging trust environment. Production
+    /// builds ignore this argument and contain no staging provenance parser or trust policy.
     #[wasm_bindgen(constructor)]
     #[must_use]
     pub fn new(staging: Option<bool>) -> Self {
+        #[cfg(not(feature = "staging"))]
+        let _ = staging;
+        #[cfg(not(feature = "staging"))]
+        return Self::default();
+
+        #[cfg(feature = "staging")]
         let staging = staging.unwrap_or(false);
+        #[cfg(feature = "staging")]
         Self {
             core: CoreVerifier::default(),
             environment: if staging {
@@ -265,9 +276,15 @@ impl WasmVerifier {
     pub fn verify_catalog_approval(&self, approval: &[u8]) -> Result<JsValue, JsError> {
         let now_unix_ms = js_sys::Date::now();
         validate_time(now_unix_ms)?;
-        let output = verify_catalog(approval, now_unix_ms as i64)
-            .map_err(|error| JsError::new(&error.to_string()))?;
-        to_js_value(&output)
+        #[cfg(feature = "staging")]
+        let output = if self.staging {
+            verify_staging_catalog(approval, now_unix_ms as i64)
+        } else {
+            verify_catalog(approval, now_unix_ms as i64)
+        };
+        #[cfg(not(feature = "staging"))]
+        let output = verify_catalog(approval, now_unix_ms as i64);
+        to_js_value(&output.map_err(|error| JsError::new(&error.to_string()))?)
     }
 
     /// Encrypt one ordinary OpenAI-compatible inference request to every trusted bundle member.
@@ -565,6 +582,31 @@ pub fn verify_catalog_approval(approval: &[u8], now_unix_ms: f64) -> Result<JsVa
 #[cfg(feature = "staging")]
 #[wasm_bindgen]
 #[allow(clippy::cast_possible_truncation)]
+pub fn verify_staging_catalog_approval(
+    approval: &[u8],
+    now_unix_ms: f64,
+) -> Result<JsValue, JsError> {
+    validate_time(now_unix_ms)?;
+    let output = verify_staging_catalog(approval, now_unix_ms as i64)
+        .map_err(|error| JsError::new(&error.to_string()))?;
+    to_js_value(&output)
+}
+
+#[cfg(not(feature = "staging"))]
+#[wasm_bindgen]
+#[allow(clippy::cast_possible_truncation)]
+pub fn verify_staging_catalog_approval(
+    _approval: &[u8],
+    _now_unix_ms: f64,
+) -> Result<JsValue, JsError> {
+    Err(JsError::new(
+        "staging catalog verification is not available in this build",
+    ))
+}
+
+#[cfg(feature = "staging")]
+#[wasm_bindgen]
+#[allow(clippy::cast_possible_truncation)]
 pub fn verify_staging_release_approval(
     release: &[u8],
     now_unix_ms: f64,
@@ -573,6 +615,18 @@ pub fn verify_staging_release_approval(
     let output = verify_staging_release(release, now_unix_ms as i64)
         .map_err(|error| JsError::new(&error.to_string()))?;
     to_js_value(&output)
+}
+
+#[cfg(not(feature = "staging"))]
+#[wasm_bindgen]
+#[allow(clippy::cast_possible_truncation)]
+pub fn verify_staging_release_approval(
+    _release: &[u8],
+    _now_unix_ms: f64,
+) -> Result<JsValue, JsError> {
+    Err(JsError::new(
+        "staging release verification is not available in this build",
+    ))
 }
 
 /// Verify fetched AMD collateral before Control activates it.

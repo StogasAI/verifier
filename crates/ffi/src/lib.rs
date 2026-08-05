@@ -19,7 +19,7 @@ use stogas_verifier::{
 };
 
 /// ABI version implemented by this library and its public header.
-pub const STOGAS_VERIFIER_ABI_VERSION: u32 = 4;
+pub const STOGAS_VERIFIER_ABI_VERSION: u32 = 1;
 
 struct VerifierSession {
     core: Verifier,
@@ -552,7 +552,7 @@ mod tests {
     }
 
     #[test]
-    fn c_abi_rejects_the_pre_v2_bundle() {
+    fn c_abi_rejects_the_legacy_bundle() {
         let bundle =
             include_bytes!("../../verifier/tests/fixtures/staging-bundle-sequence-1927.json");
         let verifier = stogas_verifier_new();

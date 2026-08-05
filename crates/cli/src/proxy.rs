@@ -1059,7 +1059,9 @@ mod tests {
     use hpke::{Kem as _, Serializable as _, kem::XWing};
     use rcgen::{BasicConstraints, CertificateParams, CertifiedIssuer, IsCa, KeyPair};
     use rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
-    use stogas_verifier::{AllowedCatalog, DrandBeacon, ReportData, VerifiedCatalogRelease};
+    use stogas_verifier::{
+        AllowedCatalog, DrandBeacon, ReleaseProvenance, ReportData, VerifiedCatalogRelease,
+    };
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
     use tokio::sync::oneshot;
     use tokio_rustls::TlsAcceptor;
@@ -1113,7 +1115,7 @@ mod tests {
                     },
                     ed25519_public_key: String::new(),
                     hpke_public_key: String::new(),
-                    schema: "stogas.node-report.v3".into(),
+                    schema: "stogas.node-report.v1".into(),
                     tls_spki_sha256: spki_hash,
                 },
                 report_data_sha512: "00".repeat(64),
@@ -1132,10 +1134,10 @@ mod tests {
             "signed_release": {
                 "keyId": "test",
                 "manifest": {
-                    "catalogSchema": 5,
+                    "catalogSchema": 1,
                     "public": format!("sha256:{}", "11".repeat(32)),
                     "runtime": format!("sha256:{}", "22".repeat(32)),
-                    "schema": "stogas.catalog.release.v3",
+                    "schema": "stogas.catalog.release.v1",
                     "sequence": 1,
                     "source": {
                         "commit": "33".repeat(20),
@@ -1144,7 +1146,7 @@ mod tests {
                         "tree": "44".repeat(20)
                     }
                 },
-                "schema": "stogas.catalog.signed.v3",
+                "schema": "stogas.catalog.signed.v1",
                 "signature": "test"
             }
         }))
@@ -1168,7 +1170,8 @@ mod tests {
             bundle: stogas_verifier::VerifiedBundle {
                 catalogs: vec![VerifiedCatalogRelease {
                     evidence: catalog_evidence,
-                    github_integrated_time_unix_ms: 0,
+                    github_integrated_time_unix_ms: Some(0),
+                    provenance: ReleaseProvenance::Github,
                     public_digest: format!("sha256:{}", "11".repeat(32)),
                     runtime_digest: format!("sha256:{}", "22".repeat(32)),
                     sequence: 1,

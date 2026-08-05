@@ -300,7 +300,9 @@ pub struct VerifiedRelease {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct VerifiedCatalogRelease {
     pub evidence: AllowedCatalog,
-    pub github_integrated_time_unix_ms: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub github_integrated_time_unix_ms: Option<i64>,
+    pub provenance: ReleaseProvenance,
     pub public_digest: String,
     pub runtime_digest: String,
     pub sequence: u64,
@@ -361,6 +363,7 @@ pub struct NodeLedgerRecord {
     pub certificate_history: Vec<NodeLedgerCertificate>,
     pub node_id: String,
     pub release: AllowedIgvm,
+    pub release_measurement: String,
     pub schema: String,
 }
 
@@ -376,7 +379,7 @@ pub struct NodeLedgerCertificate {
 pub struct NodeLedgerAdmission {
     pub cert_expires_at: String,
     pub chip_id: String,
-    pub collateral: Vec<VendorCollateral>,
+    pub endorsements: Vec<VendorCollateral>,
     pub quote: String,
     pub quote_verified_at: String,
     pub region: String,
