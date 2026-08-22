@@ -26,6 +26,7 @@ fuzz_target!(|data: &[u8]| {
         api_key: "sk-fuzz",
         accept: None,
         extra_fields: false,
+        upstream_credential: None,
         body: b"{}",
     };
     if let Ok(mut sealed) = seal_request(&request) {

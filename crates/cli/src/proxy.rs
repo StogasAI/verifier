@@ -39,6 +39,8 @@ const MIN_REFRESH_RETRY_SECONDS: u64 = 4;
 const MAX_REFRESH_RETRY_SECONDS: u64 = 8;
 const MIN_BUNDLE_REFRESH_LEAD_SECONDS: i64 = 40;
 const MAX_BUNDLE_REFRESH_LEAD_SECONDS: i64 = 70;
+const MIN_REFRESH_INTERVAL_JITTER_PERCENT: i64 = 90;
+const MAX_REFRESH_INTERVAL_JITTER_PERCENT: i64 = 110;
 const PRODUCTION_BUNDLE_URL: &str = "https://evidence.stogas.ai/bundles/latest.json";
 const PRODUCTION_BUNDLE_FALLBACK_URL: &str = "https://evidence2.stogas.ai/bundles/latest.json";
 const STAGING_BUNDLE_URL: &str = "https://evidence-staging.stogas.ai/bundles/latest.json";
@@ -58,6 +60,7 @@ pub struct ServeConfig {
     security: SecurityMode,
     browser: Option<BrowserAccess>,
     client_capability: Option<String>,
+    hardware_policy: Option<Vec<u8>>,
 }
 
 pub struct ServeConfigInput<'a> {
@@ -68,6 +71,7 @@ pub struct ServeConfigInput<'a> {
     pub bundle_refresh_interval: Duration,
     pub security: SecurityMode,
     pub browser_origin: Option<&'a str>,
+    pub hardware_policy: Option<&'a [u8]>,
     pub protect_loopback_path: bool,
 }
 
@@ -78,6 +82,9 @@ struct BrowserAccess {
 
 impl ServeConfig {
     pub fn new(input: ServeConfigInput<'_>) -> Result<Self> {
+        if input.bundle_refresh_interval.is_zero() {
+            bail!("bundle refresh interval must be positive");
+        }
         let bundle_urls = secure_bundle_urls(input.bundle_url)?;
         let bundle_fetcher = reqwest::Client::builder()
             .use_preconfigured_tls(compatible_webpki_tls_config()?)
@@ -115,6 +122,7 @@ impl ServeConfig {
             security: input.security,
             browser,
             client_capability: input.protect_loopback_path.then(random_capability),
+            hardware_policy: input.hardware_policy.map(<[u8]>::to_vec),
         })
     }
 
@@ -215,8 +223,8 @@ fn secure_bundle_urls(primary: &str) -> Result<Vec<Url>> {
 
 struct ActiveBundle {
     output: VerificationOutput,
-    client: reqwest::Client,
-    recipients: Vec<Recipient>,
+    client: Option<reqwest::Client>,
+    recipients: Option<Vec<Recipient>>,
     bundle_sha256: [u8; 32],
 }
 
@@ -245,6 +253,7 @@ struct ProxyState {
 }
 
 pub async fn serve(config: ServeConfig) -> Result<()> {
+    let listener = tokio::net::TcpListener::bind(config.listen).await?;
     let config = Arc::new(config);
     let mut verifier = Verifier::default();
     let (initial, origin_caches) = fetch_initial_bundle(&config, &mut verifier).await?;
@@ -255,16 +264,17 @@ pub async fn serve(config: ServeConfig) -> Result<()> {
         refresh_lock: Mutex::new(()),
         verifier: Mutex::new(verifier),
     });
-    tokio::spawn(refresh_loop(Arc::clone(&state)));
+    let refresh_task = tokio::spawn(refresh_loop(Arc::clone(&state)));
 
     let app = Router::new().fallback(any(proxy_request)).with_state(state);
-    let listener = tokio::net::TcpListener::bind(config.listen).await?;
     println!("OpenAI base URL: {}", config.base_url());
     println!("Bundle refresh URL: {}", config.refresh_url());
-    axum::serve(listener, app)
+    let result = axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
-        .await?;
-    Ok(())
+        .await;
+    refresh_task.abort();
+    let _ = refresh_task.await;
+    result.map_err(Into::into)
 }
 
 pub struct EmbeddedEndpoints {
@@ -299,13 +309,13 @@ pub async fn serve_embedded(
             refresh_lock: Mutex::new(()),
             verifier: Mutex::new(verifier),
         });
-        tokio::spawn(refresh_loop(Arc::clone(&state)));
+        let refresh_task = tokio::spawn(refresh_loop(Arc::clone(&state)));
         let app = Router::new().fallback(any(proxy_request)).with_state(state);
-        Ok::<_, anyhow::Error>(app)
+        Ok::<_, anyhow::Error>((app, refresh_task))
     }
     .await;
-    let app = match initialized {
-        Ok(app) => app,
+    let (app, refresh_task) = match initialized {
+        Ok(initialized) => initialized,
         Err(error) => {
             let _ = ready.send(Err(error.to_string()));
             return Err(error);
@@ -317,14 +327,18 @@ pub async fn serve_embedded(
         refresh_path: config.refresh_path(),
     };
     if ready.send(Ok(endpoints)).is_err() {
+        refresh_task.abort();
+        let _ = refresh_task.await;
         return Ok(());
     }
-    axum::serve(listener, app)
+    let result = axum::serve(listener, app)
         .with_graceful_shutdown(async {
             let _ = shutdown.await;
         })
-        .await?;
-    Ok(())
+        .await;
+    refresh_task.abort();
+    let _ = refresh_task.await;
+    result.map_err(Into::into)
 }
 
 async fn shutdown_signal() {
@@ -344,7 +358,7 @@ async fn refresh_loop(state: Arc<ProxyState>) {
         sleep_until_wall_clock(refresh_at).await;
 
         loop {
-            if refresh_once(&state).await.is_ok() {
+            if refresh_once(&state, RefreshGoal::Routine).await.is_ok() {
                 break;
             }
             tokio::time::sleep(refresh_retry_delay()).await;
@@ -357,18 +371,34 @@ fn replacement_refresh_at(
     now_unix_ms: i64,
     refresh_interval: Duration,
 ) -> i64 {
+    if output.bundle.nodes.is_empty() {
+        return now_unix_ms
+            .saturating_add(i64::try_from(refresh_retry_delay().as_millis()).unwrap_or(i64::MAX));
+    }
     let bundle_lead_seconds =
         rand::rng().random_range(MIN_BUNDLE_REFRESH_LEAD_SECONDS..=MAX_BUNDLE_REFRESH_LEAD_SECONDS);
-    replacement_refresh_at_with_lead(output, now_unix_ms, refresh_interval, bundle_lead_seconds)
+    let interval_percent = rand::rng()
+        .random_range(MIN_REFRESH_INTERVAL_JITTER_PERCENT..=MAX_REFRESH_INTERVAL_JITTER_PERCENT);
+    replacement_refresh_at_with_policy(
+        output,
+        now_unix_ms,
+        refresh_interval,
+        bundle_lead_seconds,
+        interval_percent,
+    )
 }
 
-fn replacement_refresh_at_with_lead(
+fn replacement_refresh_at_with_policy(
     output: &VerificationOutput,
     now_unix_ms: i64,
     refresh_interval: Duration,
     bundle_lead_seconds: i64,
+    interval_percent: i64,
 ) -> i64 {
-    let interval_ms = i64::try_from(refresh_interval.as_millis()).unwrap_or(i64::MAX);
+    let interval_ms = i64::try_from(refresh_interval.as_millis())
+        .unwrap_or(i64::MAX)
+        .saturating_mul(interval_percent)
+        / 100;
     let scheduled = now_unix_ms.saturating_add(interval_ms);
     let expiry_refresh = output
         .bundle
@@ -401,6 +431,7 @@ async fn fetch_initial_bundle(
     verifier: &mut Verifier,
 ) -> Result<(ActiveBundle, HashMap<String, OriginCacheState>)> {
     let mut errors = Vec::new();
+    let mut unavailable: Option<(ActiveBundle, HashMap<String, OriginCacheState>)> = None;
     for bundle_url in randomized_bundle_urls(config) {
         match fetch_bundle_origin(config, bundle_url.clone(), None).await {
             Ok(BundleFetch::Changed(candidate)) => match activate_bundle(
@@ -413,7 +444,22 @@ async fn fetch_initial_bundle(
                 Ok(active) => {
                     let mut origin_caches = HashMap::new();
                     origin_caches.insert(bundle_url.to_string(), candidate.origin_cache);
-                    return Ok((active, origin_caches));
+                    if !active.output.bundle.nodes.is_empty() {
+                        return Ok((active, origin_caches));
+                    }
+                    if let Some((current, current_origin_caches)) = unavailable.as_mut() {
+                        if active.bundle_sha256 == current.bundle_sha256 {
+                            current_origin_caches.extend(origin_caches);
+                            continue;
+                        }
+                        if !candidate_snapshot_advances(&current.output, &active.output) {
+                            errors.push(format!(
+                                "{bundle_url}: returned a non-advancing verified snapshot"
+                            ));
+                            continue;
+                        }
+                    }
+                    unavailable = Some((active, origin_caches));
                 }
                 Err(error) => errors.push(format!("{bundle_url}: {error}")),
             },
@@ -425,23 +471,47 @@ async fn fetch_initial_bundle(
             Err(error) => errors.push(error.to_string()),
         }
     }
+    if let Some(unavailable) = unavailable {
+        return Ok(unavailable);
+    }
     bail!("every evidence origin failed: {}", errors.join("; "))
 }
 
-async fn refresh_once(state: &ProxyState) -> Result<bool> {
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RefreshGoal {
+    FindChangedSnapshot,
+    Routine,
+}
+
+async fn refresh_once(state: &ProxyState, goal: RefreshGoal) -> Result<bool> {
     let _guard = state.refresh_lock.lock().await;
     let current = {
         let active = state.active.read().await;
         Arc::clone(&active)
     };
     let mut errors = Vec::new();
+    let mut active_snapshot_observed = false;
+    let mut pending_unavailable: Option<(ActiveBundle, HashMap<String, OriginCacheState>)> = None;
+    let mut unavailable_candidates = 0;
     for bundle_url in randomized_bundle_urls(&state.config) {
         let previous = {
             let origin_caches = state.origin_caches.lock().await;
             origin_caches.get(bundle_url.as_str()).cloned()
         };
         match fetch_bundle_origin(&state.config, bundle_url.clone(), previous).await {
-            Ok(BundleFetch::Unchanged) => return Ok(false),
+            Ok(BundleFetch::Unchanged) => {
+                if active_snapshot_requires_fallback(
+                    &current,
+                    pending_unavailable.is_some(),
+                    goal,
+                    &bundle_url,
+                    &mut errors,
+                    &mut active_snapshot_observed,
+                ) {
+                    continue;
+                }
+                return Ok(false);
+            }
             Ok(BundleFetch::Changed(candidate)) => {
                 if candidate.origin_cache.bundle_sha256 == current.bundle_sha256 {
                     state
@@ -449,20 +519,20 @@ async fn refresh_once(state: &ProxyState) -> Result<bool> {
                         .lock()
                         .await
                         .insert(bundle_url.to_string(), candidate.origin_cache);
+                    if active_snapshot_requires_fallback(
+                        &current,
+                        pending_unavailable.is_some(),
+                        goal,
+                        &bundle_url,
+                        &mut errors,
+                        &mut active_snapshot_observed,
+                    ) {
+                        continue;
+                    }
                     return Ok(false);
                 }
                 let origin_cache = candidate.origin_cache.clone();
-                let activated = {
-                    let mut verifier = state.verifier.lock().await;
-                    activate_bundle(
-                        &state.config,
-                        &candidate.bytes,
-                        candidate.origin_cache.bundle_sha256,
-                        wall_clock_ms(),
-                        &mut verifier,
-                    )
-                };
-                let candidate = match activated {
+                let candidate = match verify_bundle_candidate(state, &candidate).await {
                     Ok(candidate) => candidate,
                     Err(error) => {
                         errors.push(format!("{bundle_url}: {error}"));
@@ -475,18 +545,107 @@ async fn refresh_once(state: &ProxyState) -> Result<bool> {
                     ));
                     continue;
                 }
-                {
-                    let mut origin_caches = state.origin_caches.lock().await;
-                    origin_caches.clear();
-                    origin_caches.insert(bundle_url.to_string(), origin_cache);
+                if candidate.output.bundle.nodes.is_empty() && state.config.bundle_urls.len() == 2 {
+                    unavailable_candidates += 1;
+                    remember_unavailable_candidate(
+                        &mut pending_unavailable,
+                        &bundle_url,
+                        origin_cache,
+                        candidate,
+                    );
+                    continue;
                 }
-                *state.active.write().await = Arc::new(candidate);
+                install_active_bundle(
+                    state,
+                    candidate,
+                    HashMap::from([(bundle_url.to_string(), origin_cache)]),
+                )
+                .await;
                 return Ok(true);
             }
             Err(error) => errors.push(error.to_string()),
         }
     }
+    if let Some((pending, pending_origin_caches)) = pending_unavailable
+        && unavailable_candidate_can_replace(
+            &current.output,
+            unavailable_candidates,
+            state.config.bundle_urls.len(),
+        )
+    {
+        install_active_bundle(state, pending, pending_origin_caches).await;
+        return Ok(true);
+    }
+    if active_snapshot_observed {
+        return Ok(false);
+    }
     bail!("every evidence origin failed: {}", errors.join("; "))
+}
+
+async fn verify_bundle_candidate(
+    state: &ProxyState,
+    candidate: &BundleCandidate,
+) -> Result<ActiveBundle> {
+    let mut verifier = state.verifier.lock().await;
+    activate_bundle(
+        &state.config,
+        &candidate.bytes,
+        candidate.origin_cache.bundle_sha256,
+        wall_clock_ms(),
+        &mut verifier,
+    )
+}
+
+fn remember_unavailable_candidate(
+    pending: &mut Option<(ActiveBundle, HashMap<String, OriginCacheState>)>,
+    bundle_url: &Url,
+    origin_cache: OriginCacheState,
+    candidate: ActiveBundle,
+) {
+    let candidate_origin_caches = HashMap::from([(bundle_url.to_string(), origin_cache)]);
+    match pending.as_mut() {
+        Some((current, current_origin_caches))
+            if current.bundle_sha256 == candidate.bundle_sha256 =>
+        {
+            current_origin_caches.extend(candidate_origin_caches);
+        }
+        Some((current, _)) if !candidate_snapshot_advances(&current.output, &candidate.output) => {}
+        _ => *pending = Some((candidate, candidate_origin_caches)),
+    }
+}
+
+fn active_snapshot_requires_fallback(
+    current: &ActiveBundle,
+    unavailable_pending: bool,
+    goal: RefreshGoal,
+    bundle_url: &Url,
+    errors: &mut Vec<String>,
+    active_snapshot_observed: &mut bool,
+) -> bool {
+    if current.output.bundle.nodes.is_empty() {
+        *active_snapshot_observed = true;
+        return true;
+    }
+    if unavailable_pending {
+        errors.push(format!(
+            "{bundle_url}: still serves the active non-empty snapshot"
+        ));
+        return true;
+    }
+    if goal == RefreshGoal::FindChangedSnapshot {
+        *active_snapshot_observed = true;
+        return true;
+    }
+    false
+}
+
+async fn install_active_bundle(
+    state: &ProxyState,
+    candidate: ActiveBundle,
+    origin_caches: HashMap<String, OriginCacheState>,
+) {
+    *state.origin_caches.lock().await = origin_caches;
+    *state.active.write().await = Arc::new(candidate);
 }
 
 fn randomized_bundle_urls(config: &ServeConfig) -> Vec<Url> {
@@ -502,6 +661,14 @@ const fn candidate_snapshot_advances(
     candidate: &VerificationOutput,
 ) -> bool {
     candidate.bundle.created_at_unix_ms > current.bundle.created_at_unix_ms
+}
+
+const fn unavailable_candidate_can_replace(
+    current: &VerificationOutput,
+    unavailable_candidates: usize,
+    origin_count: usize,
+) -> bool {
+    current.bundle.nodes.is_empty() || origin_count != 2 || unavailable_candidates == origin_count
 }
 
 async fn fetch_bundle_origin(
@@ -564,9 +731,20 @@ fn activate_bundle(
     now_unix_ms: i64,
     verifier: &mut Verifier,
 ) -> Result<ActiveBundle> {
-    let output = verifier.verify_bundle(bytes, now_unix_ms, &config.environment)?;
-    let client = pinned_client(&output.bundle.nodes)?;
-    let recipients = recipients_from_verified_bundle(&output)?;
+    let output = match config.hardware_policy.as_deref() {
+        Some(policy) => {
+            verifier.verify_bundle_with_policy(bytes, policy, now_unix_ms, &config.environment)?
+        }
+        None => verifier.verify_bundle(bytes, now_unix_ms, &config.environment)?,
+    };
+    let (client, recipients) = if output.bundle.nodes.is_empty() {
+        (None, None)
+    } else {
+        (
+            Some(pinned_client(&output.bundle.nodes)?),
+            Some(recipients_from_verified_bundle(&output)?),
+        )
+    };
     Ok(ActiveBundle {
         output,
         client,
@@ -628,7 +806,7 @@ async fn proxy_request_inner(
         if request.method() != Method::POST || origin.is_some() {
             return Err((StatusCode::METHOD_NOT_ALLOWED, "invalid refresh request"));
         }
-        let changed = refresh_once(state)
+        let changed = refresh_once(state, RefreshGoal::Routine)
             .await
             .map_err(|_| (StatusCode::BAD_GATEWAY, "bundle refresh failed"))?;
         if wall_clock_ms() >= state.active.read().await.output.bundle.expires_at_unix_ms {
@@ -671,6 +849,12 @@ async fn proxy_request_inner(
     if now_unix_ms >= active.output.bundle.expires_at_unix_ms {
         return Err((StatusCode::SERVICE_UNAVAILABLE, "verified bundle expired"));
     }
+    if active.output.bundle.nodes.is_empty() {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "verified fleet is unavailable",
+        ));
+    }
 
     let (parts, body) = request.into_parts();
     let body = to_bytes(body, MAX_REQUEST_BYTES)
@@ -678,10 +862,17 @@ async fn proxy_request_inner(
         .map_err(|_| (StatusCode::PAYLOAD_TOO_LARGE, "request body is too large"))?;
     if state.config.security != SecurityMode::Tls && is_inference_path(&upstream_path) {
         let client = if state.config.security == SecurityMode::Both {
-            &active.client
+            active.client.as_ref().ok_or((
+                StatusCode::SERVICE_UNAVAILABLE,
+                "verified fleet is unavailable",
+            ))?
         } else {
             &state.config.upstream_client
         };
+        let recipients = active.recipients.as_deref().ok_or((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "verified fleet is unavailable",
+        ))?;
         return e2ee::send(e2ee::RequestContext {
             client,
             upstream_origin: &state.config.upstream,
@@ -689,7 +880,7 @@ async fn proxy_request_inner(
             parts: &parts,
             body,
             bundle_sha256: &active.bundle_sha256,
-            recipients: &active.recipients,
+            recipients,
             now_unix_ms,
         })
         .await;
@@ -698,19 +889,17 @@ async fn proxy_request_inner(
     let client = if state.config.security == SecurityMode::E2ee {
         &state.config.upstream_client
     } else {
-        &active.client
+        active.client.as_ref().ok_or((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "verified fleet is unavailable",
+        ))?
     };
-    send_upstream(client, &state.config.upstream, &parts, &upstream_path, body)
-        .await
-        .map_err(|error| {
-            if error.is_connect() && state.config.security != SecurityMode::E2ee {
-                eprintln!("verified upstream TLS connection failed: {error:#}");
-                (StatusCode::BAD_GATEWAY, VERIFIED_TLS_CONNECTION_ERROR)
-            } else {
-                eprintln!("upstream request failed: {error:#}");
-                (StatusCode::BAD_GATEWAY, "upstream request failed")
-            }
-        })
+    if state.config.security == SecurityMode::E2ee {
+        return send_upstream(client, &state.config.upstream, &parts, &upstream_path, body)
+            .await
+            .map_err(|error| upstream_request_error(&error, false));
+    }
+    send_upstream_with_pin_refresh(state, &active, &parts, &upstream_path, body).await
 }
 
 fn is_inference_path(path: &str) -> bool {
@@ -850,6 +1039,101 @@ async fn send_upstream(
     Ok(response
         .body(Body::from_stream(stream))
         .unwrap_or_else(|_| Response::new(Body::empty())))
+}
+
+async fn send_upstream_with_pin_refresh(
+    state: &ProxyState,
+    active: &ActiveBundle,
+    parts: &axum::http::request::Parts,
+    upstream_path: &str,
+    body: Bytes,
+) -> Result<Response<Body>, (StatusCode, &'static str)> {
+    let client = active.client.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "verified fleet is unavailable",
+    ))?;
+    let first = send_upstream(
+        client,
+        &state.config.upstream,
+        parts,
+        upstream_path,
+        body.clone(),
+    )
+    .await;
+    let error = match first {
+        Ok(response) => return Ok(response),
+        Err(error) if attested_pin_mismatch(&error) => error,
+        Err(error) => return Err(upstream_request_error(&error, true)),
+    };
+
+    // Pin verification fails during the TLS handshake, before HTTP request bytes are sent. A
+    // single verified refresh and retry is therefore safe for every method, including inference.
+    if let Err(refresh_error) = refresh_once(state, RefreshGoal::FindChangedSnapshot).await {
+        eprintln!("bundle refresh after an attested TLS pin mismatch failed: {refresh_error:#}");
+        return Err(upstream_request_error(&error, true));
+    }
+    let refreshed = state.active.read().await.clone();
+    if refreshed.bundle_sha256 == active.bundle_sha256 {
+        return Err(upstream_request_error(&error, true));
+    }
+    let now_unix_ms = wall_clock_ms();
+    if now_unix_ms >= refreshed.output.bundle.expires_at_unix_ms {
+        return Err((StatusCode::SERVICE_UNAVAILABLE, "verified bundle expired"));
+    }
+    if refreshed.output.bundle.nodes.is_empty() {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "verified fleet is unavailable",
+        ));
+    }
+    let client = refreshed.client.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "verified fleet is unavailable",
+    ))?;
+    send_upstream(client, &state.config.upstream, parts, upstream_path, body)
+        .await
+        .map_err(|retry_error| upstream_request_error(&retry_error, true))
+}
+
+fn attested_pin_mismatch(error: &reqwest::Error) -> bool {
+    if !error.is_connect() {
+        return false;
+    }
+    error_contains_attested_pin_mismatch(error)
+}
+
+fn error_contains_attested_pin_mismatch(error: &(dyn std::error::Error + 'static)) -> bool {
+    if matches!(
+        error.downcast_ref::<RustlsError>(),
+        Some(RustlsError::InvalidCertificate(
+            CertificateError::ApplicationVerificationFailure
+        ))
+    ) {
+        return true;
+    }
+    // Hyper nests TLS failures in `io::Error::Custom`, whose inner value is not always returned
+    // by `Error::source`. Read that standard container directly before following other sources.
+    if let Some(io_error) = error.downcast_ref::<std::io::Error>()
+        && let Some(inner) = io_error.get_ref()
+    {
+        return error_contains_attested_pin_mismatch(inner);
+    }
+    error
+        .source()
+        .is_some_and(error_contains_attested_pin_mismatch)
+}
+
+fn upstream_request_error(
+    error: &reqwest::Error,
+    verified_tls: bool,
+) -> (StatusCode, &'static str) {
+    if error.is_connect() && verified_tls {
+        eprintln!("verified upstream TLS connection failed: {error:#}");
+        (StatusCode::BAD_GATEWAY, VERIFIED_TLS_CONNECTION_ERROR)
+    } else {
+        eprintln!("upstream request failed: {error:#}");
+        (StatusCode::BAD_GATEWAY, "upstream request failed")
+    }
 }
 
 fn is_local_browser_header(name: &HeaderName) -> bool {
@@ -1157,6 +1441,31 @@ mod tests {
                 "allowed_igvms": [],
                 "created_at": "2026-07-23T16:00:00.000Z",
                 "expires_at": "2026-07-23T16:15:00.000Z",
+                "hardware_policy": {
+                    "policy": {
+                        "amd_sev_snp": [{
+                            "cpuid_family": 25,
+                            "cpuid_model": 1,
+                            "cpuid_stepping": 1,
+                            "forbidden_platform_info_mask": "0x0000000000000001",
+                            "minimum_tcb": {"bootloader": 4, "microcode": 222, "snp": 29, "tee": 0},
+                            "product": "Milan",
+                            "report_version": 5,
+                            "required_current_mitigation_mask": "0x000000000000000b",
+                            "required_launch_mitigation_mask": "0x000000000000000b",
+                            "required_platform_info_mask": "0x0000000000000024"
+                        }],
+                        "schema": "stogas.hardware-policy.v1",
+                        "sequence": 2
+                    },
+                    "stogas_signature": {
+                        "algorithm": "Ed25519",
+                        "key_id": "test",
+                        "schema": "stogas.hardware-policy.signature.v1",
+                        "signature": "test",
+                        "signed": "hardware-policy.json"
+                    }
+                },
                 "nodes": [],
                 "schema": "stogas.confidential-bundle.v1",
                 "sequence": 1,
@@ -1185,6 +1494,12 @@ mod tests {
                 created_at_unix_ms: 0,
                 expires_at_unix_ms,
                 excluded_nodes: Vec::new(),
+                hardware_policy: stogas_verifier::VerifiedHardwarePolicy {
+                    sequence: 1,
+                    sha256: "00".repeat(32),
+                    source: stogas_verifier::HardwarePolicySource::StogasBundle,
+                    stogas_signing_key_id: Some("test".into()),
+                },
                 releases: Vec::new(),
                 nodes: vec![node],
                 original,
@@ -1337,8 +1652,8 @@ mod tests {
         ProxyState {
             active: RwLock::new(Arc::new(ActiveBundle {
                 output,
-                client,
-                recipients,
+                client: Some(client),
+                recipients: Some(recipients),
                 bundle_sha256: bundle_sha256(bundle),
             })),
             origin_caches: Mutex::new(HashMap::new()),
@@ -1351,6 +1666,7 @@ mod tests {
                     bundle_refresh_interval: Duration::from_mins(1),
                     security: SecurityMode::Tls,
                     browser_origin,
+                    hardware_policy: None,
                     protect_loopback_path: false,
                 })
                 .unwrap(),
@@ -1522,13 +1838,56 @@ mod tests {
         node.report_data.accepted_cert_sha256 = vec!["11".repeat(32)];
         let address = tls_server(certificate, 1).await;
         let client = pinned_client_with_roots(&[node], roots(ca)).unwrap();
-        assert!(
-            client
-                .get(format!("https://localhost:{}/v1/test", address.port()))
-                .send()
-                .await
-                .is_err()
-        );
+        let error = client
+            .get(format!("https://localhost:{}/v1/test", address.port()))
+            .send()
+            .await
+            .unwrap_err();
+        assert!(attested_pin_mismatch(&error));
+    }
+
+    #[tokio::test]
+    async fn does_not_treat_a_tls_protocol_failure_as_a_pin_mismatch() {
+        let certificate = test_certificate();
+        let ca = certificate.ca.clone();
+        let node = certificate.node.clone();
+        let address = tls_server_with_provider(certificate, 1, classical_tls_provider()).await;
+        let client = pinned_client_with_roots(&[node], roots(ca)).unwrap();
+        let error = client
+            .get(format!("https://localhost:{}/v1/test", address.port()))
+            .send()
+            .await
+            .unwrap_err();
+        assert!(!attested_pin_mismatch(&error));
+    }
+
+    #[tokio::test]
+    async fn does_not_treat_webpki_or_network_failures_as_attested_pin_mismatches() {
+        let certificate = test_certificate();
+        let node = certificate.node.clone();
+        let address = tls_server(certificate, 1).await;
+        let unrelated_ca = test_certificate().ca;
+        let client =
+            pinned_client_with_roots(std::slice::from_ref(&node), roots(unrelated_ca)).unwrap();
+        let webpki_error = client
+            .get(format!("https://localhost:{}/v1/test", address.port()))
+            .send()
+            .await
+            .unwrap_err();
+        assert!(!attested_pin_mismatch(&webpki_error));
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let unavailable = listener.local_addr().unwrap();
+        drop(listener);
+        let network_ca = test_certificate().ca;
+        let client =
+            pinned_client_with_roots(std::slice::from_ref(&node), roots(network_ca)).unwrap();
+        let network_error = client
+            .get(format!("https://localhost:{}/v1/test", unavailable.port()))
+            .send()
+            .await
+            .unwrap_err();
+        assert!(!attested_pin_mismatch(&network_error));
     }
 
     #[tokio::test]
@@ -1616,6 +1975,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn verified_empty_fleet_rejects_requests() {
+        let state = proxy_state(
+            test_http_client(),
+            "https://api.example",
+            "https://evidence.example/bundles/latest.json",
+            i64::MAX,
+        );
+        {
+            let mut active = state.active.write().await;
+            let mut output = active.output.clone();
+            output.bundle.nodes.clear();
+            let bundle_sha256 = active.bundle_sha256;
+            *active = Arc::new(ActiveBundle {
+                output,
+                client: None,
+                recipients: None,
+                bundle_sha256,
+            });
+        }
+        let request = Request::builder()
+            .uri("/v1/models")
+            .header(header::HOST, "127.0.0.1:8787")
+            .body(Body::empty())
+            .unwrap();
+
+        assert_eq!(
+            proxy_request_inner(&state, request).await.unwrap_err(),
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "verified fleet is unavailable"
+            )
+        );
+    }
+
+    #[tokio::test]
     async fn browser_access_requires_exact_origin_and_capability_and_handles_preflight() {
         let state = proxy_state_with_browser(
             test_http_client(),
@@ -1692,7 +2086,7 @@ mod tests {
         );
         let before = state.active.read().await.output.bundle.sequence;
 
-        assert!(refresh_once(&state).await.is_err());
+        assert!(refresh_once(&state, RefreshGoal::Routine).await.is_err());
         assert_eq!(state.active.read().await.output.bundle.sequence, before);
     }
 
@@ -1725,6 +2119,7 @@ mod tests {
                 bundle_refresh_interval: Duration::from_mins(1),
                 security: SecurityMode::Tls,
                 browser_origin: None,
+                hardware_policy: None,
                 protect_loopback_path: false,
             })
             .is_err()
@@ -1755,6 +2150,21 @@ mod tests {
         );
         assert!(secure_browser_origin("http://client.example").is_err());
         assert!(secure_browser_origin("https://client.example/path").is_err());
+
+        assert!(
+            ServeConfig::new(ServeConfigInput {
+                bundle_url: "https://evidence.example",
+                upstream: "https://api.example",
+                listen: "127.0.0.1:8787",
+                environment: Environment::stogas(),
+                bundle_refresh_interval: Duration::ZERO,
+                security: SecurityMode::Tls,
+                browser_origin: None,
+                hardware_policy: None,
+                protect_loopback_path: false,
+            })
+            .is_err()
+        );
     }
 
     #[test]
@@ -1769,12 +2179,17 @@ mod tests {
     fn replacement_fetch_uses_the_interval_or_the_safe_expiry_lead() {
         let output = test_output(1_000_000);
         assert_eq!(
-            replacement_refresh_at_with_lead(&output, 100_000, Duration::from_mins(1), 70,),
+            replacement_refresh_at_with_policy(&output, 100_000, Duration::from_mins(1), 70, 100,),
             160_000
         );
         for _ in 0..100 {
+            let delay_seconds =
+                (replacement_refresh_at(&output, 100_000, Duration::from_mins(5)) - 100_000) / 1000;
+            assert!((270..=330).contains(&delay_seconds));
+        }
+        for _ in 0..100 {
             let lead_seconds = (output.bundle.expires_at_unix_ms
-                - replacement_refresh_at(&output, 100_000, Duration::from_mins(15)))
+                - replacement_refresh_at(&output, 100_000, Duration::from_mins(30)))
                 / 1000;
             assert!(
                 (MIN_BUNDLE_REFRESH_LEAD_SECONDS..=MAX_BUNDLE_REFRESH_LEAD_SECONDS)
@@ -1782,9 +2197,90 @@ mod tests {
             );
         }
         assert_eq!(
-            replacement_refresh_at_with_lead(&output, 950_000, Duration::from_secs(1), 70),
+            replacement_refresh_at_with_policy(&output, 950_000, Duration::from_secs(1), 70, 100,),
             954_000
         );
+
+        let mut unavailable = output;
+        unavailable.bundle.nodes.clear();
+        for _ in 0..100 {
+            let delay_seconds =
+                (replacement_refresh_at(&unavailable, 100_000, Duration::from_mins(15)) - 100_000)
+                    / 1000;
+            assert!(
+                (MIN_REFRESH_RETRY_SECONDS..=MAX_REFRESH_RETRY_SECONDS)
+                    .contains(&u64::try_from(delay_seconds).unwrap())
+            );
+        }
+    }
+
+    #[test]
+    fn recovery_refresh_matrix_never_trusts_replacements_before_the_cutoff_bundle() {
+        let old = test_output(900_000);
+        let mut cutoff = old.clone();
+        cutoff.bundle.sequence = 2;
+        cutoff.bundle.created_at_unix_ms = 120_000;
+        cutoff.bundle.nodes[0].node_id = "replacement-a".into();
+        let mut replacement_b = cutoff.bundle.nodes[0].clone();
+        replacement_b.node_id = "replacement-b".into();
+        cutoff.bundle.nodes.push(replacement_b);
+
+        assert!(!bundle_trusts_node(&old, "replacement-a"));
+        assert!(!bundle_trusts_node(&old, "replacement-b"));
+        assert!(bundle_trusts_node(&cutoff, "replacement-a"));
+        assert!(bundle_trusts_node(&cutoff, "replacement-b"));
+        assert!(!bundle_trusts_node(&cutoff, "late-replacement"));
+
+        let published_at = 120_000;
+        for interval_seconds in [60_i64, 300, 900] {
+            for phase_seconds in 1..=interval_seconds {
+                for interval_percent in [90, 100, 110] {
+                    let activation_at = first_scheduled_refresh_at_or_after(
+                        &old,
+                        published_at,
+                        published_at - phase_seconds * 1_000,
+                        Duration::from_secs(u64::try_from(interval_seconds).unwrap()),
+                        interval_percent,
+                    );
+                    assert!(
+                        (published_at..=840_000).contains(&activation_at),
+                        "interval={interval_seconds}s phase={phase_seconds}s jitter={interval_percent}% activation={activation_at}"
+                    );
+                    assert!(!bundle_trusts_node(&old, "replacement-a"));
+                    assert!(bundle_trusts_node(&cutoff, "replacement-a"));
+                }
+            }
+        }
+    }
+
+    fn first_scheduled_refresh_at_or_after(
+        active: &VerificationOutput,
+        published_at: i64,
+        mut refreshed_at: i64,
+        interval: Duration,
+        interval_percent: i64,
+    ) -> i64 {
+        loop {
+            let next = replacement_refresh_at_with_policy(
+                active,
+                refreshed_at,
+                interval,
+                60,
+                interval_percent,
+            );
+            if next >= published_at {
+                return next;
+            }
+            refreshed_at = next;
+        }
+    }
+
+    fn bundle_trusts_node(output: &VerificationOutput, node_id: &str) -> bool {
+        output
+            .bundle
+            .nodes
+            .iter()
+            .any(|node| node.node_id == node_id)
     }
 
     #[test]
@@ -1795,6 +2291,49 @@ mod tests {
         };
         assert_eq!(cache.bundle_sha256, bundle_sha256(b"same bundle"));
         assert_ne!(cache.bundle_sha256, bundle_sha256(b"new bundle"));
+    }
+
+    #[test]
+    fn empty_replacement_requires_both_official_origins_when_trust_is_active() {
+        let mut current = test_output(i64::MAX);
+        assert!(!unavailable_candidate_can_replace(&current, 1, 2));
+        assert!(unavailable_candidate_can_replace(&current, 2, 2));
+        assert!(unavailable_candidate_can_replace(&current, 1, 1));
+
+        current.bundle.nodes.clear();
+        assert!(unavailable_candidate_can_replace(&current, 1, 2));
+    }
+
+    #[test]
+    fn pin_mismatch_refresh_checks_the_fallback_after_an_unchanged_origin() {
+        let current = ActiveBundle {
+            output: test_output(i64::MAX),
+            client: None,
+            recipients: None,
+            bundle_sha256: [0x11; 32],
+        };
+        let url = Url::parse("https://evidence.example/bundles/latest.json").unwrap();
+        let mut errors = Vec::new();
+        let mut observed = false;
+        assert!(!active_snapshot_requires_fallback(
+            &current,
+            false,
+            RefreshGoal::Routine,
+            &url,
+            &mut errors,
+            &mut observed,
+        ));
+        assert!(!observed);
+
+        assert!(active_snapshot_requires_fallback(
+            &current,
+            false,
+            RefreshGoal::FindChangedSnapshot,
+            &url,
+            &mut errors,
+            &mut observed,
+        ));
+        assert!(observed);
     }
 
     #[test]

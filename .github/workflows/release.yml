@@ -16,6 +16,7 @@ jobs:
   metadata:
     name: Validate release version
     runs-on: ubuntu-24.04
+    timeout-minutes: 10
     outputs:
       version: ${{ steps.version.outputs.version }}
     steps:
@@ -32,7 +33,7 @@ jobs:
           test "$(node -p "require('./package.json').version")" = "$version"
           test "$(node -p "require('./packages/offline-sigstore/package.json').version")" = "$version"
           test "$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n1)" = "$version"
-          test "$(sed -n 's/^version = "\([^"]*\)"/\1/p' bindings/python/Cargo.toml | head -n1 || true)" = ""
+          test "$(sed -n 's/^version = "\([^"]*\)"/\1/p' bindings/python/Cargo.toml | head -n1)" = ""
           printf 'version=%s\n' "$version" >> "$GITHUB_OUTPUT"
 
   native:
@@ -67,6 +68,7 @@ jobs:
             target: x86_64-pc-windows-msvc
             archive: zip
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
         with:
@@ -136,6 +138,7 @@ jobs:
             platform: windows-amd64
             target: x86_64-pc-windows-gnu
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
         with:
@@ -188,6 +191,7 @@ jobs:
             target: x64
             manylinux: 'off'
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
         with:
@@ -246,6 +250,7 @@ jobs:
     name: npm/WASM packages
     needs: [metadata, verify]
     runs-on: ubuntu-24.04
+    timeout-minutes: 35
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
         with:
@@ -314,6 +319,7 @@ jobs:
     name: Rust crate packages
     needs: [metadata, verify]
     runs-on: ubuntu-24.04
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
         with:
@@ -352,6 +358,7 @@ jobs:
     name: Publish immutable Go module tag
     needs: [crates, go-native, metadata, native, python, verify, wasm]
     runs-on: ubuntu-24.04
+    timeout-minutes: 30
     permissions:
       attestations: write
       contents: write
@@ -380,7 +387,10 @@ jobs:
           cp LICENSE go/LICENSE
           cmp LICENSE go/LICENSE
           (cd go && CGO_ENABLED=1 go test ./...)
-          (cd go/native && find . -type f ! -name SHA256SUMS -printf '%P\n' | LC_ALL=C sort | xargs sha256sum > SHA256SUMS && sha256sum -c SHA256SUMS)
+          checksum_file="$RUNNER_TEMP/go-SHA256SUMS"
+          (cd go/native && find . -type f ! -name SHA256SUMS -printf '%P\0' | LC_ALL=C sort -z | xargs -0 -r sha256sum) > "$checksum_file"
+          mv "$checksum_file" go/native/SHA256SUMS
+          (cd go/native && sha256sum -c SHA256SUMS)
           if git rev-parse "$go_tag" >/dev/null 2>&1; then
             git show "$go_tag^{commit}:go/native/SHA256SUMS" > "$RUNNER_TEMP/published-go-SHA256SUMS"
             diff -u "$RUNNER_TEMP/published-go-SHA256SUMS" go/native/SHA256SUMS
@@ -414,6 +424,7 @@ jobs:
     name: Create attested draft release
     needs: [crates, go-module, metadata, native, python, wasm]
     runs-on: ubuntu-24.04
+    timeout-minutes: 20
     permissions:
       attestations: write
       contents: write
@@ -445,9 +456,10 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          cd dist
-          find . -maxdepth 1 -type f ! -name SHA256SUMS -printf '%P\n' | LC_ALL=C sort | xargs sha256sum > SHA256SUMS
-          sha256sum -c SHA256SUMS
+          checksum_file="$RUNNER_TEMP/release-SHA256SUMS"
+          (cd dist && find . -maxdepth 1 -type f ! -name SHA256SUMS -printf '%P\0' | LC_ALL=C sort -z | xargs -0 -r sha256sum) > "$checksum_file"
+          mv "$checksum_file" dist/SHA256SUMS
+          (cd dist && sha256sum -c SHA256SUMS)
       - name: Attest every published artifact
         uses: actions/attest-build-provenance@a2bbfa25375fe432b6a289bc6b6cd05ecd0c4c32
         with:

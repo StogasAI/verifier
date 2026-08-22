@@ -9,7 +9,7 @@ use std::{
 };
 use stogas::SecurityMode;
 use stogas_verifier::{
-    MAX_INPUT_BYTES, VerificationOutput, Verifier, response_proof::MAX_PROOF_BYTES, verify_bundle,
+    MAX_INPUT_BYTES, VerificationOutput, Verifier, response_proof::MAX_PROOF_BYTES,
 };
 use tokio::io::AsyncReadExt as _;
 
@@ -21,6 +21,19 @@ const MAX_PROOF_INPUT_BYTES: usize = MAX_PROOF_BYTES * 2;
 enum InternalTrustTarget {
     Production,
     Staging,
+}
+
+#[cfg(feature = "staging")]
+fn verifier_environment(target: InternalTrustTarget) -> stogas_verifier::Environment {
+    match target {
+        InternalTrustTarget::Production => stogas_verifier::Environment::stogas(),
+        InternalTrustTarget::Staging => stogas_verifier::Environment::staging(),
+    }
+}
+
+#[cfg(not(feature = "staging"))]
+fn verifier_environment() -> stogas_verifier::Environment {
+    stogas_verifier::Environment::stogas()
 }
 
 #[derive(Parser)]
@@ -40,6 +53,26 @@ struct ProofCommandInput {
     e2ee_transcript_sha256: Option<String>,
     json: bool,
     now_unix_ms: Option<i64>,
+    policy: Option<PathBuf>,
+}
+
+struct VerifyCommandInput {
+    bundle: PathBuf,
+    policy: Option<PathBuf>,
+    json: bool,
+    now_unix_ms: Option<i64>,
+    environment: stogas_verifier::Environment,
+}
+
+struct ServeCommandInput {
+    bundle_url: String,
+    upstream: String,
+    listen: String,
+    environment: stogas_verifier::Environment,
+    bundle_refresh_seconds: u64,
+    security: Option<SecurityMode>,
+    browser_origin: Option<String>,
+    policy: Option<PathBuf>,
 }
 
 #[derive(Subcommand)]
@@ -48,6 +81,9 @@ enum Command {
     Verify {
         /// Bundle path, or `-` for stdin.
         bundle: PathBuf,
+        /// Caller-owned hardware appraisal policy. This replaces only mutable AMD security rules.
+        #[arg(long)]
+        policy: Option<PathBuf>,
         /// Emit stable JSON.
         #[arg(long)]
         json: bool,
@@ -72,6 +108,9 @@ enum Command {
         /// Currently valid bundle used for the request.
         #[arg(long, required_unless_present = "ledger", conflicts_with = "ledger")]
         bundle: Option<PathBuf>,
+        /// Caller-owned hardware appraisal policy for current-bundle verification.
+        #[arg(long, conflicts_with = "ledger")]
+        policy: Option<PathBuf>,
         /// Immutable historical node-ledger record.
         #[arg(long, required_unless_present = "bundle", conflicts_with = "bundle")]
         ledger: Option<PathBuf>,
@@ -96,7 +135,7 @@ enum Command {
         upstream: String,
         #[arg(long, default_value = "127.0.0.1:8787")]
         listen: String,
-        /// How often to fetch and verify the latest bundle.
+        /// Bundle refresh target in seconds. Scheduled attempts use ±10% jitter.
         #[arg(long, default_value_t = 300, value_parser = clap::value_parser!(u64).range(1..))]
         bundle_refresh_seconds: u64,
         /// Protect inference with verified TLS, application E2EE, or both.
@@ -105,6 +144,9 @@ enum Command {
         /// Allow one browser origin and print a capability-protected browser base URL.
         #[arg(long)]
         browser_origin: Option<String>,
+        /// Caller-owned hardware appraisal policy.
+        #[arg(long)]
+        policy: Option<PathBuf>,
         /// Internal trust environment. Not compiled into public CLI releases.
         #[cfg(feature = "staging")]
         #[arg(long, hide = true, value_enum, default_value_t = InternalTrustTarget::Production)]
@@ -117,43 +159,31 @@ async fn main() -> Result<()> {
     match Cli::parse().command {
         Command::Verify {
             bundle,
+            policy,
             json,
             now_unix_ms,
             #[cfg(feature = "staging")]
             target,
         } => {
-            let bytes = if bundle.as_os_str() == "-" {
-                let mut input = Vec::new();
-                std::io::stdin()
-                    .take(u64::try_from(MAX_INPUT_BYTES + 1)?)
-                    .read_to_end(&mut input)?;
-                if input.len() > MAX_INPUT_BYTES {
-                    bail!("bundle exceeds {MAX_INPUT_BYTES} bytes");
-                }
-                input
-            } else {
-                read_bounded_file(&bundle, MAX_INPUT_BYTES, "bundle").await?
-            };
-            let output = verify_bundle(&bytes, now_unix_ms.unwrap_or_else(wall_clock_ms), &{
+            let environment = verifier_environment(
                 #[cfg(feature = "staging")]
-                {
-                    match target {
-                        InternalTrustTarget::Production => stogas_verifier::Environment::stogas(),
-                        InternalTrustTarget::Staging => stogas_verifier::Environment::staging(),
-                    }
-                }
-                #[cfg(not(feature = "staging"))]
-                {
-                    stogas_verifier::Environment::stogas()
-                }
-            })?;
-            print_output(&output, json)?;
+                target,
+            );
+            run_verify(VerifyCommandInput {
+                bundle,
+                policy,
+                json,
+                now_unix_ms,
+                environment,
+            })
+            .await?;
         }
         Command::Proof {
             proof,
             request,
             response,
             bundle,
+            policy,
             ledger,
             catalog,
             e2ee_transcript_sha256,
@@ -170,6 +200,7 @@ async fn main() -> Result<()> {
                 e2ee_transcript_sha256,
                 json,
                 now_unix_ms,
+                policy,
             })
             .await?;
         }
@@ -180,36 +211,75 @@ async fn main() -> Result<()> {
             bundle_refresh_seconds,
             security,
             browser_origin,
+            policy,
             #[cfg(feature = "staging")]
             target,
         } => {
-            serve(
+            let environment = verifier_environment(
+                #[cfg(feature = "staging")]
+                target,
+            );
+            run_serve(ServeCommandInput {
                 bundle_url,
                 upstream,
                 listen,
-                {
-                    #[cfg(feature = "staging")]
-                    {
-                        match target {
-                            InternalTrustTarget::Production => {
-                                stogas_verifier::Environment::stogas()
-                            }
-                            InternalTrustTarget::Staging => stogas_verifier::Environment::staging(),
-                        }
-                    }
-                    #[cfg(not(feature = "staging"))]
-                    {
-                        stogas_verifier::Environment::stogas()
-                    }
-                },
+                environment,
                 bundle_refresh_seconds,
                 security,
                 browser_origin,
-            )
+                policy,
+            })
             .await?;
         }
     }
     Ok(())
+}
+
+async fn run_verify(input: VerifyCommandInput) -> Result<()> {
+    let bytes = if input.bundle.as_os_str() == "-" {
+        let mut bytes = Vec::new();
+        std::io::stdin()
+            .take(u64::try_from(MAX_INPUT_BYTES + 1)?)
+            .read_to_end(&mut bytes)?;
+        if bytes.len() > MAX_INPUT_BYTES {
+            bail!("bundle exceeds {MAX_INPUT_BYTES} bytes");
+        }
+        bytes
+    } else {
+        read_bounded_file(&input.bundle, MAX_INPUT_BYTES, "bundle").await?
+    };
+    let policy = match input.policy {
+        Some(path) => Some(read_bounded_file(&path, MAX_INPUT_BYTES, "hardware policy").await?),
+        None => None,
+    };
+    let mut verifier = Verifier::default();
+    let now = input.now_unix_ms.unwrap_or_else(wall_clock_ms);
+    let output = match policy.as_deref() {
+        Some(policy) => {
+            verifier.verify_bundle_with_policy(&bytes, policy, now, &input.environment)?
+        }
+        None => verifier.verify_bundle(&bytes, now, &input.environment)?,
+    };
+    print_output(&output, input.json)
+}
+
+async fn run_serve(input: ServeCommandInput) -> Result<()> {
+    let hardware_policy = match input.policy {
+        Some(path) => Some(read_bounded_file(&path, MAX_INPUT_BYTES, "hardware policy").await?),
+        None => None,
+    };
+    let security = resolved_security(input.security, input.browser_origin.as_deref());
+    stogas::serve(stogas::ServeOptions {
+        bundle_url: input.bundle_url,
+        upstream: input.upstream,
+        listen: input.listen,
+        environment: input.environment,
+        bundle_refresh_interval: Duration::from_secs(input.bundle_refresh_seconds),
+        security,
+        browser_origin: input.browser_origin,
+        hardware_policy,
+    })
+    .await
 }
 
 async fn run_proof(input: ProofCommandInput) -> Result<()> {
@@ -220,7 +290,20 @@ async fn run_proof(input: ProofCommandInput) -> Result<()> {
     let mut verifier = Verifier::default();
     let output = if let Some(bundle) = input.bundle {
         let bundle = read_bounded_file(&bundle, MAX_INPUT_BYTES, "bundle").await?;
-        verifier.verify_bundle(&bundle, now, &stogas_verifier::Environment::stogas())?;
+        match input.policy {
+            Some(policy) => {
+                let policy = read_bounded_file(&policy, MAX_INPUT_BYTES, "hardware policy").await?;
+                verifier.verify_bundle_with_policy(
+                    &bundle,
+                    &policy,
+                    now,
+                    &stogas_verifier::Environment::stogas(),
+                )?;
+            }
+            None => {
+                verifier.verify_bundle(&bundle, now, &stogas_verifier::Environment::stogas())?;
+            }
+        }
         verifier.verify_response_proof_hashes(
             &proof,
             &request_sha256,
@@ -309,27 +392,6 @@ async fn read_bounded_file(path: &PathBuf, maximum: usize, label: &str) -> Resul
         bail!("{label} exceeds {maximum} bytes");
     }
     Ok(bytes)
-}
-
-async fn serve(
-    bundle_url: String,
-    upstream: String,
-    listen: String,
-    environment: stogas_verifier::Environment,
-    bundle_refresh_seconds: u64,
-    security: Option<SecurityMode>,
-    browser_origin: Option<String>,
-) -> Result<()> {
-    stogas::serve(
-        &bundle_url,
-        &upstream,
-        &listen,
-        environment,
-        Duration::from_secs(bundle_refresh_seconds),
-        resolved_security(security, browser_origin.as_deref()),
-        browser_origin.as_deref(),
-    )
-    .await
 }
 
 fn resolved_security(

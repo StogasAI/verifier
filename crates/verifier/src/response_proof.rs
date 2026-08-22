@@ -14,7 +14,7 @@ pub const SCHEMA_V1: &str = "stogas.response-proof.v1";
 /// Maximum serialized response-proof size.
 pub const MAX_PROOF_BYTES: usize = 8 * 1024;
 /// Maximum request or response body accepted by one-shot proof verification.
-pub const MAX_BODY_BYTES: usize = 64 * 1024 * 1024;
+pub const MAX_BODY_BYTES: usize = 128 * 1024 * 1024;
 
 const SIGNATURE_DOMAIN: &[u8] = b"stogas.response-proof.v1\0";
 const MAX_CATALOG_ID_BYTES: usize = 128;
@@ -480,8 +480,9 @@ fn is_lower_hex(value: &str, bytes: usize) -> bool {
 mod tests {
     use super::*;
     use crate::{
-        AllowedCatalog, BundleEnvelope, CatalogIdentity, DrandBeacon, ReleaseProvenance,
-        ReportData, VerifiedBundle, VerifiedCatalogRelease, VerifiedNode,
+        AllowedCatalog, BundleEnvelope, CatalogIdentity, DrandBeacon, HardwarePolicySource,
+        ReleaseProvenance, ReportData, VerifiedBundle, VerifiedCatalogRelease,
+        VerifiedHardwarePolicy, VerifiedNode,
     };
     use ed25519_dalek::{Signer as _, SigningKey};
     use serde_json::json;
@@ -555,6 +556,31 @@ mod tests {
                 "allowed_igvms": [],
                 "created_at": "2026-07-23T16:00:00.000Z",
                 "expires_at": "2026-07-23T16:15:00.000Z",
+                "hardware_policy": {
+                    "policy": {
+                        "amd_sev_snp": [{
+                            "cpuid_family": 25,
+                            "cpuid_model": 1,
+                            "cpuid_stepping": 1,
+                            "forbidden_platform_info_mask": "0x0000000000000001",
+                            "minimum_tcb": {"bootloader": 4, "microcode": 222, "snp": 29, "tee": 0},
+                            "product": "Milan",
+                            "report_version": 5,
+                            "required_current_mitigation_mask": "0x000000000000000b",
+                            "required_launch_mitigation_mask": "0x000000000000000b",
+                            "required_platform_info_mask": "0x0000000000000024"
+                        }],
+                        "schema": "stogas.hardware-policy.v1",
+                        "sequence": 2
+                    },
+                    "stogas_signature": {
+                        "algorithm": "Ed25519",
+                        "key_id": "test",
+                        "schema": "stogas.hardware-policy.signature.v1",
+                        "signature": "test",
+                        "signed": "hardware-policy.json"
+                    }
+                },
                 "nodes": [],
                 "schema": "stogas.confidential-bundle.v1",
                 "sequence": 1,
@@ -583,6 +609,12 @@ mod tests {
                 created_at_unix_ms: NOW - 60_000,
                 expires_at_unix_ms: NOW + 15 * 60_000,
                 excluded_nodes: Vec::new(),
+                hardware_policy: VerifiedHardwarePolicy {
+                    sequence: 1,
+                    sha256: "00".repeat(32),
+                    source: HardwarePolicySource::StogasBundle,
+                    stogas_signing_key_id: Some("test".into()),
+                },
                 releases: Vec::new(),
                 nodes: vec![node],
                 original,

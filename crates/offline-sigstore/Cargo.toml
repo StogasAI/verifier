@@ -43,3 +43,7 @@ sigstore-verify = { version = "=0.11.0", default-features = false }
 
 [lints]
 workspace = true
+
+[package.metadata.cargo-machete]
+# The rustls-webpki package exposes its Rust library under the webpki crate name.
+ignored = ["rustls-webpki"]

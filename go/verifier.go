@@ -17,6 +17,7 @@ typedef struct StogasTransport StogasTransport;
 StogasVerifier *stogas_verifier_new(void);
 void stogas_verifier_free(StogasVerifier *verifier);
 char *stogas_verifier_verify_bundle(const StogasVerifier *verifier, const uint8_t *bundle, size_t bundle_len, int64_t now_unix_ms);
+char *stogas_verifier_verify_bundle_with_policy(const StogasVerifier *verifier, const uint8_t *bundle, size_t bundle_len, const uint8_t *policy, size_t policy_len, int64_t now_unix_ms);
 char *stogas_verifier_verify_response_proof(const StogasVerifier *verifier, const uint8_t *proof, size_t proof_len, const uint8_t *request_body, size_t request_body_len, const uint8_t *response_body, size_t response_body_len, const uint8_t *e2ee_transcript_sha256, size_t e2ee_transcript_sha256_len, int64_t now_unix_ms);
 char *stogas_verifier_verify_historical_response_proof(const StogasVerifier *verifier, const uint8_t *proof, size_t proof_len, const uint8_t *request_body, size_t request_body_len, const uint8_t *response_body, size_t response_body_len, const uint8_t *ledger, size_t ledger_len, const uint8_t *catalog, size_t catalog_len, const uint8_t *e2ee_transcript_sha256, size_t e2ee_transcript_sha256_len, int64_t now_unix_ms);
 void stogas_verifier_string_free(char *value);
@@ -43,10 +44,11 @@ var ErrTransportClosed = errors.New("stogas transport is closed")
 
 // TransportOptions controls one in-process managed Stogas connection.
 type TransportOptions struct {
-	Security                     string `json:"security,omitempty"`
-	BundleRefreshIntervalSeconds uint64 `json:"bundle_refresh_interval_seconds,omitempty"`
-	BaseURL                      string `json:"base_url,omitempty"`
-	BundleURL                    string `json:"bundle_url,omitempty"`
+	Security                     string          `json:"security,omitempty"`
+	BundleRefreshIntervalSeconds uint64          `json:"bundle_refresh_interval_seconds,omitempty"`
+	BaseURL                      string          `json:"base_url,omitempty"`
+	BundleURL                    string          `json:"bundle_url,omitempty"`
+	HardwarePolicy               json.RawMessage `json:"hardware_policy,omitempty"`
 }
 
 // Transport owns bundle refresh, attested TLS, E2EE, and streaming in the native Rust core.
@@ -147,6 +149,32 @@ func New() (*Verifier, error) {
 // VerifyBundle verifies using one captured platform wall-clock value.
 func (verifier *Verifier) VerifyBundle(bundle []byte) (json.RawMessage, error) {
 	return verifier.verifyBundleAt(bundle, time.Now().UnixMilli())
+}
+
+// VerifyBundleWithPolicy verifies a bundle with caller-owned hardware appraisal rules.
+func (verifier *Verifier) VerifyBundleWithPolicy(bundle, policy []byte) (json.RawMessage, error) {
+	return verifier.verifyBundleWithPolicyAt(bundle, policy, time.Now().UnixMilli())
+}
+
+func (verifier *Verifier) verifyBundleWithPolicyAt(bundle, policy []byte, nowUnixMS int64) (json.RawMessage, error) {
+	verifier.mu.Lock()
+	defer verifier.mu.Unlock()
+	if verifier.handle == nil {
+		return nil, ErrClosed
+	}
+	response := C.stogas_verifier_verify_bundle_with_policy(
+		verifier.handle,
+		bytePointer(bundle),
+		C.size_t(len(bundle)),
+		bytePointer(policy),
+		C.size_t(len(policy)),
+		C.int64_t(nowUnixMS),
+	)
+	var output json.RawMessage
+	if err := decodeResponse(response, &output); err != nil {
+		return nil, err
+	}
+	return output, nil
 }
 
 func (verifier *Verifier) verifyBundleAt(bundle []byte, nowUnixMS int64) (json.RawMessage, error) {
@@ -275,6 +303,16 @@ func VerifyBundle(bundle []byte) (json.RawMessage, error) {
 	}
 	defer verifier.Close()
 	return verifier.VerifyBundle(bundle)
+}
+
+// VerifyBundleWithPolicy verifies once with caller-owned hardware appraisal rules.
+func VerifyBundleWithPolicy(bundle, policy []byte) (json.RawMessage, error) {
+	verifier, err := New()
+	if err != nil {
+		return nil, err
+	}
+	defer verifier.Close()
+	return verifier.VerifyBundleWithPolicy(bundle, policy)
 }
 
 type abiResponse struct {

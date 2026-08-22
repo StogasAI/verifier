@@ -41,8 +41,5 @@ thiserror.workspace = true
 x509-parser = { version = "0.18.0" }
 zeroize.workspace = true
 
-[dev-dependencies]
-pretty_assertions = "1.4.1"
-
 [lints]
 workspace = true

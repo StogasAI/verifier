@@ -6,6 +6,7 @@ use stogas_sdk::{SecurityMode, Transport as ManagedTransport, TransportOptions};
 use stogas_verifier::{
     Environment, HistoricalResponseProofInput, Verifier as CoreVerifier,
     verify_bundle as verify_core_bundle,
+    verify_bundle_with_policy as verify_core_bundle_with_policy,
 };
 
 #[pyclass(name = "Verifier")]
@@ -26,13 +27,15 @@ impl PythonTransport {
         security = "tls",
         bundle_refresh_interval_seconds = 300,
         base_url = None,
-        bundle_url = None
+        bundle_url = None,
+        hardware_policy = None
     ))]
     fn new(
         security: &str,
         bundle_refresh_interval_seconds: u64,
         base_url: Option<String>,
         bundle_url: Option<String>,
+        hardware_policy: Option<Vec<u8>>,
     ) -> PyResult<Self> {
         let defaults = TransportOptions::default();
         let options = TransportOptions {
@@ -47,6 +50,7 @@ impl PythonTransport {
             ),
             base_url: base_url.unwrap_or(defaults.base_url),
             bundle_url: bundle_url.unwrap_or(defaults.bundle_url),
+            hardware_policy,
         };
         let inner = ManagedTransport::start(&options)
             .map_err(|error| PyValueError::new_err(error.to_string()))?;
@@ -90,6 +94,19 @@ impl PythonVerifier {
         bundle: &[u8],
     ) -> PyResult<Bound<'py, PyBytes>> {
         self.verify_bundle_with_time(py, bundle, wall_clock_ms()?)
+    }
+
+    fn verify_bundle_with_policy<'py>(
+        &mut self,
+        py: Python<'py>,
+        bundle: &[u8],
+        policy: &[u8],
+    ) -> PyResult<Bound<'py, PyBytes>> {
+        let output = self
+            .core
+            .verify_bundle_with_policy(bundle, policy, wall_clock_ms()?, &self.environment)
+            .map_err(|error| PyValueError::new_err(error.to_string()))?;
+        json_bytes(py, &output)
     }
 
     #[pyo3(signature = (proof, request_body, response_body, e2ee_transcript_sha256=None))]
@@ -163,6 +180,18 @@ fn verify_bundle<'py>(py: Python<'py>, bundle: &[u8]) -> PyResult<Bound<'py, PyB
     verify_bundle_with_time(py, bundle, wall_clock_ms()?)
 }
 
+#[pyfunction]
+fn verify_bundle_with_policy<'py>(
+    py: Python<'py>,
+    bundle: &[u8],
+    policy: &[u8],
+) -> PyResult<Bound<'py, PyBytes>> {
+    let output =
+        verify_core_bundle_with_policy(bundle, policy, wall_clock_ms()?, &Environment::stogas())
+            .map_err(|error| PyValueError::new_err(error.to_string()))?;
+    json_bytes(py, &output)
+}
+
 fn wall_clock_ms() -> PyResult<i64> {
     i64::try_from(
         SystemTime::now()
@@ -196,5 +225,6 @@ fn json_bytes<'py, T: serde::Serialize>(
 fn _stogas_verifier(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<PythonVerifier>()?;
     module.add_class::<PythonTransport>()?;
-    module.add_function(wrap_pyfunction!(verify_bundle, module)?)
+    module.add_function(wrap_pyfunction!(verify_bundle, module)?)?;
+    module.add_function(wrap_pyfunction!(verify_bundle_with_policy, module)?)
 }

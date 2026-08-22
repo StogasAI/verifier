@@ -18,11 +18,11 @@ var ErrTransportClosed = errors.New("stogas transport is closed")
 
 // TransportOptions mirrors the cgo SDK surface.
 type TransportOptions struct {
-	Staging                      bool
 	Security                     string
 	BundleRefreshIntervalSeconds uint64
 	BaseURL                      string
 	BundleURL                    string
+	HardwarePolicy               json.RawMessage
 }
 
 // Transport is unavailable without cgo.
@@ -57,6 +57,11 @@ func (*Verifier) VerifyBundle([]byte) (json.RawMessage, error) {
 	return nil, ErrNativeLibraryUnavailable
 }
 
+// VerifyBundleWithPolicy reports that the packaged native verifier is unavailable.
+func (*Verifier) VerifyBundleWithPolicy([]byte, []byte) (json.RawMessage, error) {
+	return nil, ErrNativeLibraryUnavailable
+}
+
 // VerifyResponseProof reports that the packaged native verifier is unavailable.
 func (*Verifier) VerifyResponseProof([]byte, []byte, []byte, string) (json.RawMessage, error) {
 	return nil, ErrNativeLibraryUnavailable
@@ -72,5 +77,10 @@ func (*Verifier) Close() error { return nil }
 
 // VerifyBundle reports that the packaged native verifier is unavailable.
 func VerifyBundle([]byte) (json.RawMessage, error) {
+	return nil, ErrNativeLibraryUnavailable
+}
+
+// VerifyBundleWithPolicy reports that the packaged native verifier is unavailable.
+func VerifyBundleWithPolicy([]byte, []byte) (json.RawMessage, error) {
 	return nil, ErrNativeLibraryUnavailable
 }

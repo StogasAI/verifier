@@ -25,7 +25,8 @@ void stogas_verifier_free(StogasVerifier *verifier);
  *   "security": "tls" | "e2ee" | "both",
  *   "bundle_refresh_interval_seconds": 300,
  *   "base_url": "https://api.stogas.ai",
- *   "bundle_url": "https://evidence.stogas.ai/bundles/latest.json"
+ *   "bundle_url": "https://evidence.stogas.ai/bundles/latest.json",
+ *   "hardware_policy": { ... }
  * }
  *
  * Optional fields use the secure production defaults. On success, *transport_out owns a live
@@ -49,6 +50,14 @@ char *stogas_verifier_verify_bundle(
     const StogasVerifier *verifier,
     const uint8_t *bundle,
     size_t bundle_len,
+    int64_t now_unix_ms
+);
+char *stogas_verifier_verify_bundle_with_policy(
+    const StogasVerifier *verifier,
+    const uint8_t *bundle,
+    size_t bundle_len,
+    const uint8_t *policy,
+    size_t policy_len,
     int64_t now_unix_ms
 );
 char *stogas_verifier_verify_response_proof(

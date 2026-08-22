@@ -1,4 +1,4 @@
-//! Shared Stogas E2EE v1 client cryptography and response framing.
+//! Shared Stogas E2EE v1 request cryptography and response framing.
 //!
 //! HTTP runtimes remain thin adapters: they verify and select a bundle, call [`seal_request`],
 //! send the returned JSON to the ordinary inference endpoint, then feed response bytes into
@@ -20,7 +20,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue;
 use sha2::{Digest as _, Sha256};
 use sha2_v11::Sha256 as Sha256V11;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use thiserror::Error;
 use zeroize::{Zeroize as _, Zeroizing};
 
@@ -33,23 +33,26 @@ pub const VERSION: u8 = 1;
 /// Maximum number of independently attested fleet recipients in one request.
 pub const MAX_RECIPIENTS: usize = 64;
 /// Maximum encrypted inner request size.
-pub const MAX_CIPHERTEXT_BYTES: usize = 64 * 1024 * 1024;
+pub const MAX_CIPHERTEXT_BYTES: usize = 94 * 1024 * 1024;
 /// Maximum request acceptance interval allowed by a gateway.
 pub const MAX_ACCEPTANCE_WINDOW_MS: i64 = 2 * 60 * 1_000;
 /// Wall-clock skew accepted by a gateway when evaluating the request deadline.
 pub const CLOCK_SKEW_ALLOWANCE_MS: i64 = 30 * 1_000;
+/// Maximum authenticated plaintext bytes in one encrypted response body.
+pub const MAX_RESPONSE_BODY_BYTES: usize = 65 * 1024 * 1024;
+/// Maximum encrypted response bytes accepted from the network.
+pub const MAX_RESPONSE_WIRE_BYTES: usize = 66 * 1024 * 1024;
 
 const CONTENT_KEY_BYTES: usize = 32;
 const KEY_ID_BYTES: usize = 32;
 const RECIPIENT_PUBLIC_KEY_BYTES: usize = 1_216;
 const RESPONSE_TAG_BYTES: usize = 16;
-const RESPONSE_FRAME_HEADER_BYTES: usize = 13;
+const RESPONSE_RECORD_HEADER_BYTES: usize = 4;
+const RESPONSE_NONCE_BYTES: usize = 12;
 const MAX_RESPONSE_DATA_BYTES: usize = 64 * 1024;
 const MAX_RESPONSE_METADATA_BYTES: usize = 64 * 1024;
-const RESPONSE_FRAME_DATA: u8 = 1;
-const RESPONSE_FRAME_METADATA: u8 = 2;
-const RESPONSE_FRAME_FINAL: u8 = 3;
 const RESPONSE_MAGIC: [u8; 5] = [b'S', b'T', b'G', b'E', VERSION];
+const RESPONSE_PREAMBLE_BYTES: usize = RESPONSE_MAGIC.len() + RESPONSE_NONCE_BYTES;
 
 type Kem = XWing;
 
@@ -65,8 +68,8 @@ pub enum Error {
     /// The encrypted response is malformed, unauthenticated, or out of order.
     #[error("invalid E2EE response: {0}")]
     InvalidResponse(String),
-    /// The response ended without an authenticated terminal frame.
-    #[error("encrypted response ended before its authenticated final frame")]
+    /// The response ended without an authenticated terminal record.
+    #[error("encrypted response ended before its authenticated final record")]
     TruncatedResponse,
 }
 
@@ -75,6 +78,15 @@ pub enum Error {
 pub struct Recipient {
     /// Serialized MLKEM768-X25519 (X-Wing) public key bytes.
     pub public_key: Vec<u8>,
+}
+
+/// Optional provider credential carried only inside the encrypted request.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+pub struct UpstreamCredential<'a> {
+    /// Canonical Stogas provider ID.
+    pub provider: &'a str,
+    /// Provider API key.
+    pub api_key: &'a str,
 }
 
 /// Complete input to one encrypted inference request.
@@ -97,6 +109,8 @@ pub struct Request<'a> {
     pub accept: Option<&'a str>,
     /// Include the compact signed Stogas response fields.
     pub extra_fields: bool,
+    /// Optional pass-through provider credential.
+    pub upstream_credential: Option<UpstreamCredential<'a>>,
     /// Ordinary JSON body for the selected inference endpoint.
     pub body: &'a [u8],
 }
@@ -130,11 +144,11 @@ pub struct ResponseMetadata {
 /// One incrementally authenticated response event.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ResponseEvent {
-    /// First frame containing the inner status, media type, and safe headers.
+    /// First record containing the inner status, media type, and safe headers.
     Metadata(ResponseMetadata),
     /// One body or SSE byte segment.
     Data(Vec<u8>),
-    /// Authenticated clean end of response.
+    /// Authenticated empty record at the clean end of response.
     Final,
 }
 
@@ -171,6 +185,8 @@ struct InnerRequest<'a> {
     accept: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     extra_fields: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    upstream_credential: Option<UpstreamCredential<'a>>,
     body: &'a RawValue,
 }
 
@@ -253,11 +269,12 @@ pub fn seal_request(request: &Request<'_>) -> Result<SealedRequest, Error> {
             api_key: request.api_key,
             accept: request.accept,
             extra_fields: request.extra_fields.then_some(true),
+            upstream_credential: request.upstream_credential,
             body: &raw_body,
         })
         .map_err(|_| Error::InvalidRequest("inner request could not be encoded".into()))?,
     );
-    let (request_cipher, request_nonce, response_cipher, response_nonce) =
+    let (request_cipher, request_nonce, response_cipher) =
         derive_ciphers(content_key.as_ref(), &transcript_hash)?;
     let request_nonce_ref: &Nonce<U12> = request_nonce
         .as_slice()
@@ -312,7 +329,7 @@ pub fn seal_request(request: &Request<'_>) -> Result<SealedRequest, Error> {
         body,
         request_id,
         transcript_sha256: hex::encode(transcript_hash),
-        response: ResponseDecoder::new(response_cipher, response_nonce, transcript_hash),
+        response: ResponseDecoder::new(response_cipher, transcript_hash),
     })
 }
 
@@ -332,18 +349,34 @@ fn validate_request(request: &Request<'_>) -> Result<(), Error> {
             "acceptance deadline exceeds two minutes".into(),
         ));
     }
-    if request.api_key.trim().is_empty() || request.api_key.len() > 4 * 1024 {
+    if !valid_credential(request.api_key) {
         return Err(Error::InvalidRequest(
-            "api_key must be present and at most 4096 bytes".into(),
+            "api_key must contain 1 to 4096 visible ASCII bytes".into(),
         ));
     }
-    reject_header_controls(request.api_key, "api_key")?;
+    if let Some(credential) = request.upstream_credential {
+        if !matches!(credential.provider, "anthropic" | "chutes" | "openai") {
+            return Err(Error::InvalidRequest(
+                "upstream credential provider is invalid".into(),
+            ));
+        }
+        if credential.api_key.is_empty()
+            || credential.api_key.len() > 4 * 1024
+            || !credential
+                .api_key
+                .bytes()
+                .all(|byte| (0x21..=0x7e).contains(&byte))
+        {
+            return Err(Error::InvalidRequest(
+                "upstream credential api_key is invalid".into(),
+            ));
+        }
+    }
     for (name, value, max) in [("accept", request.accept, 256)] {
-        if let Some(value) = value {
-            if value.len() > max {
-                return Err(Error::InvalidRequest(format!("{name} is too large")));
-            }
-            reject_header_controls(value, name)?;
+        if let Some(value) = value
+            && (value.len() > max || !valid_http_field_value(value, false))
+        {
+            return Err(Error::InvalidRequest(format!("{name} is too large")));
         }
     }
     if request.body.is_empty() || request.body.len() > MAX_CIPHERTEXT_BYTES - RESPONSE_TAG_BYTES {
@@ -354,13 +387,40 @@ fn validate_request(request: &Request<'_>) -> Result<(), Error> {
     Ok(())
 }
 
-fn reject_header_controls(value: &str, name: &str) -> Result<(), Error> {
-    if value.bytes().any(|byte| matches!(byte, 0 | b'\r' | b'\n')) {
-        return Err(Error::InvalidRequest(format!(
-            "{name} contains invalid control characters"
-        )));
+fn valid_credential(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 4 * 1024
+        && value.bytes().all(|byte| (0x21..=0x7e).contains(&byte))
+}
+
+fn valid_http_field_value(value: &str, allow_empty: bool) -> bool {
+    if value.is_empty() {
+        return allow_empty;
     }
-    Ok(())
+    value.trim() == value
+        && value
+            .bytes()
+            .all(|byte| byte == b'\t' || (0x20..=0x7e).contains(&byte))
+}
+
+fn valid_http_field_name(value: &str) -> bool {
+    !value.is_empty()
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&byte))
+}
+
+fn valid_content_type(value: &str) -> bool {
+    if value.len() > 256 || !valid_http_field_value(value, false) {
+        return false;
+    }
+    let media_type = value
+        .split_once(';')
+        .map_or(value, |(media_type, _)| media_type);
+    let Some((major, minor)) = media_type.split_once('/') else {
+        return false;
+    };
+    !minor.contains('/') && valid_http_field_name(major) && valid_http_field_name(minor)
 }
 
 fn prepare_recipients(recipients: &[Recipient]) -> Result<Vec<PreparedRecipient>, Error> {
@@ -430,23 +490,20 @@ fn write_length_prefixed(output: &mut Vec<u8>, value: &[u8]) -> Result<(), Error
 fn derive_ciphers(
     content_key: &[u8],
     transcript_hash: &[u8; 32],
-) -> Result<(Aes256Gcm, [u8; 12], Aes256Gcm, [u8; 12]), Error> {
+) -> Result<(Aes256Gcm, [u8; 12], Aes256Gcm), Error> {
     let hkdf = Hkdf::<Sha256V11>::new(Some(transcript_hash), content_key);
     let mut request_key = Zeroizing::new([0_u8; 32]);
     let mut request_nonce = [0_u8; 12];
     let mut response_key = Zeroizing::new([0_u8; 32]);
-    let mut response_nonce = [0_u8; 12];
     hkdf.expand(b"stogas.e2ee.request.key.v1", request_key.as_mut())
         .map_err(|_| Error::Crypto)?;
     hkdf.expand(b"stogas.e2ee.request.nonce.v1", &mut request_nonce)
         .map_err(|_| Error::Crypto)?;
     hkdf.expand(b"stogas.e2ee.response.key.v1", response_key.as_mut())
         .map_err(|_| Error::Crypto)?;
-    hkdf.expand(b"stogas.e2ee.response.nonce.v1", &mut response_nonce)
-        .map_err(|_| Error::Crypto)?;
     let request = Aes256Gcm::new_from_slice(request_key.as_ref()).map_err(|_| Error::Crypto)?;
     let response = Aes256Gcm::new_from_slice(response_key.as_ref()).map_err(|_| Error::Crypto)?;
-    Ok((request, request_nonce, response, response_nonce))
+    Ok((request, request_nonce, response))
 }
 
 fn hpke_info(transcript_hash: &[u8; 32]) -> Vec<u8> {
@@ -551,28 +608,37 @@ fn format_uuid(bytes: [u8; 16]) -> String {
 /// Incremental decoder for authenticated buffered and SSE responses.
 pub struct ResponseDecoder {
     cipher: Aes256Gcm,
-    base_nonce: [u8; 12],
+    base_nonce: [u8; RESPONSE_NONCE_BYTES],
     transcript_hash: [u8; 32],
     buffer: Vec<u8>,
     offset: usize,
+    wire_bytes: usize,
+    body_bytes: usize,
     sequence: u64,
-    magic_seen: bool,
-    metadata_seen: bool,
-    final_seen: bool,
+    state: ResponseDecoderState,
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum ResponseDecoderState {
+    AwaitingPreamble,
+    AwaitingMetadata,
+    Streaming,
+    Finished,
+    Failed,
 }
 
 impl ResponseDecoder {
-    const fn new(cipher: Aes256Gcm, base_nonce: [u8; 12], transcript_hash: [u8; 32]) -> Self {
+    const fn new(cipher: Aes256Gcm, transcript_hash: [u8; 32]) -> Self {
         Self {
             cipher,
-            base_nonce,
+            base_nonce: [0; RESPONSE_NONCE_BYTES],
             transcript_hash,
             buffer: Vec::new(),
             offset: 0,
+            wire_bytes: 0,
+            body_bytes: 0,
             sequence: 0,
-            magic_seen: false,
-            metadata_seen: false,
-            final_seen: false,
+            state: ResponseDecoderState::AwaitingPreamble,
         }
     }
 
@@ -580,16 +646,34 @@ impl ResponseDecoder {
     ///
     /// # Errors
     ///
-    /// Returns an error on any malformed, reordered, oversized, or unauthenticated frame.
+    /// Returns an error on any malformed, reordered, oversized, or unauthenticated record.
     pub fn push(&mut self, bytes: &[u8]) -> Result<Vec<ResponseEvent>, Error> {
-        if self.final_seen && !bytes.is_empty() {
-            return Err(Error::InvalidResponse(
-                "data follows the final frame".into(),
-            ));
+        if self.state == ResponseDecoderState::Failed {
+            return Err(Error::InvalidResponse("response decoder has failed".into()));
         }
+        let result = self.push_inner(bytes);
+        if result.is_err() {
+            self.state = ResponseDecoderState::Failed;
+            self.buffer.zeroize();
+            self.buffer.clear();
+            self.offset = 0;
+        }
+        result
+    }
+
+    fn push_inner(&mut self, bytes: &[u8]) -> Result<Vec<ResponseEvent>, Error> {
+        if self.state == ResponseDecoderState::Finished {
+            return Ok(Vec::new());
+        }
+        let wire_bytes = self
+            .wire_bytes
+            .checked_add(bytes.len())
+            .filter(|size| *size <= MAX_RESPONSE_WIRE_BYTES)
+            .ok_or_else(|| Error::InvalidResponse("encrypted response is too large".into()))?;
+        self.wire_bytes = wire_bytes;
         self.buffer.extend_from_slice(bytes);
         let mut events = Vec::new();
-        if !self.consume_magic()? {
+        if !self.consume_preamble()? {
             return Ok(events);
         }
         while let Some(event) = self.next_event()? {
@@ -603,19 +687,21 @@ impl ResponseDecoder {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::TruncatedResponse`] unless a final frame was consumed with no trailing
-    /// partial bytes.
-    pub const fn finish(&self) -> Result<(), Error> {
-        if !self.final_seen || self.available() != 0 {
+    /// Returns [`Error::TruncatedResponse`] unless a final record was consumed.
+    pub fn finish(&self) -> Result<(), Error> {
+        if self.state == ResponseDecoderState::Failed {
+            return Err(Error::InvalidResponse("response decoder has failed".into()));
+        }
+        if self.state != ResponseDecoderState::Finished || self.available() != 0 {
             return Err(Error::TruncatedResponse);
         }
         Ok(())
     }
 
-    /// Whether the authenticated final frame has been consumed.
+    /// Whether the authenticated final record has been consumed.
     #[must_use]
     pub const fn is_finished(&self) -> bool {
-        self.final_seen
+        matches!(self.state, ResponseDecoderState::Finished)
     }
 
     const fn available(&self) -> usize {
@@ -636,56 +722,56 @@ impl ResponseDecoder {
         }
     }
 
-    fn consume_magic(&mut self) -> Result<bool, Error> {
-        if self.magic_seen {
+    fn consume_preamble(&mut self) -> Result<bool, Error> {
+        if self.state != ResponseDecoderState::AwaitingPreamble {
             return Ok(true);
         }
-        if self.available() < RESPONSE_MAGIC.len() {
+        if self.available() < RESPONSE_PREAMBLE_BYTES {
             return Ok(false);
         }
         if self.peek(RESPONSE_MAGIC.len()) != RESPONSE_MAGIC {
             return Err(Error::InvalidResponse("invalid response magic".into()));
         }
-        self.offset += RESPONSE_MAGIC.len();
-        self.magic_seen = true;
+        let response_nonce: [u8; RESPONSE_NONCE_BYTES] = self.buffer
+            [self.offset + RESPONSE_MAGIC.len()..self.offset + RESPONSE_PREAMBLE_BYTES]
+            .try_into()
+            .map_err(|_| Error::InvalidResponse("invalid response nonce".into()))?;
+        self.base_nonce = response_nonce;
+        self.offset += RESPONSE_PREAMBLE_BYTES;
+        self.state = ResponseDecoderState::AwaitingMetadata;
         Ok(true)
     }
 
     fn next_event(&mut self) -> Result<Option<ResponseEvent>, Error> {
-        if self.available() < RESPONSE_FRAME_HEADER_BYTES {
+        if self.available() < RESPONSE_RECORD_HEADER_BYTES {
             return Ok(None);
         }
-        let header: [u8; RESPONSE_FRAME_HEADER_BYTES] = self
-            .peek(RESPONSE_FRAME_HEADER_BYTES)
+        let header: [u8; RESPONSE_RECORD_HEADER_BYTES] = self
+            .peek(RESPONSE_RECORD_HEADER_BYTES)
             .try_into()
-            .map_err(|_| Error::InvalidResponse("invalid frame header".into()))?;
-        let (frame_type, frame_sequence, ciphertext_length) = parse_response_frame_header(header)?;
-        if frame_sequence != self.sequence {
-            return Err(Error::InvalidResponse(
-                "non-contiguous response sequence".into(),
-            ));
-        }
-        let frame_length = RESPONSE_FRAME_HEADER_BYTES
+            .map_err(|_| Error::InvalidResponse("invalid record header".into()))?;
+        let ciphertext_length = parse_response_record_length(header, self.sequence)?;
+        let record_length = RESPONSE_RECORD_HEADER_BYTES
             .checked_add(ciphertext_length)
-            .ok_or_else(|| Error::InvalidResponse("invalid frame length".into()))?;
-        if self.available() < frame_length {
+            .ok_or_else(|| Error::InvalidResponse("invalid record length".into()))?;
+        if self.available() < record_length {
             return Ok(None);
         }
-        let plaintext = self.decrypt_frame(frame_type, frame_length)?;
-        self.offset += frame_length;
+        let plaintext = self.decrypt_record(record_length)?;
+        let sequence = self.sequence;
+        self.offset += record_length;
         self.sequence = self
             .sequence
             .checked_add(1)
             .ok_or_else(|| Error::InvalidResponse("response sequence exhausted".into()))?;
-        self.apply_frame(frame_type, frame_sequence, plaintext)
-            .map(Some)
+        self.apply_record(sequence, plaintext).map(Some)
     }
 
-    fn decrypt_frame(&self, frame_type: u8, frame_length: usize) -> Result<Vec<u8>, Error> {
+    fn decrypt_record(&self, record_length: usize) -> Result<Vec<u8>, Error> {
         let ciphertext =
-            &self.buffer[self.offset + RESPONSE_FRAME_HEADER_BYTES..self.offset + frame_length];
+            &self.buffer[self.offset + RESPONSE_RECORD_HEADER_BYTES..self.offset + record_length];
         let nonce = response_nonce(self.base_nonce, self.sequence);
-        let aad = response_aad(&self.transcript_hash, frame_type, self.sequence);
+        let aad = response_aad(&self.transcript_hash, self.sequence);
         self.cipher
             .decrypt(
                 <&Nonce<U12>>::try_from(nonce.as_slice())
@@ -695,49 +781,35 @@ impl ResponseDecoder {
                     aad: &aad,
                 },
             )
-            .map_err(|_| Error::InvalidResponse("response frame authentication failed".into()))
+            .map_err(|_| Error::InvalidResponse("response record authentication failed".into()))
     }
 
-    fn apply_frame(
-        &mut self,
-        frame_type: u8,
-        frame_sequence: u64,
-        plaintext: Vec<u8>,
-    ) -> Result<ResponseEvent, Error> {
-        match frame_type {
-            RESPONSE_FRAME_METADATA => self.apply_metadata(frame_sequence, &plaintext),
-            RESPONSE_FRAME_DATA => {
-                if !self.metadata_seen || self.final_seen {
-                    return Err(Error::InvalidResponse("data frame is out of order".into()));
-                }
-                Ok(ResponseEvent::Data(plaintext))
-            }
-            RESPONSE_FRAME_FINAL => {
-                if !self.metadata_seen || self.final_seen || !plaintext.is_empty() {
-                    return Err(Error::InvalidResponse(
-                        "final frame is invalid or out of order".into(),
-                    ));
-                }
-                self.final_seen = true;
-                if self.available() != 0 {
-                    return Err(Error::InvalidResponse(
-                        "data follows the final frame".into(),
-                    ));
-                }
-                Ok(ResponseEvent::Final)
-            }
-            _ => unreachable!(),
+    fn apply_record(&mut self, sequence: u64, plaintext: Vec<u8>) -> Result<ResponseEvent, Error> {
+        if sequence == 0 {
+            return self.apply_metadata(&plaintext);
         }
+        if self.state != ResponseDecoderState::Streaming {
+            return Err(Error::InvalidResponse(
+                "response record is out of order".into(),
+            ));
+        }
+        if plaintext.is_empty() {
+            self.state = ResponseDecoderState::Finished;
+            self.offset = self.buffer.len();
+            return Ok(ResponseEvent::Final);
+        }
+        self.body_bytes = self
+            .body_bytes
+            .checked_add(plaintext.len())
+            .filter(|size| *size <= MAX_RESPONSE_BODY_BYTES)
+            .ok_or_else(|| Error::InvalidResponse("response body is too large".into()))?;
+        Ok(ResponseEvent::Data(plaintext))
     }
 
-    fn apply_metadata(
-        &mut self,
-        frame_sequence: u64,
-        plaintext: &[u8],
-    ) -> Result<ResponseEvent, Error> {
-        if self.metadata_seen || frame_sequence != 0 || self.final_seen {
+    fn apply_metadata(&mut self, plaintext: &[u8]) -> Result<ResponseEvent, Error> {
+        if self.state != ResponseDecoderState::AwaitingMetadata {
             return Err(Error::InvalidResponse(
-                "metadata frame is out of order".into(),
+                "metadata record is out of order".into(),
             ));
         }
         let value = strict_json::from_slice(plaintext)
@@ -745,33 +817,18 @@ impl ResponseDecoder {
         let metadata: ResponseMetadata = serde_json::from_value(value)
             .map_err(|_| Error::InvalidResponse("invalid response metadata".into()))?;
         validate_response_metadata(&metadata)?;
-        self.metadata_seen = true;
+        self.state = ResponseDecoderState::Streaming;
         Ok(ResponseEvent::Metadata(metadata))
     }
 }
 
-fn parse_response_frame_header(
-    header: [u8; RESPONSE_FRAME_HEADER_BYTES],
-) -> Result<(u8, u64, usize), Error> {
-    let frame_type = header[0];
-    if !matches!(
-        frame_type,
-        RESPONSE_FRAME_DATA | RESPONSE_FRAME_METADATA | RESPONSE_FRAME_FINAL
-    ) {
-        return Err(Error::InvalidResponse("unknown frame type".into()));
-    }
-    let frame_sequence = u64::from_be_bytes(
-        header[1..9]
-            .try_into()
-            .map_err(|_| Error::InvalidResponse("invalid frame header".into()))?,
-    );
-    let ciphertext_length = usize::try_from(u32::from_be_bytes(
-        header[9..13]
-            .try_into()
-            .map_err(|_| Error::InvalidResponse("invalid frame header".into()))?,
-    ))
-    .map_err(|_| Error::InvalidResponse("invalid frame length".into()))?;
-    let plaintext_limit = if frame_type == RESPONSE_FRAME_METADATA {
+fn parse_response_record_length(
+    header: [u8; RESPONSE_RECORD_HEADER_BYTES],
+    sequence: u64,
+) -> Result<usize, Error> {
+    let ciphertext_length = usize::try_from(u32::from_be_bytes(header))
+        .map_err(|_| Error::InvalidResponse("invalid record length".into()))?;
+    let plaintext_limit = if sequence == 0 {
         MAX_RESPONSE_METADATA_BYTES
     } else {
         MAX_RESPONSE_DATA_BYTES
@@ -780,10 +837,10 @@ fn parse_response_frame_header(
         || ciphertext_length > plaintext_limit + RESPONSE_TAG_BYTES
     {
         return Err(Error::InvalidResponse(
-            "response frame exceeds its size limit".into(),
+            "response record exceeds its size limit".into(),
         ));
     }
-    Ok((frame_type, frame_sequence, ciphertext_length))
+    Ok(ciphertext_length)
 }
 
 impl Drop for ResponseDecoder {
@@ -800,7 +857,7 @@ fn validate_response_metadata(metadata: &ResponseMetadata) -> Result<(), Error> 
             "inner HTTP status is invalid".into(),
         ));
     }
-    if metadata.content_type.is_empty() || metadata.content_type.len() > 256 {
+    if !valid_content_type(&metadata.content_type) {
         return Err(Error::InvalidResponse(
             "inner Content-Type is invalid".into(),
         ));
@@ -810,14 +867,13 @@ fn validate_response_metadata(metadata: &ResponseMetadata) -> Result<(), Error> 
             "too many inner response headers".into(),
         ));
     }
+    let mut seen = BTreeSet::new();
     for (name, value) in &metadata.headers {
-        if name.is_empty()
-            || name.len() > 128
+        if name.len() > 128
             || value.len() > 16 * 1024
-            || name
-                .bytes()
-                .any(|byte| matches!(byte, 0 | b'\r' | b'\n' | b':'))
-            || value.bytes().any(|byte| matches!(byte, 0 | b'\r' | b'\n'))
+            || !valid_http_field_name(name)
+            || !valid_http_field_value(value, true)
+            || !seen.insert(name.to_ascii_lowercase())
         {
             return Err(Error::InvalidResponse(
                 "inner response header is invalid".into(),
@@ -827,12 +883,11 @@ fn validate_response_metadata(metadata: &ResponseMetadata) -> Result<(), Error> 
     Ok(())
 }
 
-fn response_aad(transcript_hash: &[u8; 32], frame_type: u8, sequence: u64) -> Vec<u8> {
-    let mut aad = Vec::with_capacity(74);
-    aad.extend_from_slice(b"stogas.e2ee.response.frame.v1");
+fn response_aad(transcript_hash: &[u8; 32], sequence: u64) -> Vec<u8> {
+    let mut aad = Vec::with_capacity(72);
+    aad.extend_from_slice(b"stogas.e2ee.response.record.v1");
     aad.push(0);
     aad.extend_from_slice(transcript_hash);
-    aad.push(frame_type);
     aad.extend_from_slice(&sequence.to_be_bytes());
     aad
 }
@@ -869,6 +924,10 @@ mod tests {
             api_key: "sk-stogas-secret",
             accept: Some("text/event-stream"),
             extra_fields: true,
+            upstream_credential: Some(UpstreamCredential {
+                provider: "openai",
+                api_key: "sk-provider-secret",
+            }),
             body: br#"{"model":"gpt-5","input":"hello"}"#,
         })
         .unwrap();
@@ -895,6 +954,7 @@ mod tests {
             .collect::<Vec<_>>();
         assert!(ids.windows(2).all(|window| window[0] < window[1]));
         assert!(!String::from_utf8_lossy(&sealed.body).contains("sk-stogas-secret"));
+        assert!(!String::from_utf8_lossy(&sealed.body).contains("sk-provider-secret"));
         assert!(!String::from_utf8_lossy(&sealed.body).contains("hello"));
     }
 
@@ -911,6 +971,7 @@ mod tests {
             api_key: "sk-stogas-secret",
             accept: None,
             extra_fields: false,
+            upstream_credential: None,
             body: br#"{"model":"gpt-5","messages":[]}"#,
         })
         .unwrap();
@@ -963,6 +1024,24 @@ mod tests {
         request.api_key = "sk-test\r\nX-Evil: yes";
         assert_invalid_request(&request);
         request = valid_request(&valid_recipient);
+        request.api_key = "sk test";
+        assert_invalid_request(&request);
+        request = valid_request(&valid_recipient);
+        request.api_key = "sk-tést";
+        assert_invalid_request(&request);
+        request = valid_request(&valid_recipient);
+        request.accept = Some("application/json\u{1}");
+        assert_invalid_request(&request);
+        request = valid_request(&valid_recipient);
+        request.accept = Some(" application/json");
+        assert_invalid_request(&request);
+        request = valid_request(&valid_recipient);
+        request.upstream_credential = Some(UpstreamCredential {
+            provider: "openai",
+            api_key: "provider key with spaces",
+        });
+        assert_invalid_request(&request);
+        request = valid_request(&valid_recipient);
         request.body = b"{";
         assert_invalid_request(&request);
     }
@@ -1000,7 +1079,7 @@ mod tests {
     }
 
     #[test]
-    fn response_decoder_rejects_tampering_truncation_reordering_and_trailing_data() {
+    fn response_decoder_rejects_tampering_truncation_and_reordering_then_stops_at_final() {
         let metadata = ResponseMetadata {
             status_code: 200,
             content_type: "application/json".into(),
@@ -1020,13 +1099,79 @@ mod tests {
         let mut trailing = baseline_response_decoder();
         let mut with_trailing = encode_response(&trailing, &metadata, &[br#"{"ok":true}"#]);
         with_trailing.push(0);
-        assert!(trailing.push(&with_trailing).is_err());
+        assert!(
+            trailing
+                .push(&with_trailing)
+                .unwrap()
+                .contains(&ResponseEvent::Final)
+        );
+        assert!(trailing.push(b"later network chunk").unwrap().is_empty());
+        trailing.finish().unwrap();
+
+        let mut early_final = baseline_response_decoder();
+        let authenticated_trailing = encode_response(&early_final, &metadata, &[b"", b"later"]);
+        assert_eq!(
+            early_final.push(&authenticated_trailing).unwrap(),
+            vec![
+                ResponseEvent::Metadata(metadata.clone()),
+                ResponseEvent::Final,
+            ]
+        );
+        early_final.finish().unwrap();
 
         let mut reordered_decoder = baseline_response_decoder();
-        let mut reordered = encode_response(&reordered_decoder, &metadata, &[br#"{"ok":true}"#]);
-        reordered[RESPONSE_MAGIC.len() + 1..RESPONSE_MAGIC.len() + 9]
-            .copy_from_slice(&1_u64.to_be_bytes());
+        let encoded = encode_response(&reordered_decoder, &metadata, &[br#"{"ok":true}"#]);
+        let metadata_end = response_record_end(&encoded, RESPONSE_PREAMBLE_BYTES);
+        let body_end = response_record_end(&encoded, metadata_end);
+        let mut reordered = encoded[..RESPONSE_PREAMBLE_BYTES].to_vec();
+        reordered.extend_from_slice(&encoded[metadata_end..body_end]);
+        reordered.extend_from_slice(&encoded[RESPONSE_PREAMBLE_BYTES..metadata_end]);
+        reordered.extend_from_slice(&encoded[body_end..]);
         assert!(reordered_decoder.push(&reordered).is_err());
+    }
+
+    #[test]
+    fn response_decoder_rejects_unsupported_or_tampered_nonce_preambles_permanently() {
+        let metadata = ResponseMetadata {
+            status_code: 200,
+            content_type: "application/json".into(),
+            headers: BTreeMap::new(),
+        };
+
+        let mut unsupported_decoder = baseline_response_decoder();
+        let mut unsupported = encode_response(&unsupported_decoder, &metadata, &[]);
+        unsupported[4] = VERSION + 1;
+        assert!(unsupported_decoder.push(&unsupported).is_err());
+        assert!(unsupported_decoder.push(&[]).is_err());
+        assert!(!unsupported_decoder.is_finished());
+
+        let mut tampered_decoder = baseline_response_decoder();
+        let mut tampered = encode_response_with_nonce(
+            &tampered_decoder,
+            &metadata,
+            &[],
+            [0x5a; RESPONSE_NONCE_BYTES],
+        );
+        tampered[RESPONSE_MAGIC.len()] ^= 1;
+        assert!(tampered_decoder.push(&tampered).is_err());
+        assert!(tampered_decoder.finish().is_err());
+    }
+
+    #[test]
+    fn response_decoder_enforces_aggregate_wire_and_body_limits() {
+        let metadata = ResponseMetadata {
+            status_code: 200,
+            content_type: "application/json".into(),
+            headers: BTreeMap::new(),
+        };
+        let mut wire_decoder = baseline_response_decoder();
+        wire_decoder.wire_bytes = MAX_RESPONSE_WIRE_BYTES;
+        assert!(wire_decoder.push(&[0]).is_err());
+
+        let mut body_decoder = baseline_response_decoder();
+        body_decoder.body_bytes = MAX_RESPONSE_BODY_BYTES;
+        let encoded = encode_response(&body_decoder, &metadata, &[b"x"]);
+        assert!(body_decoder.push(&encoded).is_err());
     }
 
     #[test]
@@ -1044,8 +1189,36 @@ mod tests {
             },
             ResponseMetadata {
                 status_code: 200,
+                content_type: "applicationjson".into(),
+                headers: BTreeMap::new(),
+            },
+            ResponseMetadata {
+                status_code: 200,
+                content_type: "application/json\u{1}".into(),
+                headers: BTreeMap::new(),
+            },
+            ResponseMetadata {
+                status_code: 200,
                 content_type: "application/json".into(),
                 headers: BTreeMap::from([("X-Test\r\nX-Evil".into(), "yes".into())]),
+            },
+            ResponseMetadata {
+                status_code: 200,
+                content_type: "application/json".into(),
+                headers: BTreeMap::from([("X Test".into(), "yes".into())]),
+            },
+            ResponseMetadata {
+                status_code: 200,
+                content_type: "application/json".into(),
+                headers: BTreeMap::from([("X-Test".into(), "yes\u{1}".into())]),
+            },
+            ResponseMetadata {
+                status_code: 200,
+                content_type: "application/json".into(),
+                headers: BTreeMap::from([
+                    ("X-Test".into(), "one".into()),
+                    ("x-test".into(), "two".into()),
+                ]),
             },
         ] {
             let mut decoder = baseline_response_decoder();
@@ -1116,7 +1289,7 @@ mod tests {
                 &transcript,
             )
             .unwrap();
-        let (request_cipher, request_nonce, response_cipher, response_nonce) =
+        let (request_cipher, request_nonce, response_cipher) =
             derive_ciphers(&content_key, &transcript_hash).unwrap();
         let nonce: &Nonce<U12> = request_nonce.as_slice().try_into().unwrap();
         let inner = request_cipher
@@ -1133,7 +1306,7 @@ mod tests {
             fixture.expected_inner
         );
 
-        let mut decoder = ResponseDecoder::new(response_cipher, response_nonce, transcript_hash);
+        let mut decoder = ResponseDecoder::new(response_cipher, transcript_hash);
         let events = decoder
             .push(&decode_canonical_base64(&fixture.response_base64, "response fixture").unwrap())
             .unwrap();
@@ -1173,6 +1346,7 @@ mod tests {
             api_key: "sk-test",
             accept: None,
             extra_fields: false,
+            upstream_credential: None,
             body: b"{}",
         })
         .unwrap()
@@ -1189,6 +1363,7 @@ mod tests {
             api_key: "sk-test",
             accept: None,
             extra_fields: false,
+            upstream_credential: None,
             body: b"{}",
         }
     }
@@ -1209,41 +1384,51 @@ mod tests {
         metadata: &ResponseMetadata,
         chunks: &[&[u8]],
     ) -> Vec<u8> {
+        encode_response_with_nonce(decoder, metadata, chunks, [0; RESPONSE_NONCE_BYTES])
+    }
+
+    fn encode_response_with_nonce(
+        decoder: &ResponseDecoder,
+        metadata: &ResponseMetadata,
+        chunks: &[&[u8]],
+        response_nonce: [u8; RESPONSE_NONCE_BYTES],
+    ) -> Vec<u8> {
         let mut encoded = RESPONSE_MAGIC.to_vec();
-        append_frame(
+        encoded.extend_from_slice(&response_nonce);
+        append_record(
             &mut encoded,
             decoder,
-            RESPONSE_FRAME_METADATA,
+            response_nonce,
             0,
             &serde_json::to_vec(metadata).unwrap(),
         );
         for (index, chunk) in chunks.iter().enumerate() {
-            append_frame(
+            append_record(
                 &mut encoded,
                 decoder,
-                RESPONSE_FRAME_DATA,
+                response_nonce,
                 u64::try_from(index).unwrap() + 1,
                 chunk,
             );
         }
-        append_frame(
+        append_record(
             &mut encoded,
             decoder,
-            RESPONSE_FRAME_FINAL,
+            response_nonce,
             u64::try_from(chunks.len()).unwrap() + 1,
             &[],
         );
         encoded
     }
 
-    fn append_frame(
+    fn append_record(
         encoded: &mut Vec<u8>,
         decoder: &ResponseDecoder,
-        frame_type: u8,
+        base_nonce: [u8; 12],
         sequence: u64,
         plaintext: &[u8],
     ) {
-        let nonce = response_nonce(decoder.base_nonce, sequence);
+        let nonce = response_nonce(base_nonce, sequence);
         let nonce: &Nonce<U12> = nonce.as_slice().try_into().unwrap();
         let ciphertext = decoder
             .cipher
@@ -1251,13 +1436,21 @@ mod tests {
                 nonce,
                 Payload {
                     msg: plaintext,
-                    aad: &response_aad(&decoder.transcript_hash, frame_type, sequence),
+                    aad: &response_aad(&decoder.transcript_hash, sequence),
                 },
             )
             .unwrap();
-        encoded.push(frame_type);
-        encoded.extend_from_slice(&sequence.to_be_bytes());
         encoded.extend_from_slice(&u32::try_from(ciphertext.len()).unwrap().to_be_bytes());
         encoded.extend_from_slice(&ciphertext);
+    }
+
+    fn response_record_end(encoded: &[u8], start: usize) -> usize {
+        let ciphertext_length = usize::try_from(u32::from_be_bytes(
+            encoded[start..start + RESPONSE_RECORD_HEADER_BYTES]
+                .try_into()
+                .unwrap(),
+        ))
+        .unwrap();
+        start + RESPONSE_RECORD_HEADER_BYTES + ciphertext_length
     }
 }

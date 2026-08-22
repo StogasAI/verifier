@@ -3,7 +3,7 @@
 mod crypto;
 mod sct;
 mod sigstore;
-mod strict_json;
+pub mod strict_json;
 mod tlog;
 mod trust_root;
 mod tsa;
@@ -102,25 +102,8 @@ pub fn verify_github_attestation(
     policy: &GithubPolicy,
     now_unix_ms: i64,
 ) -> Result<VerifiedAttestation, Error> {
-    if bundle_bytes.len() > MAX_BUNDLE_BYTES {
-        return Err(Error::TooLarge);
-    }
-    let documents = parse_bundle_documents(bundle_bytes)?;
-    let mut verified = None;
-    let mut last_error = None;
-    for value in documents {
-        match verify_github_attestation_value(&value, expected_subjects, policy, now_unix_ms) {
-            Ok(result) if verified.is_none() => verified = Some(result),
-            Ok(_) => {
-                return Err(Error::Policy(
-                    "multiple attestations match the required subjects and policy".into(),
-                ));
-            }
-            Err(error) => last_error = Some(error),
-        }
-    }
-    verified.ok_or_else(|| {
-        last_error.unwrap_or_else(|| Error::InvalidBundle("attestation input is empty".into()))
+    verify_single_attestation(bundle_bytes, |value| {
+        verify_github_attestation_value(value, expected_subjects, policy, now_unix_ms)
     })
 }
 
@@ -138,6 +121,15 @@ pub fn verify_dsse_attestation(
     policy: &IdentityPolicy,
     now_unix_ms: i64,
 ) -> Result<VerifiedAttestation, Error> {
+    verify_single_attestation(bundle_bytes, |value| {
+        verify_dsse_attestation_value(value, expected_subjects, policy, now_unix_ms)
+    })
+}
+
+fn verify_single_attestation(
+    bundle_bytes: &[u8],
+    mut verify: impl FnMut(&Value) -> Result<VerifiedAttestation, Error>,
+) -> Result<VerifiedAttestation, Error> {
     if bundle_bytes.len() > MAX_BUNDLE_BYTES {
         return Err(Error::TooLarge);
     }
@@ -145,8 +137,7 @@ pub fn verify_dsse_attestation(
     let mut verified = None;
     let mut last_error = None;
     for value in documents {
-        let result = verify_dsse_attestation_value(&value, expected_subjects, policy, now_unix_ms);
-        match result {
+        match verify(&value) {
             Ok(result) if verified.is_none() => verified = Some(result),
             Ok(_) => {
                 return Err(Error::Policy(

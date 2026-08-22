@@ -21,6 +21,7 @@
 	"files": [
 		"bindings/browser",
 		"bindings/node",
+		"bindings/shared",
 		"bindings/worker",
 		"pkg/browser",
 		"README.md",

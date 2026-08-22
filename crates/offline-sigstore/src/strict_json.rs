@@ -2,6 +2,11 @@ use serde::de::{self, DeserializeSeed, MapAccess, SeqAccess, Visitor};
 use serde_json::{Map, Number, Value};
 use std::{collections::HashSet, fmt};
 
+/// Parses one complete JSON value and rejects duplicate object keys.
+///
+/// # Errors
+///
+/// Returns an error for invalid JSON, trailing data, or a duplicate object key.
 pub fn from_slice(input: &[u8]) -> Result<Value, serde_json::Error> {
     let mut deserializer = serde_json::Deserializer::from_slice(input);
     let value = StrictValue.deserialize(&mut deserializer)?;

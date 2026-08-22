@@ -7,10 +7,14 @@ on:
 permissions:
   contents: read
 
+env:
+  RELEASE_TAG: ${{ github.event.release.tag_name }}
+
 jobs:
   metadata:
     name: Validate published release
     runs-on: ubuntu-24.04
+    timeout-minutes: 10
     outputs:
       version: ${{ steps.version.outputs.version }}
     steps:
@@ -23,7 +27,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          tag="${{ github.event.release.tag_name }}"
+          tag="$RELEASE_TAG"
           [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]]
           version="${tag#v}"
           test "$(node -p "require('./package.json').version")" = "$version"
@@ -36,6 +40,7 @@ jobs:
     name: npm
     needs: metadata
     runs-on: ubuntu-24.04
+    timeout-minutes: 15
     environment: release
     permissions:
       attestations: read
@@ -57,11 +62,17 @@ jobs:
         run: |
           set -euo pipefail
           mkdir dist
-          gh release download "${{ github.event.release.tag_name }}" --dir dist \
+          gh release download "$RELEASE_TAG" --dir dist \
             --pattern 'stogas-*.tgz' --pattern SHA256SUMS
-          (cd dist && sha256sum -c --ignore-missing SHA256SUMS)
-          for package in dist/stogas-*.tgz; do
-            gh attestation verify "$package" --repo "$GITHUB_REPOSITORY"
+          mapfile -t packages < <(find dist -maxdepth 1 -type f -name 'stogas-*.tgz' -printf '%p\n' | LC_ALL=C sort)
+          test "${#packages[@]}" = 2
+          release_commit="$(git rev-parse HEAD)"
+          for package in "${packages[@]}"; do
+            name="${package#dist/}"
+            awk -v name="$name" '$2 == name { print; count++ } END { exit count == 1 ? 0 : 1 }' \
+              dist/SHA256SUMS | (cd dist && sha256sum -c -)
+            gh attestation verify "$package" --repo "$GITHUB_REPOSITORY" \
+              --source-ref "refs/tags/$RELEASE_TAG" --source-digest "$release_commit"
           done
       - name: Publish both reviewed npm packages
         shell: bash
@@ -75,6 +86,7 @@ jobs:
     name: PyPI
     needs: metadata
     runs-on: ubuntu-24.04
+    timeout-minutes: 15
     environment: release
     permissions:
       attestations: read
@@ -92,11 +104,17 @@ jobs:
         run: |
           set -euo pipefail
           mkdir dist
-          gh release download "${{ github.event.release.tag_name }}" --dir dist \
+          gh release download "$RELEASE_TAG" --dir dist \
             --pattern '*.whl' --pattern SHA256SUMS
-          (cd dist && sha256sum -c --ignore-missing SHA256SUMS)
-          for wheel in dist/*.whl; do
-            gh attestation verify "$wheel" --repo "$GITHUB_REPOSITORY"
+          mapfile -t wheels < <(find dist -maxdepth 1 -type f -name '*.whl' -printf '%p\n' | LC_ALL=C sort)
+          test "${#wheels[@]}" = 5
+          release_commit="$(git rev-parse HEAD)"
+          for wheel in "${wheels[@]}"; do
+            name="${wheel#dist/}"
+            awk -v name="$name" '$2 == name { print; count++ } END { exit count == 1 ? 0 : 1 }' \
+              dist/SHA256SUMS | (cd dist && sha256sum -c -)
+            gh attestation verify "$wheel" --repo "$GITHUB_REPOSITORY" \
+              --source-ref "refs/tags/$RELEASE_TAG" --source-digest "$release_commit"
           done
           rm dist/SHA256SUMS
       - uses: pypa/gh-action-pypi-publish@cef221092ed1bacb1cc03d23a2d87d1d172e277b
@@ -108,6 +126,7 @@ jobs:
     name: crates.io
     needs: metadata
     runs-on: ubuntu-24.04
+    timeout-minutes: 30
     environment: release
     permissions:
       attestations: read
@@ -127,19 +146,26 @@ jobs:
         run: |
           set -euo pipefail
           mkdir dist
-          gh release download "${{ github.event.release.tag_name }}" --dir dist \
+          gh release download "$RELEASE_TAG" --dir dist \
             --pattern '*.crate' --pattern SHA256SUMS
-          (cd dist && sha256sum -c --ignore-missing SHA256SUMS)
-          for package in dist/*.crate; do
-            gh attestation verify "$package" --repo "$GITHUB_REPOSITORY"
+          mapfile -t packages < <(find dist -maxdepth 1 -type f -name '*.crate' -printf '%p\n' | LC_ALL=C sort)
+          test "${#packages[@]}" = 3
+          release_commit="$(git rev-parse HEAD)"
+          for package in "${packages[@]}"; do
+            name="${package#dist/}"
+            awk -v name="$name" '$2 == name { print; count++ } END { exit count == 1 ? 0 : 1 }' \
+              dist/SHA256SUMS | (cd dist && sha256sum -c -)
+            gh attestation verify "$package" --repo "$GITHUB_REPOSITORY" \
+              --source-ref "refs/tags/$RELEASE_TAG" --source-digest "$release_commit"
           done
       - name: Publish the dependency before the branded verifier
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+          RELEASE_VERSION: ${{ needs.metadata.outputs.version }}
         shell: bash
         run: |
           set -euo pipefail
-          version="${{ needs.metadata.outputs.version }}"
+          version="$RELEASE_VERSION"
           publish_if_absent() {
             local package="$1"
             if cargo info "$package@$version" --registry crates-io >/dev/null 2>&1; then

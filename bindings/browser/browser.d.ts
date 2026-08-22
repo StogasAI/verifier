@@ -3,11 +3,19 @@ import type {
 	Verifier as CoreVerifier
 } from '../../pkg/browser/stogas_verifier.js';
 
-export { default, verify_bundle } from '../../pkg/browser/stogas_verifier.js';
+export {
+	default,
+	verify_bundle,
+	verify_bundle_with_policy
+} from '../../pkg/browser/stogas_verifier.js';
 
 export declare class Verifier {
 	constructor();
 	verify_bundle(bundle: Uint8Array): ReturnType<CoreVerifier['verify_bundle']>;
+	verify_bundle_with_policy(
+		bundle: Uint8Array,
+		policy: Uint8Array
+	): ReturnType<CoreVerifier['verify_bundle_with_policy']>;
 	verify_response_proof(
 		proof: Uint8Array,
 		requestBody: Uint8Array,
@@ -26,12 +34,8 @@ export declare class Verifier {
 	verify_node_ledger_record(
 		ledger: Uint8Array
 	): ReturnType<CoreVerifier['verify_node_ledger_record']>;
-	verify_release_approval(
-		release: Uint8Array
-	): ReturnType<CoreVerifier['verify_release_approval']>;
-	verify_catalog_approval(
-		catalog: Uint8Array
-	): ReturnType<CoreVerifier['verify_catalog_approval']>;
+	verify_release_approval(release: Uint8Array): ReturnType<CoreVerifier['verify_release_approval']>;
+	verify_catalog_approval(catalog: Uint8Array): ReturnType<CoreVerifier['verify_catalog_approval']>;
 	free(): void;
 }
 
@@ -53,9 +57,12 @@ export declare class ResponseProofStream {
 export interface StogasTransportOptions {
 	baseURL?: string;
 	bundleURL?: string;
+	/** Refresh target in seconds. Scheduled attempts use ±10% jitter. Defaults to 300. */
 	bundleRefreshIntervalSeconds?: number;
 	environment?: 'production' | 'staging';
 	fetch?: typeof globalThis.fetch;
+	/** Caller-owned AMD hardware appraisal policy. */
+	hardwarePolicy?: Uint8Array;
 }
 
 export interface StogasBundleSnapshot {
@@ -64,7 +71,7 @@ export interface StogasBundleSnapshot {
 	envelopeSha256: string | null;
 	error: string | null;
 	fetchedAtUnixMs: number | null;
-	status: 'idle' | 'refreshing' | 'ready' | 'error';
+	status: 'idle' | 'refreshing' | 'ready' | 'unavailable' | 'error';
 	verificationDurationMs: number | null;
 	verifiedAtUnixMs: number | null;
 }

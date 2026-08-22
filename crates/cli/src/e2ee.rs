@@ -7,12 +7,14 @@ use futures_util::{Stream, StreamExt as _, stream};
 use std::{collections::VecDeque, io, pin::Pin, time::Duration};
 use stogas_verifier::e2ee::{
     RESPONSE_CONTENT_TYPE, Recipient, Request as EncryptedRequest, ResponseDecoder, ResponseEvent,
-    ResponseMetadata, seal_request,
+    ResponseMetadata, UpstreamCredential, seal_request,
 };
 use url::Url;
 
 const REQUEST_ACCEPTANCE_WINDOW: Duration = Duration::from_mins(1);
 const EXTRA_FIELDS_HEADER: &str = "x-stogas-extra-fields";
+const UPSTREAM_PROVIDER_HEADER: &str = "x-stogas-upstream-provider";
+const UPSTREAM_API_KEY_HEADER: &str = "x-stogas-upstream-api-key";
 const E2EE_RESPONSE_HEADER: &str = "x-stogas-e2ee";
 const E2EE_TRANSCRIPT_HEADER: &str = "x-stogas-e2ee-transcript-sha256";
 const E2EE_HTTPS_CONNECTION_ERROR: &str =
@@ -121,6 +123,7 @@ fn seal(
             ));
         }
     };
+    let upstream_credential = pass_through_credential(&request.parts.headers)?;
     let expires_at_unix_ms = request
         .now_unix_ms
         .saturating_add(i64::try_from(REQUEST_ACCEPTANCE_WINDOW.as_millis()).unwrap_or(i64::MAX));
@@ -134,6 +137,7 @@ fn seal(
         api_key,
         accept,
         extra_fields,
+        upstream_credential,
         body: &request.body,
     })
     .map_err(|_| {
@@ -242,6 +246,33 @@ fn optional_header<'a>(
                 .map_err(|_| (StatusCode::BAD_REQUEST, message))
         })
         .transpose()
+}
+
+fn pass_through_credential(
+    headers: &axum::http::HeaderMap,
+) -> Result<Option<UpstreamCredential<'_>>, TransportError> {
+    let upstream_provider = optional_header(
+        headers,
+        &HeaderName::from_static(UPSTREAM_PROVIDER_HEADER),
+        "invalid pass-through provider credential",
+    )?;
+    let upstream_api_key = optional_header(
+        headers,
+        &HeaderName::from_static(UPSTREAM_API_KEY_HEADER),
+        "invalid pass-through provider credential",
+    )?;
+    match (upstream_provider, upstream_api_key) {
+        (Some("azure"), Some(_)) => Err((
+            StatusCode::BAD_REQUEST,
+            "Azure pass-through credentials are not supported",
+        )),
+        (Some(provider), Some(api_key)) => Ok(Some(UpstreamCredential { provider, api_key })),
+        (None, None) => Ok(None),
+        _ => Err((
+            StatusCode::BAD_REQUEST,
+            "an upstream provider and API key are required together",
+        )),
+    }
 }
 
 async fn read_metadata(state: &mut ResponseStream) -> Result<ResponseMetadata, TransportError> {
@@ -355,5 +386,31 @@ mod tests {
             headers.insert(header::AUTHORIZATION, HeaderValue::from_str(value).unwrap());
             assert!(bearer_api_key(&headers).is_err());
         }
+    }
+
+    #[test]
+    fn pass_through_headers_are_complete_and_reject_azure() {
+        let mut headers = axum::http::HeaderMap::new();
+        assert!(pass_through_credential(&headers).unwrap().is_none());
+
+        headers.insert(
+            HeaderName::from_static(UPSTREAM_API_KEY_HEADER),
+            HeaderValue::from_static("provider-secret"),
+        );
+        assert!(pass_through_credential(&headers).is_err());
+
+        headers.insert(
+            HeaderName::from_static(UPSTREAM_PROVIDER_HEADER),
+            HeaderValue::from_static("openai"),
+        );
+        let credential = pass_through_credential(&headers).unwrap().unwrap();
+        assert_eq!(credential.provider, "openai");
+        assert_eq!(credential.api_key, "provider-secret");
+
+        headers.insert(
+            HeaderName::from_static(UPSTREAM_PROVIDER_HEADER),
+            HeaderValue::from_static("azure"),
+        );
+        assert!(pass_through_credential(&headers).is_err());
     }
 }

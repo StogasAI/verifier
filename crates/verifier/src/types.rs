@@ -16,11 +16,61 @@ pub struct BundleBody {
     pub allowed_igvms: Vec<AllowedIgvm>,
     pub created_at: String,
     pub expires_at: String,
+    pub hardware_policy: SignedHardwarePolicy,
     pub nodes: Vec<Node>,
     pub schema: String,
     pub sequence: u64,
     pub ttl_ms: u64,
     pub vendor_collateral: Vec<VendorCollateral>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SignedHardwarePolicy {
+    pub policy: HardwarePolicy,
+    pub stogas_signature: HardwarePolicySignature,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct HardwarePolicySignature {
+    pub algorithm: String,
+    pub key_id: String,
+    pub schema: String,
+    pub signature: String,
+    pub signed: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct HardwarePolicy {
+    pub amd_sev_snp: Vec<AmdSevSnpPolicy>,
+    pub schema: String,
+    pub sequence: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AmdSevSnpPolicy {
+    pub cpuid_family: u8,
+    pub cpuid_model: u8,
+    pub cpuid_stepping: u8,
+    pub forbidden_platform_info_mask: String,
+    pub minimum_tcb: AmdTcb,
+    pub product: String,
+    pub report_version: u32,
+    pub required_current_mitigation_mask: String,
+    pub required_launch_mitigation_mask: String,
+    pub required_platform_info_mask: String,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AmdTcb {
+    pub bootloader: u8,
+    pub microcode: u8,
+    pub snp: u8,
+    pub tee: u8,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -164,6 +214,7 @@ pub struct HeartbeatCandidate {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct AdmissionRequest {
+    pub hardware_policy: SignedHardwarePolicy,
     pub heartbeat: HeartbeatCandidate,
     pub launch_policies: Vec<LaunchPolicy>,
     pub region: String,
@@ -184,14 +235,7 @@ pub struct LocalAdmissionRequest {
     pub heartbeat: HeartbeatCandidate,
     pub launch_policies: Vec<LaunchPolicy>,
     pub region: String,
-    pub trusted_platforms: Vec<TrustedPlatform>,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct TrustedPlatform {
-    pub chip_id: String,
-    pub reported_tcb: String,
+    pub trusted_chip_ids: Vec<String>,
 }
 
 /// Identity fields extracted from an untrusted raw report for collateral lookup only.
@@ -345,9 +389,25 @@ pub struct VerifiedBundle {
     pub created_at_unix_ms: i64,
     pub expires_at_unix_ms: i64,
     pub excluded_nodes: Vec<ExcludedNode>,
+    pub hardware_policy: VerifiedHardwarePolicy,
     pub releases: Vec<VerifiedRelease>,
     pub nodes: Vec<VerifiedNode>,
     pub original: BundleEnvelope,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HardwarePolicySource {
+    Local,
+    StogasBundle,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct VerifiedHardwarePolicy {
+    pub sequence: u64,
+    pub sha256: String,
+    pub source: HardwarePolicySource,
+    pub stogas_signing_key_id: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -361,6 +421,7 @@ pub struct NodeLedgerRecord {
     pub admitted_at: String,
     pub admission: NodeLedgerAdmission,
     pub certificate_history: Vec<NodeLedgerCertificate>,
+    pub hardware_policy: SignedHardwarePolicy,
     pub node_id: String,
     pub release: AllowedIgvm,
     pub release_measurement: String,

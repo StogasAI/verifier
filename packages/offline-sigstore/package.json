@@ -21,6 +21,7 @@
 	"type": "module",
 	"files": [
 		"bindings",
+		"LICENSE",
 		"pkg",
 		"README.md"
 	],

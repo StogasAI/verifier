@@ -17,6 +17,7 @@ use stogas_verifier::{
     },
     inspect_snp_quote as inspect_quote, response_proof, secret_release,
     verify_amd_collateral_admission as verify_amd_collateral, verify_bundle as verify_core_bundle,
+    verify_bundle_with_policy as verify_core_bundle_with_policy,
     verify_catalog_approval as verify_catalog,
     verify_certificate_csr_submission as verify_csr_submission,
     verify_heartbeat_admission as verify_admission,
@@ -30,6 +31,10 @@ use wasm_bindgen::prelude::*;
 /// Report whether this artifact contains the private staging provenance policy.
 #[wasm_bindgen(js_name = verifierSupportsStagingProvenance)]
 #[must_use]
+#[expect(
+    clippy::missing_const_for_fn,
+    reason = "wasm-bindgen rejects const exported functions"
+)]
 pub fn verifier_supports_staging_provenance() -> bool {
     cfg!(feature = "staging")
 }
@@ -126,22 +131,33 @@ impl WasmVerifier {
     /// # Errors
     ///
     /// Returns a JavaScript error for an untrusted bundle.
-    #[allow(clippy::cast_possible_truncation)]
     pub fn verify_bundle(&mut self, bundle: &[u8]) -> Result<JsValue, JsError> {
-        let now_unix_ms = js_sys::Date::now();
-        validate_time(now_unix_ms)?;
+        let now_unix_ms = wall_clock_ms()?;
         let output = self
             .core
-            .verify_bundle(bundle, now_unix_ms as i64, &self.environment)
+            .verify_bundle(bundle, now_unix_ms, &self.environment)
             .map_err(|error| JsError::new(&error.to_string()))?;
-        let result = to_js_value(&output)?;
-        self.active_bundle = Some(ActiveBundle {
-            expires_at_unix_ms: output.bundle.expires_at_unix_ms,
-            sha256: bundle_sha256(bundle),
-            recipients: recipients_from_verified_bundle(&output).ok(),
-            verification: output,
-        });
-        Ok(result)
+        self.activate_bundle(bundle, output)
+    }
+
+    /// Verify a bundle with caller-owned hardware appraisal rules.
+    ///
+    /// Fixed cryptographic, identity, launch, and freshness checks remain mandatory.
+    ///
+    /// # Errors
+    ///
+    /// Returns a JavaScript error for an untrusted bundle or invalid local policy.
+    pub fn verify_bundle_with_policy(
+        &mut self,
+        bundle: &[u8],
+        policy: &[u8],
+    ) -> Result<JsValue, JsError> {
+        let now_unix_ms = wall_clock_ms()?;
+        let output = self
+            .core
+            .verify_bundle_with_policy(bundle, policy, now_unix_ms, &self.environment)
+            .map_err(|error| JsError::new(&error.to_string()))?;
+        self.activate_bundle(bundle, output)
     }
 
     /// Verify one compact response receipt against the active bundle.
@@ -150,7 +166,6 @@ impl WasmVerifier {
     ///
     /// Returns a JavaScript error for body, signature, attested-key, drand, expiry, or E2EE
     /// transcript mismatches.
-    #[allow(clippy::cast_possible_truncation)]
     pub fn verify_response_proof(
         &self,
         proof: &[u8],
@@ -159,8 +174,7 @@ impl WasmVerifier {
         e2ee_transcript_sha256: Option<String>,
     ) -> Result<JsValue, JsError> {
         let e2ee_transcript_sha256 = e2ee_transcript_sha256.map(String::into_boxed_str);
-        let now_unix_ms = js_sys::Date::now();
-        validate_time(now_unix_ms)?;
+        let now_unix_ms = wall_clock_ms()?;
         let active = self
             .active_bundle
             .as_ref()
@@ -170,7 +184,7 @@ impl WasmVerifier {
             request_body,
             response_body,
             e2ee_transcript_sha256.as_deref(),
-            now_unix_ms as i64,
+            now_unix_ms,
             &active.verification,
         )
         .map_err(|error| JsError::new(&error.to_string()))?;
@@ -205,7 +219,6 @@ impl WasmVerifier {
     /// # Errors
     ///
     /// Returns a JavaScript error if the historical admission chain or receipt is invalid.
-    #[allow(clippy::cast_possible_truncation)]
     pub fn verify_historical_response_proof(
         &self,
         proof: &[u8],
@@ -216,8 +229,7 @@ impl WasmVerifier {
         e2ee_transcript_sha256: Option<String>,
     ) -> Result<JsValue, JsError> {
         let e2ee_transcript_sha256 = e2ee_transcript_sha256.map(String::into_boxed_str);
-        let now_unix_ms = js_sys::Date::now();
-        validate_time(now_unix_ms)?;
+        let now_unix_ms = wall_clock_ms()?;
         let output = self
             .core
             .verify_historical_response_proof(&HistoricalResponseProofInput {
@@ -225,7 +237,7 @@ impl WasmVerifier {
                 request_body,
                 response_body,
                 expected_e2ee_transcript_sha256: e2ee_transcript_sha256.as_deref(),
-                now_unix_ms: now_unix_ms as i64,
+                now_unix_ms,
                 ledger_bytes: ledger,
                 catalog_approval_bytes: catalog,
                 environment: &self.environment,
@@ -252,18 +264,16 @@ impl WasmVerifier {
     ///
     /// Returns a JavaScript error if either build proof, the launch policy, or the Stogas
     /// signature is invalid.
-    #[allow(clippy::cast_possible_truncation)]
     pub fn verify_release_approval(&self, release: &[u8]) -> Result<JsValue, JsError> {
-        let now_unix_ms = js_sys::Date::now();
-        validate_time(now_unix_ms)?;
+        let now_unix_ms = wall_clock_ms()?;
         #[cfg(feature = "staging")]
         let output = if self.staging {
-            verify_staging_release(release, now_unix_ms as i64)
+            verify_staging_release(release, now_unix_ms)
         } else {
-            verify_release(release, now_unix_ms as i64)
+            verify_release(release, now_unix_ms)
         };
         #[cfg(not(feature = "staging"))]
-        let output = verify_release(release, now_unix_ms as i64);
+        let output = verify_release(release, now_unix_ms);
         to_js_value(&output.map_err(|error| JsError::new(&error.to_string()))?)
     }
 
@@ -272,18 +282,16 @@ impl WasmVerifier {
     /// # Errors
     ///
     /// Returns a JavaScript error if either proof lane or their artifact hashes differ.
-    #[allow(clippy::cast_possible_truncation)]
     pub fn verify_catalog_approval(&self, approval: &[u8]) -> Result<JsValue, JsError> {
-        let now_unix_ms = js_sys::Date::now();
-        validate_time(now_unix_ms)?;
+        let now_unix_ms = wall_clock_ms()?;
         #[cfg(feature = "staging")]
         let output = if self.staging {
-            verify_staging_catalog(approval, now_unix_ms as i64)
+            verify_staging_catalog(approval, now_unix_ms)
         } else {
-            verify_catalog(approval, now_unix_ms as i64)
+            verify_catalog(approval, now_unix_ms)
         };
         #[cfg(not(feature = "staging"))]
-        let output = verify_catalog(approval, now_unix_ms as i64);
+        let output = verify_catalog(approval, now_unix_ms);
         to_js_value(&output.map_err(|error| JsError::new(&error.to_string()))?)
     }
 
@@ -292,7 +300,8 @@ impl WasmVerifier {
     /// # Errors
     ///
     /// Returns a JavaScript error unless a current verified bundle contains E2EE recipients.
-    #[allow(clippy::cast_possible_truncation)]
+    // The flat argument list is the generated JavaScript ABI.
+    #[allow(clippy::too_many_arguments)]
     pub fn seal_e2ee_request(
         &self,
         path: &str,
@@ -300,11 +309,13 @@ impl WasmVerifier {
         body: &[u8],
         accept: Option<String>,
         extra_fields: bool,
+        upstream_provider: Option<String>,
+        upstream_api_key: Option<String>,
     ) -> Result<WasmE2eeRequest, JsError> {
         let accept = accept.map(String::into_boxed_str);
-        let now_unix_ms = js_sys::Date::now();
-        validate_time(now_unix_ms)?;
-        let now_unix_ms = now_unix_ms as i64;
+        let upstream_provider = upstream_provider.map(String::into_boxed_str);
+        let upstream_api_key = upstream_api_key.map(String::into_boxed_str);
+        let now_unix_ms = wall_clock_ms()?;
         let active = self
             .active_bundle
             .as_ref()
@@ -316,6 +327,21 @@ impl WasmVerifier {
             .recipients
             .as_deref()
             .ok_or_else(|| JsError::new("the active verified bundle has no E2EE recipients"))?;
+        let upstream_credential = match (upstream_provider.as_deref(), upstream_api_key.as_deref())
+        {
+            (Some(provider), Some(provider_api_key)) => {
+                Some(stogas_verifier::e2ee::UpstreamCredential {
+                    provider,
+                    api_key: provider_api_key,
+                })
+            }
+            (None, None) => None,
+            _ => {
+                return Err(JsError::new(
+                    "an upstream provider and API key are required together",
+                ));
+            }
+        };
         let sealed = seal_request(&CoreE2eeRequest {
             path,
             request_id: None,
@@ -326,6 +352,7 @@ impl WasmVerifier {
             api_key,
             accept: accept.as_deref(),
             extra_fields,
+            upstream_credential,
             body,
         })
         .map_err(|error| JsError::new(&error.to_string()))?;
@@ -335,6 +362,31 @@ impl WasmVerifier {
             transcript_sha256: sealed.transcript_sha256,
             response: sealed.response,
         })
+    }
+}
+
+impl WasmVerifier {
+    fn activate_bundle(
+        &mut self,
+        bundle: &[u8],
+        output: stogas_verifier::VerificationOutput,
+    ) -> Result<JsValue, JsError> {
+        let result = to_js_value(&output)?;
+        let recipients = if output.bundle.nodes.is_empty() {
+            None
+        } else {
+            Some(
+                recipients_from_verified_bundle(&output)
+                    .map_err(|error| JsError::new(&error.to_string()))?,
+            )
+        };
+        self.active_bundle = Some(ActiveBundle {
+            expires_at_unix_ms: output.bundle.expires_at_unix_ms,
+            sha256: bundle_sha256(bundle),
+            recipients,
+            verification: output,
+        });
+        Ok(result)
     }
 }
 
@@ -359,7 +411,6 @@ impl WasmResponseProofStream {
     /// # Errors
     ///
     /// Returns a JavaScript error for a reused state or any proof verification failure.
-    #[allow(clippy::cast_possible_truncation)]
     pub fn finish(
         &mut self,
         verifier: &WasmVerifier,
@@ -368,8 +419,7 @@ impl WasmResponseProofStream {
     ) -> Result<JsValue, JsError> {
         let response_sha256 = self.finish_response_sha256()?;
         let e2ee_transcript_sha256 = e2ee_transcript_sha256.map(String::into_boxed_str);
-        let now_unix_ms = js_sys::Date::now();
-        validate_time(now_unix_ms)?;
+        let now_unix_ms = wall_clock_ms()?;
         let output = verifier
             .core
             .verify_response_proof_hashes(
@@ -377,7 +427,7 @@ impl WasmResponseProofStream {
                 &self.request_sha256,
                 &response_sha256,
                 e2ee_transcript_sha256.as_deref(),
-                now_unix_ms as i64,
+                now_unix_ms,
             )
             .map_err(|error| JsError::new(&error.to_string()))?;
         to_js_value(&output)
@@ -388,7 +438,6 @@ impl WasmResponseProofStream {
     /// # Errors
     ///
     /// Returns a JavaScript error for a reused state or any evidence or proof failure.
-    #[allow(clippy::cast_possible_truncation)]
     pub fn finish_historical(
         &mut self,
         verifier: &WasmVerifier,
@@ -399,8 +448,7 @@ impl WasmResponseProofStream {
     ) -> Result<JsValue, JsError> {
         let response_sha256 = self.finish_response_sha256()?;
         let e2ee_transcript_sha256 = e2ee_transcript_sha256.map(String::into_boxed_str);
-        let now_unix_ms = js_sys::Date::now();
-        validate_time(now_unix_ms)?;
+        let now_unix_ms = wall_clock_ms()?;
         let output = verifier
             .core
             .verify_historical_response_proof_hashes(&HistoricalResponseProofHashInput {
@@ -408,7 +456,7 @@ impl WasmResponseProofStream {
                 request_sha256: &self.request_sha256,
                 response_sha256: &response_sha256,
                 expected_e2ee_transcript_sha256: e2ee_transcript_sha256.as_deref(),
-                now_unix_ms: now_unix_ms as i64,
+                now_unix_ms,
                 ledger_bytes: ledger,
                 catalog_approval_bytes: catalog,
                 environment: &verifier.environment,
@@ -486,7 +534,7 @@ impl WasmE2eeRequest {
         Ok(output)
     }
 
-    /// Require the authenticated final response frame and no partial trailing data.
+    /// Require the authenticated final response record.
     ///
     /// # Errors
     ///
@@ -504,11 +552,17 @@ fn set_property(object: &js_sys::Object, name: &str, value: &JsValue) -> Result<
         .map_err(|_| JsError::new("could not construct an E2EE response event"))
 }
 
-fn validate_time(now_unix_ms: f64) -> Result<(), JsError> {
-    if !now_unix_ms.is_finite() || now_unix_ms.fract() != 0.0 {
-        return Err(JsError::new("now_unix_ms must be an integer"));
+fn wall_clock_ms() -> Result<i64, JsError> {
+    parse_unix_ms(js_sys::Date::now(), "platform wall clock")
+}
+
+#[allow(clippy::cast_possible_truncation)]
+fn parse_unix_ms(value: f64, label: &str) -> Result<i64, JsError> {
+    const MAX_SAFE_INTEGER: f64 = 9_007_199_254_740_991.0;
+    if !value.is_finite() || value.fract() != 0.0 || value.abs() > MAX_SAFE_INTEGER {
+        return Err(JsError::new(&format!("{label} must be a safe integer")));
     }
-    Ok(())
+    Ok(value as i64)
 }
 
 fn to_js_value<T: Serialize>(value: &T) -> Result<JsValue, JsError> {
@@ -542,12 +596,24 @@ pub fn seal_secret_release(
 ///
 /// Returns a JavaScript error when the platform time or bundle is invalid.
 #[wasm_bindgen]
-#[allow(clippy::cast_possible_truncation)]
 pub fn verify_bundle(bundle: &[u8]) -> Result<JsValue, JsError> {
-    let now_unix_ms = js_sys::Date::now();
-    validate_time(now_unix_ms)?;
-    let output = verify_core_bundle(bundle, now_unix_ms as i64, &Environment::stogas())
+    let now_unix_ms = wall_clock_ms()?;
+    let output = verify_core_bundle(bundle, now_unix_ms, &Environment::stogas())
         .map_err(|error| JsError::new(&error.to_string()))?;
+    to_js_value(&output)
+}
+
+/// Verify a bundle with caller-owned hardware appraisal rules.
+///
+/// # Errors
+///
+/// Returns a JavaScript error when the platform time, bundle, or local policy is invalid.
+#[wasm_bindgen]
+pub fn verify_bundle_with_policy(bundle: &[u8], policy: &[u8]) -> Result<JsValue, JsError> {
+    let now_unix_ms = wall_clock_ms()?;
+    let output =
+        verify_core_bundle_with_policy(bundle, policy, now_unix_ms, &Environment::stogas())
+            .map_err(|error| JsError::new(&error.to_string()))?;
     to_js_value(&output)
 }
 
@@ -557,11 +623,10 @@ pub fn verify_bundle(bundle: &[u8]) -> Result<JsValue, JsError> {
 ///
 /// Returns a JavaScript error when the captured time or release authorization is invalid.
 #[wasm_bindgen]
-#[allow(clippy::cast_possible_truncation)]
 pub fn verify_release_approval(release: &[u8], now_unix_ms: f64) -> Result<JsValue, JsError> {
-    validate_time(now_unix_ms)?;
-    let output = verify_release(release, now_unix_ms as i64)
-        .map_err(|error| JsError::new(&error.to_string()))?;
+    let now_unix_ms = parse_unix_ms(now_unix_ms, "now_unix_ms")?;
+    let output =
+        verify_release(release, now_unix_ms).map_err(|error| JsError::new(&error.to_string()))?;
     to_js_value(&output)
 }
 
@@ -571,30 +636,37 @@ pub fn verify_release_approval(release: &[u8], now_unix_ms: f64) -> Result<JsVal
 ///
 /// Returns a JavaScript error when the captured time or either authorization is invalid.
 #[wasm_bindgen]
-#[allow(clippy::cast_possible_truncation)]
 pub fn verify_catalog_approval(approval: &[u8], now_unix_ms: f64) -> Result<JsValue, JsError> {
-    validate_time(now_unix_ms)?;
-    let output = verify_catalog(approval, now_unix_ms as i64)
-        .map_err(|error| JsError::new(&error.to_string()))?;
+    let now_unix_ms = parse_unix_ms(now_unix_ms, "now_unix_ms")?;
+    let output =
+        verify_catalog(approval, now_unix_ms).map_err(|error| JsError::new(&error.to_string()))?;
     to_js_value(&output)
 }
 
+/// Verify one catalog approval with the private staging provenance policy.
+///
+/// # Errors
+///
+/// Returns a JavaScript error when the captured time or either authorization is invalid.
 #[cfg(feature = "staging")]
 #[wasm_bindgen]
-#[allow(clippy::cast_possible_truncation)]
 pub fn verify_staging_catalog_approval(
     approval: &[u8],
     now_unix_ms: f64,
 ) -> Result<JsValue, JsError> {
-    validate_time(now_unix_ms)?;
-    let output = verify_staging_catalog(approval, now_unix_ms as i64)
+    let now_unix_ms = parse_unix_ms(now_unix_ms, "now_unix_ms")?;
+    let output = verify_staging_catalog(approval, now_unix_ms)
         .map_err(|error| JsError::new(&error.to_string()))?;
     to_js_value(&output)
 }
 
+/// Reject staging catalog verification from a production verifier build.
+///
+/// # Errors
+///
+/// Always returns a JavaScript error because this build excludes the staging policy.
 #[cfg(not(feature = "staging"))]
 #[wasm_bindgen]
-#[allow(clippy::cast_possible_truncation)]
 pub fn verify_staging_catalog_approval(
     _approval: &[u8],
     _now_unix_ms: f64,
@@ -604,22 +676,30 @@ pub fn verify_staging_catalog_approval(
     ))
 }
 
+/// Verify one release approval with the private staging provenance policy.
+///
+/// # Errors
+///
+/// Returns a JavaScript error when the captured time or either authorization is invalid.
 #[cfg(feature = "staging")]
 #[wasm_bindgen]
-#[allow(clippy::cast_possible_truncation)]
 pub fn verify_staging_release_approval(
     release: &[u8],
     now_unix_ms: f64,
 ) -> Result<JsValue, JsError> {
-    validate_time(now_unix_ms)?;
-    let output = verify_staging_release(release, now_unix_ms as i64)
+    let now_unix_ms = parse_unix_ms(now_unix_ms, "now_unix_ms")?;
+    let output = verify_staging_release(release, now_unix_ms)
         .map_err(|error| JsError::new(&error.to_string()))?;
     to_js_value(&output)
 }
 
+/// Reject staging release verification from a production verifier build.
+///
+/// # Errors
+///
+/// Always returns a JavaScript error because this build excludes the staging policy.
 #[cfg(not(feature = "staging"))]
 #[wasm_bindgen]
-#[allow(clippy::cast_possible_truncation)]
 pub fn verify_staging_release_approval(
     _release: &[u8],
     _now_unix_ms: f64,
@@ -635,15 +715,14 @@ pub fn verify_staging_release_approval(
 ///
 /// Returns a JavaScript error for invalid time, certificate, CRL, identity, or digest data.
 #[wasm_bindgen]
-#[allow(clippy::cast_possible_truncation)]
 pub fn verify_amd_collateral_admission(
     request: &[u8],
     now_unix_ms: f64,
     required_until_unix_ms: f64,
 ) -> Result<JsValue, JsError> {
-    validate_time(now_unix_ms)?;
-    validate_time(required_until_unix_ms)?;
-    let output = verify_amd_collateral(request, now_unix_ms as i64, required_until_unix_ms as i64)
+    let now_unix_ms = parse_unix_ms(now_unix_ms, "now_unix_ms")?;
+    let required_until_unix_ms = parse_unix_ms(required_until_unix_ms, "required_until_unix_ms")?;
+    let output = verify_amd_collateral(request, now_unix_ms, required_until_unix_ms)
         .map_err(|error| JsError::new(&error.to_string()))?;
     to_js_value(&output)
 }
@@ -654,14 +733,13 @@ pub fn verify_amd_collateral_admission(
 ///
 /// Returns a JavaScript error for malformed policy, time, or untrusted evidence.
 #[wasm_bindgen]
-#[allow(clippy::cast_possible_truncation)]
 pub fn verify_sigstore_github_attestation(
     bundle: &[u8],
     expected_subjects_json: &str,
     policy_json: &str,
     now_unix_ms: f64,
 ) -> Result<JsValue, JsError> {
-    validate_time(now_unix_ms)?;
+    let now_unix_ms = parse_unix_ms(now_unix_ms, "now_unix_ms")?;
     let owned: Vec<OwnedSubject> = serde_json::from_str(expected_subjects_json)
         .map_err(|error| JsError::new(&format!("invalid subjects: {error}")))?;
     let subjects = owned
@@ -673,7 +751,7 @@ pub fn verify_sigstore_github_attestation(
         .collect::<Vec<_>>();
     let policy: GithubPolicy = serde_json::from_str(policy_json)
         .map_err(|error| JsError::new(&format!("invalid policy: {error}")))?;
-    let output = verify_github_attestation(bundle, &subjects, &policy, now_unix_ms as i64)
+    let output = verify_github_attestation(bundle, &subjects, &policy, now_unix_ms)
         .map_err(|error| JsError::new(&error.to_string()))?;
     to_js_value(&output)
 }
@@ -695,11 +773,10 @@ pub fn inspect_snp_quote(quote: &str) -> Result<JsValue, JsError> {
 ///
 /// Returns a JavaScript error when time, input, or any trust check fails.
 #[wasm_bindgen]
-#[allow(clippy::cast_possible_truncation)]
 pub fn verify_heartbeat_admission(request: &[u8], now_unix_ms: f64) -> Result<JsValue, JsError> {
-    validate_time(now_unix_ms)?;
-    let output = verify_admission(request, now_unix_ms as i64)
-        .map_err(|error| JsError::new(&error.to_string()))?;
+    let now_unix_ms = parse_unix_ms(now_unix_ms, "now_unix_ms")?;
+    let output =
+        verify_admission(request, now_unix_ms).map_err(|error| JsError::new(&error.to_string()))?;
     to_js_value(&output)
 }
 
@@ -738,13 +815,12 @@ pub fn verify_certificate_csr_submission(
 /// Returns a JavaScript error when time, input, binding, replay, or configured local signature
 /// verification fails.
 #[wasm_bindgen]
-#[allow(clippy::cast_possible_truncation)]
 pub fn verify_local_heartbeat_admission(
     request: &[u8],
     now_unix_ms: f64,
 ) -> Result<JsValue, JsError> {
-    validate_time(now_unix_ms)?;
-    let output = verify_local_admission(request, now_unix_ms as i64)
+    let now_unix_ms = parse_unix_ms(now_unix_ms, "now_unix_ms")?;
+    let output = verify_local_admission(request, now_unix_ms)
         .map_err(|error| JsError::new(&error.to_string()))?;
     to_js_value(&output)
 }

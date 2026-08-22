@@ -16,7 +16,6 @@ staging = ["stogas-verifier/staging"]
 [dependencies]
 base64.workspace = true
 js-sys = "0.3.78"
-getrandom = { version = "0.3.4", features = ["wasm_js"] }
 getrandom-02 = { package = "getrandom", version = "0.2.17", features = ["js"] }
 getrandom-04 = { package = "getrandom", version = "0.4.3", features = ["wasm_js"] }
 hex.workspace = true
@@ -30,3 +29,7 @@ wasm-bindgen = "0.2.101"
 
 [lints]
 workspace = true
+
+[package.metadata.cargo-machete]
+# These direct dependencies select JavaScript entropy backends for transitive users.
+ignored = ["getrandom-02", "getrandom-04"]

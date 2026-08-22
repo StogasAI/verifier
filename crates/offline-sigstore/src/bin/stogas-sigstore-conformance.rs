@@ -3,8 +3,10 @@
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use serde::Deserialize;
 use sha2::{Digest as _, Sha256};
-use std::{path::PathBuf, time::UNIX_EPOCH};
+use std::{io::Read as _, path::PathBuf, time::UNIX_EPOCH};
 use stogas_offline_sigstore::{IdentityPolicy, Subject, verify_dsse_attestation};
+
+const MAX_BUNDLE_BYTES: u64 = 16 * 1024 * 1024;
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -49,8 +51,7 @@ fn main() {
 
 fn run() -> Result<(), String> {
     let arguments = parse_arguments()?;
-    let bundle = std::fs::read(&arguments.bundle)
-        .map_err(|error| format!("could not read bundle: {error}"))?;
+    let bundle = read_bounded_bundle(&arguments.bundle)?;
     let digest = artifact_digest(&arguments.artifact)?;
     let shape: BundleShape = serde_json::from_slice(&bundle)
         .map_err(|error| format!("could not inspect DSSE bundle: {error}"))?;
@@ -132,7 +133,31 @@ fn artifact_digest(value: &str) -> Result<String, String> {
     {
         return Ok(digest.to_owned());
     }
-    let bytes =
-        std::fs::read(value).map_err(|error| format!("could not read artifact: {error}"))?;
-    Ok(hex::encode(Sha256::digest(bytes)))
+    let mut file =
+        std::fs::File::open(value).map_err(|error| format!("could not read artifact: {error}"))?;
+    let mut hasher = Sha256::new();
+    let mut buffer = vec![0_u8; 1024 * 1024];
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .map_err(|error| format!("could not read artifact: {error}"))?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(hex::encode(hasher.finalize()))
+}
+
+fn read_bounded_bundle(path: &PathBuf) -> Result<Vec<u8>, String> {
+    let file =
+        std::fs::File::open(path).map_err(|error| format!("could not read bundle: {error}"))?;
+    let mut bundle = Vec::new();
+    file.take(MAX_BUNDLE_BYTES + 1)
+        .read_to_end(&mut bundle)
+        .map_err(|error| format!("could not read bundle: {error}"))?;
+    if u64::try_from(bundle.len()).unwrap_or(u64::MAX) > MAX_BUNDLE_BYTES {
+        return Err(format!("bundle exceeds {MAX_BUNDLE_BYTES} bytes"));
+    }
+    Ok(bundle)
 }

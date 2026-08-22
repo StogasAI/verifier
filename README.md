@@ -23,12 +23,15 @@ stogas-verify serve
 
 Point any OpenAI-compatible client at `http://127.0.0.1:8787/v1`. The proxy:
 
-- randomly polls one independent evidence origin every five minutes by default, falls back to the other
+- polls one randomly selected evidence origin on a five-minute target with ±10% jitter by default, falls back to the other
   after network, HTTP, local-verification, or snapshot-order failure, and avoids reverifying
   identical bytes;
 - supports attested TLS, E2EE, or both on the normal inference endpoints;
 - requires TLS 1.3 with X25519MLKEM768, WebPKI, and certificate and public-key pinning in native `tls` and `both` modes;
 - sends E2EE over ordinary WebPKI HTTPS when hybrid TLS is unavailable;
+- carries pass-through provider credential headers only inside the E2EE request;
+- keeps polling every four to eight seconds and returns HTTP 503 when a verified bundle has no
+  trusted gateways;
 - forwards `/v1/*` requests and streaming responses without installing a local CA.
 
 The official origins are `https://evidence.stogas.ai/bundles/latest.json` on Cloudflare/R2 and
@@ -44,7 +47,7 @@ stogas-verify serve --browser-origin https://app.example.com
 
 The CLI prints a capability-protected base URL for that browser session. It handles CORS and local-network preflights without allowing other origins or forwarding local access headers upstream, and defaults browser-origin traffic to E2EE.
 
-Use `--security tls|e2ee|both` to select the transport policy. Bundle refresh defaults to five minutes; `--bundle-refresh-seconds` accepts any positive whole-second interval. The proxy also fetches before the hard bundle expiry, so a long interval cannot skip the final replacement window.
+Use `--security tls|e2ee|both` to select the transport policy. Bundle refresh uses a five-minute target by default; every configured target receives ±10% jitter. `--bundle-refresh-seconds` accepts any positive whole-second target. The proxy also fetches before the hard bundle expiry, so a long interval cannot skip the final replacement window. A valid empty trust set is an explicit unavailable state, not a verification failure. When a non-empty bundle is active, both official origins must return verified empty candidates before the proxy replaces it. This availability safeguard does not apply to a caller-selected single origin. Once active, an empty trust set blocks inference and starts the faster recovery polling above.
 
 ### Verify a file
 
@@ -53,6 +56,25 @@ stogas-verify verify bundle.json
 ```
 
 Use `-` to read from standard input. The command prints the verified release, trusted gateways, excluded stale gateways, and bundle expiry.
+
+Each bundle contains a Stogas-signed default hardware policy. It defines mutable AMD advisory appraisal, such as minimum TCB components, required report-v5 mitigation bits, and required platform state. The signature proves that Stogas selected the policy. It does not prove that the policy matches every customer's risk decision.
+
+To own that decision, copy `body.hardware_policy.policy` from a bundle, review or change it, and pass the bare policy file:
+
+```console
+stogas-verify verify bundle.json --policy hardware-policy.json
+stogas-verify serve --policy hardware-policy.json
+```
+
+The local file does not need a Stogas signature. Its file distribution is the caller's trust boundary. The verifier still checks the bundled policy signature and every fixed quote, certificate, report binding, release, encoding, and freshness rule. A stricter local policy can make the complete fleet unavailable until its hardware is updated.
+
+The shipped policy accepts one reviewed Milan B1 floor: bootloader 4, SNP 29, microcode 222,
+mitigation bits 0, 1, and 3, ECC, completed alias checking, and disabled SMT. It does not claim
+mitigation bits 2 or 4. A customer that requires either bit can supply a stricter local policy,
+which rejects the current fleet. AMD documents those additional mitigations in
+[AMD-SB-3016](https://www.amd.com/en/resources/product-security/bulletin/amd-sb-3016.html) and
+[AMD-SB-3034](https://www.amd.com/en/resources/product-security/bulletin/amd-sb-3034.html).
+Passing attestation values does not replace required host or guest lifecycle work.
 
 ## SDK
 
@@ -73,6 +95,8 @@ const result = verifier.verify_bundle(new Uint8Array(await response.arrayBuffer(
 console.log(result.bundle.nodes);
 ```
 
+Use `verify_bundle_with_policy(bundleBytes, policyBytes)` to replace only mutable hardware appraisal. Managed SDK transports accept the same bare policy as `hardwarePolicy` in JavaScript, `hardware_policy` in Rust and Python, and `HardwarePolicy` in Go. `result.bundle.hardware_policy` reports the applied policy hash, sequence, source, and Stogas key ID when the bundled default was used.
+
 `result.bundle.catalogs` contains the verified catalog approvals. Each approval requires one
 GitHub Actions attestation over the runtime and public hashes and one separate Stogas-signed
 manifest from an independent build with the same hashes. Every accepted node's
@@ -85,9 +109,14 @@ Browser code imports `@stogas/verifier/browser` and calls its default WebAssembl
 accepted bytes were verified, and the measured local cryptographic verification time. Byte-identical
 refreshes reuse the earlier verified result and its measurement.
 
+When a verified bundle has no trusted nodes, the snapshot status is `unavailable`. The transport
+remains active, polls every four to eight seconds, and fails protected requests locally until a
+newer verified bundle provides a trusted node.
+
 The client API has two forms:
 
 - `verify_bundle(bytes)` for one verification;
+- `verify_bundle_with_policy(bytes, policy)` for verification with caller-owned AMD appraisal rules;
 - `new Verifier().verify_bundle(bytes)` when verifying successive bundles. The instance reuses already verified immutable release provenance in memory.
 
 Both verifier forms read the platform clock once. Neither fetches, schedules refreshes, persists state, or makes requests to the inference API.
@@ -122,7 +151,7 @@ stream.write(frameBytes); // Call for each non-Stogas frame, including [DONE].
 const receipt = stream.finish(proofBytes, e2eeTranscriptSHA256);
 ```
 
-The one-shot body API has a 64 MiB limit. The stream API keeps only a running hash. The CLI also
+The one-shot body API has a 128 MiB limit. The stream API keeps only a running hash. The CLI also
 hashes request and response files incrementally.
 
 `StogasTransport.verifyResponseProof(...)` performs the same check against the transport's
@@ -153,6 +182,8 @@ A trusted result means that:
 - the independent Stogas release signature authorizes those same launch-policy bytes;
 - each trusted gateway presents a valid AMD SEV-SNP report for an authorized launch measurement;
 - the report CPUID, AMD product, VCEK structure, generation-specific hardware identifier, complete TCB, and pinned product root agree; unknown processor profiles fail closed;
+- the exact signed report bytes and signature encoding are valid, including all reserved bytes;
+- report version 5 current, reported, committed, and launch TCB values, launch and current mitigation vectors, and platform state satisfy the applied hardware policy;
 - the report binds that gateway's TLS, certificate-rotation, response-signing, and encryption keys;
 - the unsigned bundle envelope's SHA-256 matches its canonical body, while every trust claim verifies to its embedded root;
 - the bundle was created no more than three minutes before or one minute after local verification, remains unexpired, and has a positive validity interval of no more than 15 minutes;

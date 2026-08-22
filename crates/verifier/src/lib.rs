@@ -1,6 +1,6 @@
 //! Deterministic, networkless verification for Stogas confidential bundles.
 
-mod strict_json;
+pub(crate) use stogas_offline_sigstore::strict_json;
 mod types;
 
 pub mod e2ee;
@@ -63,6 +63,8 @@ const STOGAS_RELEASE_PUBLIC_KEY_DER_BASE64: &str =
 const STAGING_PROVENANCE_TYPE: &str = "https://stogas.ai/attestations/staging-development/v1";
 const HEARTBEAT_SIGNATURE_DOMAIN: &[u8] = b"stogas.gateway-heartbeat.v1\0";
 const CSR_SIGNATURE_DOMAIN: &[u8] = b"stogas.gateway-csr-submission.v1\0";
+const HARDWARE_POLICY_SIGNATURE_DOMAIN: &[u8] = b"stogas hardware policy v1\n";
+const SNP_PLATFORM_INFO_KNOWN_MASK: u64 = 0xbf;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum AmdTcbLayout {
@@ -371,8 +373,42 @@ impl Verifier {
         now_unix_ms: i64,
         environment: &Environment,
     ) -> Result<VerificationOutput, Error> {
+        self.verify_bundle_using_policy(bundle_bytes, None, now_unix_ms, environment)
+    }
+
+    /// Verify a bundle while replacing only its mutable hardware appraisal rules.
+    ///
+    /// The bundled Stogas policy signature is still checked. The local policy cannot disable
+    /// quote signatures, certificate chains, report bindings, launch policy, or freshness checks.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error without changing the active bundle or release cache.
+    pub fn verify_bundle_with_policy(
+        &mut self,
+        bundle_bytes: &[u8],
+        local_policy_bytes: &[u8],
+        now_unix_ms: i64,
+        environment: &Environment,
+    ) -> Result<VerificationOutput, Error> {
+        self.verify_bundle_using_policy(
+            bundle_bytes,
+            Some(local_policy_bytes),
+            now_unix_ms,
+            environment,
+        )
+    }
+
+    fn verify_bundle_using_policy(
+        &mut self,
+        bundle_bytes: &[u8],
+        local_policy_bytes: Option<&[u8]>,
+        now_unix_ms: i64,
+        environment: &Environment,
+    ) -> Result<VerificationOutput, Error> {
         let (output, next_cache) = verify_bundle_inner(
             bundle_bytes,
+            local_policy_bytes,
             now_unix_ms,
             environment,
             &self.verified_catalogs,
@@ -501,6 +537,25 @@ pub fn verify_bundle(
     environment: &Environment,
 ) -> Result<VerificationOutput, Error> {
     Verifier::default().verify_bundle(bundle_bytes, now_unix_ms, environment)
+}
+
+/// Verify a bundle with caller-owned hardware appraisal rules.
+///
+/// # Errors
+///
+/// Returns an error if either the bundle or the local policy is invalid.
+pub fn verify_bundle_with_policy(
+    bundle_bytes: &[u8],
+    local_policy_bytes: &[u8],
+    now_unix_ms: i64,
+    environment: &Environment,
+) -> Result<VerificationOutput, Error> {
+    Verifier::default().verify_bundle_with_policy(
+        bundle_bytes,
+        local_policy_bytes,
+        now_unix_ms,
+        environment,
+    )
 }
 
 /// Verify one release authorization before Control persists it.
@@ -633,6 +688,7 @@ pub fn verify_node_ledger_record(
     }
     validate_ledger_certificate_history(&record, admitted_at)?;
     let release = verify_release(&record.release, environment, admitted_at)?;
+    let hardware_policy = verify_signed_hardware_policy(&record.hardware_policy, environment)?;
     let node = ledger_record_node(&record);
     validate_node_shape(&node)?;
     let node_preimage = format!(
@@ -657,11 +713,10 @@ pub fn verify_node_ledger_record(
     )?;
     let verified_node = verify_node(
         &node,
-        admitted_at,
-        admitted_at,
-        admitted_at,
+        NodeVerificationTime::at(admitted_at),
         &launch_policies,
         &amd_stacks,
+        &hardware_policy.policy,
     )?;
     Ok(VerifiedNodeLedgerRecord {
         admitted_at_unix_ms: admitted_at,
@@ -842,6 +897,8 @@ pub fn verify_heartbeat_admission(
         .map_err(|error| Error::InvalidJson(error.to_string()))?;
     let request: AdmissionRequest = serde_json::from_value(value)
         .map_err(|error| Error::InvalidBundle(format!("invalid admission request: {error}")))?;
+    let hardware_policy =
+        verify_signed_hardware_policy(&request.hardware_policy, &Environment::stogas())?;
     if request.launch_policies.is_empty() || request.launch_policies.len() > 2 {
         return Err(Error::InvalidBundle(
             "admission requires one or two launch policies".into(),
@@ -911,11 +968,10 @@ pub fn verify_heartbeat_admission(
     )?;
     let verified = verify_node(
         &node,
-        now_unix_ms,
-        now_unix_ms,
-        now_unix_ms,
+        NodeVerificationTime::at(now_unix_ms),
         &policies,
         &amd_stacks,
+        &hardware_policy.policy,
     )?;
     verify_heartbeat_candidate_signature(heartbeat, &heartbeat.report_data.ed25519_public_key)?;
     Ok(VerifiedAdmission { node, verified })
@@ -1168,13 +1224,12 @@ pub fn verify_local_heartbeat_admission(
     validate_local_heartbeat(heartbeat, now_unix_ms)?;
 
     let identity = inspect_local_quote(&request, now_unix_ms)?;
-    if !request.trusted_platforms.iter().any(|platform| {
-        platform.chip_id.eq_ignore_ascii_case(&identity.chip_id)
-            && platform
-                .reported_tcb
-                .eq_ignore_ascii_case(&identity.reported_tcb)
-    }) {
-        return Err(Error::Node("unknown local chip id or reported TCB".into()));
+    if !request
+        .trusted_chip_ids
+        .iter()
+        .any(|chip_id| chip_id.eq_ignore_ascii_case(&identity.chip_id))
+    {
+        return Err(Error::Node("unknown local chip id".into()));
     }
     let launch_policy = request
         .launch_policies
@@ -1214,7 +1269,7 @@ pub fn verify_local_heartbeat_admission(
         )?;
         verify_quicknet(&node.report_data.drand)?;
         if let Some(report) = identity.raw_report.as_deref() {
-            check_raw_report_bindings(&node, launch_policy, report)?;
+            check_raw_report_bindings(&node, launch_policy, report, None)?;
             verify_local_raw_report_signature(
                 report,
                 request.amd_report_signing_public_key.as_deref(),
@@ -1349,9 +1404,15 @@ fn parse_local_admission_request(request_bytes: &[u8]) -> Result<LocalAdmissionR
             "local admission requires one or two launch policies".into(),
         ));
     }
-    if request.trusted_platforms.is_empty() || request.trusted_platforms.len() > 16 {
+    if request.trusted_chip_ids.is_empty()
+        || request.trusted_chip_ids.len() > 16
+        || request
+            .trusted_chip_ids
+            .iter()
+            .any(|chip_id| !is_lower_hex(chip_id, 64))
+    {
         return Err(Error::InvalidBundle(
-            "local admission requires one to sixteen trusted platforms".into(),
+            "local admission requires one to sixteen trusted chip ids".into(),
         ));
     }
     if !matches!(
@@ -1458,17 +1519,16 @@ fn inspect_local_mock_quote(
     {
         return Err(Error::Node("local mock quote binding differs".into()));
     }
-    if request.trusted_platforms.len() != 1 || request.launch_policies.len() != 1 {
+    if request.trusted_chip_ids.len() != 1 || request.launch_policies.len() != 1 {
         return Err(Error::Node(
-            "local mock admission requires exactly one platform and release".into(),
+            "local mock admission requires exactly one chip and release".into(),
         ));
     }
-    let platform = &request.trusted_platforms[0];
     Ok(LocalQuoteIdentity {
-        chip_id: platform.chip_id.to_lowercase(),
+        chip_id: request.trusted_chip_ids[0].to_lowercase(),
         raw_report: None,
         release_measurement: request.launch_policies[0].measurement.to_lowercase(),
-        reported_tcb: platform.reported_tcb.to_lowercase(),
+        reported_tcb: "0000000000000000".into(),
     })
 }
 
@@ -1522,26 +1582,58 @@ fn inspect_local_raw_quote(request: &LocalAdmissionRequest) -> Result<LocalQuote
 
 #[cfg(feature = "snp")]
 fn verify_local_raw_report_signature(report: &[u8], public_key: Option<&str>) -> Result<(), Error> {
+    let public_key = public_key
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| Error::Node("local AMD report signing key is not configured".into()))?;
+    let der = decode_public_key_material(public_key)?;
+    verify_raw_snp_report_signature(report, &der, "local")
+}
+
+#[cfg(feature = "snp")]
+fn verify_raw_snp_report_signature_with_vcek(
+    report: &[u8],
+    vcek_der: &[u8],
+    node_id: &str,
+) -> Result<(), Error> {
+    use x509_parser::parse_x509_certificate;
+
+    let (remaining, vcek) = parse_x509_certificate(vcek_der)
+        .map_err(|error| Error::Node(format!("{node_id} AMD VCEK: {error}")))?;
+    if !remaining.is_empty() {
+        return Err(Error::Node(format!(
+            "{node_id} AMD VCEK contains trailing data"
+        )));
+    }
+    verify_raw_snp_report_signature(report, vcek.public_key().raw, node_id)
+}
+
+#[cfg(feature = "snp")]
+fn verify_raw_snp_report_signature(
+    report: &[u8],
+    public_key_der: &[u8],
+    label: &str,
+) -> Result<(), Error> {
     use p384::{
         ecdsa::{Signature, VerifyingKey, signature::hazmat::PrehashVerifier as _},
         pkcs8::DecodePublicKey as _,
     };
     use sha2::Sha384;
 
-    let public_key = public_key
-        .filter(|value| !value.trim().is_empty())
-        .ok_or_else(|| Error::Node("local AMD report signing key is not configured".into()))?;
-    let der = decode_public_key_material(public_key)?;
-    let key = VerifyingKey::from_public_key_der(&der)
-        .map_err(|error| Error::Node(format!("local AMD report signing key: {error}")))?;
+    if report.len() != 0x4a0 {
+        return Err(Error::Node(format!(
+            "{label} SNP report has the wrong size"
+        )));
+    }
+    let key = VerifyingKey::from_public_key_der(public_key_der)
+        .map_err(|error| Error::Node(format!("{label} AMD report signing key: {error}")))?;
     let signature = &report[0x2a0..0x4a0];
     if signature[48..72].iter().any(|byte| *byte != 0)
         || signature[120..144].iter().any(|byte| *byte != 0)
         || signature[144..].iter().any(|byte| *byte != 0)
     {
-        return Err(Error::Node(
-            "local SNP signature reserved bytes are nonzero".into(),
-        ));
+        return Err(Error::Node(format!(
+            "{label} SNP signature reserved bytes are nonzero"
+        )));
     }
     let mut r = [0_u8; 48];
     let mut s = [0_u8; 48];
@@ -1550,10 +1642,10 @@ fn verify_local_raw_report_signature(report: &[u8], public_key: Option<&str>) ->
         s[index] = signature[72 + 47 - index];
     }
     let signature = Signature::from_scalars(r, s)
-        .map_err(|error| Error::Node(format!("local SNP signature encoding: {error}")))?;
+        .map_err(|error| Error::Node(format!("{label} SNP signature encoding: {error}")))?;
     let digest = Sha384::digest(&report[..0x2a0]);
     key.verify_prehash(&digest, &signature)
-        .map_err(|error| Error::Node(format!("local SNP signature: {error}")))
+        .map_err(|error| Error::Node(format!("{label} SNP signature: {error}")))
 }
 
 #[cfg(not(feature = "snp"))]
@@ -1585,19 +1677,154 @@ fn decode_public_key_material(value: &str) -> Result<Vec<u8>, Error> {
         .map_err(|_| Error::Node("local AMD report signing key encoding is invalid".into()))
 }
 
-fn verify_bundle_inner(
-    bundle_bytes: &[u8],
-    now_unix_ms: i64,
+struct SelectedHardwarePolicy {
+    policy: HardwarePolicy,
+    verified: VerifiedHardwarePolicy,
+}
+
+fn select_hardware_policy(
+    signed: &SignedHardwarePolicy,
+    local_policy_bytes: Option<&[u8]>,
     environment: &Environment,
-    verified_catalogs: &BTreeMap<String, VerifiedCatalogRelease>,
-    verified_releases: &BTreeMap<String, VerifiedRelease>,
-) -> Result<(VerificationOutput, VerificationCache), Error> {
+) -> Result<SelectedHardwarePolicy, Error> {
+    let signed_policy = verify_signed_hardware_policy(signed, environment)?;
+    let Some(local_policy_bytes) = local_policy_bytes else {
+        return Ok(signed_policy);
+    };
+    if local_policy_bytes.len() > MAX_INPUT_BYTES {
+        return Err(Error::TooLarge);
+    }
+    let value = strict_json::from_slice(local_policy_bytes)
+        .map_err(|error| Error::InvalidJson(format!("invalid local hardware policy: {error}")))?;
+    let policy: HardwarePolicy = serde_json::from_value(value)
+        .map_err(|error| Error::InvalidBundle(format!("invalid local hardware policy: {error}")))?;
+    let canonical = validate_hardware_policy(&policy)?;
+    Ok(SelectedHardwarePolicy {
+        verified: VerifiedHardwarePolicy {
+            sequence: policy.sequence,
+            sha256: hex::encode(Sha256::digest(canonical.as_bytes())),
+            source: HardwarePolicySource::Local,
+            stogas_signing_key_id: None,
+        },
+        policy,
+    })
+}
+
+fn verify_signed_hardware_policy(
+    signed: &SignedHardwarePolicy,
+    environment: &Environment,
+) -> Result<SelectedHardwarePolicy, Error> {
+    let signature = &signed.stogas_signature;
+    if signature.schema != "stogas.hardware-policy.signature.v1"
+        || signature.algorithm != "Ed25519"
+        || signature.signed != "hardware-policy.json"
+    {
+        return Err(Error::InvalidBundle(
+            "unsupported hardware policy signature".into(),
+        ));
+    }
+    let key = environment
+        .release_keys
+        .get(&signature.key_id)
+        .ok_or_else(|| Error::InvalidBundle("hardware policy signing key is not trusted".into()))?;
+    let canonical = validate_hardware_policy(&signed.policy)?;
+    let mut payload = HARDWARE_POLICY_SIGNATURE_DOMAIN.to_vec();
+    payload.extend_from_slice(canonical.as_bytes());
+    verify_ed25519(key, &payload, &signature.signature)
+        .map_err(|error| Error::InvalidBundle(format!("hardware policy signature: {error}")))?;
+    Ok(SelectedHardwarePolicy {
+        verified: VerifiedHardwarePolicy {
+            sequence: signed.policy.sequence,
+            sha256: hex::encode(Sha256::digest(canonical.as_bytes())),
+            source: HardwarePolicySource::StogasBundle,
+            stogas_signing_key_id: Some(signature.key_id.clone()),
+        },
+        policy: signed.policy.clone(),
+    })
+}
+
+fn validate_hardware_policy(policy: &HardwarePolicy) -> Result<String, Error> {
+    if policy.schema != "stogas.hardware-policy.v1"
+        || policy.sequence == 0
+        || policy.amd_sev_snp.is_empty()
+        || policy.amd_sev_snp.len() > 32
+    {
+        return Err(Error::InvalidBundle(
+            "unsupported or invalid hardware policy".into(),
+        ));
+    }
+    let mut profiles = BTreeSet::new();
+    for profile in &policy.amd_sev_snp {
+        if profile.report_version != 5
+            || profile.product.is_empty()
+            || profile.product.len() > 32
+            || !profiles.insert((
+                profile.cpuid_family,
+                profile.cpuid_model,
+                profile.cpuid_stepping,
+            ))
+        {
+            return Err(Error::InvalidBundle(
+                "hardware policy has an invalid or duplicate AMD profile".into(),
+            ));
+        }
+        let built_in = amd_product_from_cpuid(profile.cpuid_family, profile.cpuid_model)
+            .ok_or_else(|| {
+                Error::InvalidBundle("hardware policy has an unsupported CPUID".into())
+            })?;
+        if profile.product != built_in.product_name
+            || built_in.tcb_layout != AmdTcbLayout::Family19h
+        {
+            return Err(Error::InvalidBundle(
+                "hardware policy product differs from its CPUID or TCB layout".into(),
+            ));
+        }
+        let required_platform = parse_u64_hex(
+            &profile.required_platform_info_mask,
+            "required platform-info mask",
+        )?;
+        let forbidden_platform = parse_u64_hex(
+            &profile.forbidden_platform_info_mask,
+            "forbidden platform-info mask",
+        )?;
+        if required_platform & forbidden_platform != 0
+            || required_platform & !SNP_PLATFORM_INFO_KNOWN_MASK != 0
+            || forbidden_platform & !SNP_PLATFORM_INFO_KNOWN_MASK != 0
+        {
+            return Err(Error::InvalidBundle(
+                "hardware policy has invalid platform-info masks".into(),
+            ));
+        }
+        parse_u64_hex(
+            &profile.required_launch_mitigation_mask,
+            "required launch mitigation mask",
+        )?;
+        parse_u64_hex(
+            &profile.required_current_mitigation_mask,
+            "required current mitigation mask",
+        )?;
+    }
+    let value = serde_json::to_value(policy)
+        .map_err(|error| Error::InvalidBundle(format!("hardware policy: {error}")))?;
+    canonical_json(&value)
+}
+
+fn parse_u64_hex(value: &str, label: &str) -> Result<u64, Error> {
+    let hex = value
+        .strip_prefix("0x")
+        .filter(|hex| is_lower_hex(hex, 8))
+        .ok_or_else(|| Error::InvalidBundle(format!("hardware policy {label} is invalid")))?;
+    u64::from_str_radix(hex, 16)
+        .map_err(|_| Error::InvalidBundle(format!("hardware policy {label} is invalid")))
+}
+
+fn parse_and_verify_bundle_envelope(bundle_bytes: &[u8]) -> Result<BundleEnvelope, Error> {
     if bundle_bytes.len() > MAX_INPUT_BYTES {
         return Err(Error::TooLarge);
     }
     let value = strict_json::from_slice(bundle_bytes)
         .map_err(|error| Error::InvalidJson(error.to_string()))?;
-    let signed_body = serde_json::to_vec(
+    let body = serde_json::to_vec(
         value
             .get("body")
             .ok_or_else(|| Error::InvalidBundle("bundle body is absent".into()))?,
@@ -1606,7 +1833,25 @@ fn verify_bundle_inner(
     let envelope: BundleEnvelope =
         serde_json::from_value(value).map_err(|error| Error::InvalidBundle(error.to_string()))?;
     validate_shape(&envelope)?;
-    verify_envelope(&envelope, &signed_body)?;
+    verify_envelope(&envelope, &body)?;
+    Ok(envelope)
+}
+
+fn verify_bundle_inner(
+    bundle_bytes: &[u8],
+    local_policy_bytes: Option<&[u8]>,
+    now_unix_ms: i64,
+    environment: &Environment,
+    verified_catalogs: &BTreeMap<String, VerifiedCatalogRelease>,
+    verified_releases: &BTreeMap<String, VerifiedRelease>,
+) -> Result<(VerificationOutput, VerificationCache), Error> {
+    let envelope = parse_and_verify_bundle_envelope(bundle_bytes)?;
+
+    let hardware_policy = select_hardware_policy(
+        &envelope.body.hardware_policy,
+        local_policy_bytes,
+        environment,
+    )?;
 
     let created_at = parse_time(&envelope.body.created_at)?;
     let expires_at = parse_time(&envelope.body.expires_at)?;
@@ -1663,14 +1908,18 @@ fn verify_bundle_inner(
         created_at,
         expires_at,
     )?;
+    let verification_time = NodeVerificationTime {
+        bundle_created_at: created_at,
+        bundle_expires_at: expires_at,
+        now_unix_ms,
+    };
     let (nodes, excluded_nodes) = verify_and_partition_nodes(
         &envelope.body.nodes,
-        created_at,
-        expires_at,
-        now_unix_ms,
+        verification_time,
         &launch_policies,
         &amd_stacks,
         &catalog_policies,
+        &hardware_policy.policy,
     )?;
     Ok((
         VerificationOutput {
@@ -1680,6 +1929,7 @@ fn verify_bundle_inner(
                 created_at_unix_ms: created_at,
                 expires_at_unix_ms: expires_at,
                 excluded_nodes,
+                hardware_policy: hardware_policy.verified,
                 releases,
                 nodes,
                 original: envelope.clone(),
@@ -1692,15 +1942,13 @@ fn verify_bundle_inner(
     ))
 }
 
-#[allow(clippy::too_many_arguments)]
 fn verify_and_partition_nodes(
     bundle_nodes: &[Node],
-    created_at: i64,
-    expires_at: i64,
-    now_unix_ms: i64,
+    verification_time: NodeVerificationTime,
     launch_policies: &BTreeMap<&str, &LaunchPolicy>,
     amd_stacks: &BTreeMap<String, AmdCollateralStack>,
     catalog_policies: &BTreeMap<&str, u64>,
+    hardware_policy: &HardwarePolicy,
 ) -> Result<(Vec<VerifiedNode>, Vec<ExcludedNode>), Error> {
     let mut nodes = Vec::new();
     let mut excluded = Vec::new();
@@ -1708,16 +1956,15 @@ fn verify_and_partition_nodes(
         verify_node_catalog_policy(&node.node_id, &node.report_data.catalog, catalog_policies)?;
         let verified = verify_node(
             node,
-            created_at,
-            expires_at,
-            now_unix_ms,
+            verification_time,
             launch_policies,
             amd_stacks,
+            hardware_policy,
         )?;
         if verified
             .drand_round_time_unix_ms
             .saturating_add(MAX_NODE_EVIDENCE_AGE_MS)
-            < created_at
+            < verification_time.bundle_created_at
         {
             excluded.push(ExcludedNode {
                 drand_round: verified.drand_round,
@@ -2049,18 +2296,15 @@ fn verify_catalog_provenance(
     staging_development_provenance: bool,
     now_unix_ms: i64,
 ) -> Result<(Option<i64>, ReleaseProvenance), Error> {
-    #[cfg(feature = "staging")]
-    if staging_development_provenance {
-        return Ok((None, ReleaseProvenance::Staging));
+    if let Some(provenance) = staging_provenance(staging_development_provenance) {
+        return Ok(provenance);
     }
-    #[cfg(not(feature = "staging"))]
-    let _ = staging_development_provenance;
 
     let workflow_identity = format!(
         "https://github.com/StogasAI/catalog/.github/workflows/catalog-release.yml@refs/tags/{}",
         manifest.source.tag
     );
-    let verified = verify_github_attestation(
+    verify_github_provenance(
         attestation_bytes,
         &[
             Subject {
@@ -2081,13 +2325,8 @@ fn verify_catalog_provenance(
             require_github_hosted: true,
         },
         now_unix_ms,
+        "catalog provenance",
     )
-    .map_err(|error| Error::Release(format!("catalog provenance: {error}")))?;
-    let integrated_time = verified
-        .integrated_time
-        .checked_mul(1000)
-        .ok_or_else(|| Error::Release("catalog GitHub integration time overflows".into()))?;
-    Ok((Some(integrated_time), ReleaseProvenance::Github))
 }
 
 fn verify_release(
@@ -2168,18 +2407,15 @@ fn verify_release_provenance(
     staging_development_provenance: bool,
     now_unix_ms: i64,
 ) -> Result<(Option<i64>, ReleaseProvenance), Error> {
-    #[cfg(feature = "staging")]
-    if staging_development_provenance {
-        return Ok((None, ReleaseProvenance::Staging));
+    if let Some(provenance) = staging_provenance(staging_development_provenance) {
+        return Ok(provenance);
     }
-    #[cfg(not(feature = "staging"))]
-    let _ = staging_development_provenance;
 
     let workflow_identity = format!(
         "https://github.com/StogasAI/gateway/.github/workflows/gateway-igvm-release.yml@refs/tags/{}",
         policy.release_tag
     );
-    let verified = verify_github_attestation(
+    verify_github_provenance(
         attestation_bytes,
         &[
             Subject {
@@ -2200,12 +2436,40 @@ fn verify_release_provenance(
             require_github_hosted: true,
         },
         now_unix_ms,
+        "gateway provenance",
     )
-    .map_err(|error| Error::Release(error.to_string()))?;
+}
+
+const fn staging_provenance(enabled: bool) -> Option<(Option<i64>, ReleaseProvenance)> {
+    #[cfg(feature = "staging")]
+    {
+        if enabled {
+            Some((None, ReleaseProvenance::Staging))
+        } else {
+            None
+        }
+    }
+    #[cfg(not(feature = "staging"))]
+    {
+        let _ = enabled;
+        None
+    }
+}
+
+fn verify_github_provenance(
+    attestation_bytes: &[u8],
+    expected_subjects: &[Subject<'_>],
+    policy: &GithubPolicy,
+    now_unix_ms: i64,
+    context: &str,
+) -> Result<(Option<i64>, ReleaseProvenance), Error> {
+    let verified =
+        verify_github_attestation(attestation_bytes, expected_subjects, policy, now_unix_ms)
+            .map_err(|error| Error::Release(format!("{context}: {error}")))?;
     let integrated_time = verified
         .integrated_time
         .checked_mul(1000)
-        .ok_or_else(|| Error::Release("GitHub integration time overflows".into()))?;
+        .ok_or_else(|| Error::Release(format!("{context} GitHub integration time overflows")))?;
     Ok((Some(integrated_time), ReleaseProvenance::Github))
 }
 
@@ -2262,13 +2526,29 @@ fn is_staging_development_provenance(
     Ok(true)
 }
 
-fn verify_node(
-    node: &Node,
+#[derive(Clone, Copy)]
+struct NodeVerificationTime {
     bundle_created_at: i64,
     bundle_expires_at: i64,
     now_unix_ms: i64,
+}
+
+impl NodeVerificationTime {
+    const fn at(now_unix_ms: i64) -> Self {
+        Self {
+            bundle_created_at: now_unix_ms,
+            bundle_expires_at: now_unix_ms,
+            now_unix_ms,
+        }
+    }
+}
+
+fn verify_node(
+    node: &Node,
+    verification_time: NodeVerificationTime,
     launch_policies: &BTreeMap<&str, &LaunchPolicy>,
     amd_stacks: &BTreeMap<String, AmdCollateralStack>,
+    hardware_policy: &HardwarePolicy,
 ) -> Result<VerifiedNode, Error> {
     let launch_policy = launch_policies
         .get(node.release_measurement.as_str())
@@ -2278,7 +2558,7 @@ fn verify_node(
                 node.node_id, node.release_measurement
             ))
         })?;
-    if parse_time(&node.cert_expires_at)? < bundle_expires_at {
+    if parse_time(&node.cert_expires_at)? < verification_time.bundle_expires_at {
         return Err(Error::Node(format!(
             "bundle outlives {} certificate",
             node.node_id
@@ -2300,7 +2580,7 @@ fn verify_node(
         )));
     }
     let quote_verified_at = parse_time(&node.quote_verified_at)?;
-    if quote_verified_at > bundle_created_at {
+    if quote_verified_at > verification_time.bundle_created_at {
         return Err(Error::Node(format!(
             "{} quote verification time is later than bundle creation",
             node.node_id
@@ -2310,7 +2590,7 @@ fn verify_node(
         &node.node_id,
         node.report_data.drand.round,
         quote_verified_at,
-        now_unix_ms,
+        verification_time.now_unix_ms,
     )?;
     let round = node.report_data.drand.round;
     verify_quicknet(&node.report_data.drand)?;
@@ -2320,15 +2600,17 @@ fn verify_node(
     verify_snp_node(
         node,
         launch_policy,
-        bundle_created_at,
-        bundle_expires_at,
+        verification_time.bundle_created_at,
+        verification_time.bundle_expires_at,
         amd_stack,
+        hardware_policy,
     )?;
     Ok(VerifiedNode {
         chip_id: node.chip_id.clone(),
         drand_round: round,
         drand_round_time_unix_ms,
-        evidence_age_ms: bundle_created_at
+        evidence_age_ms: verification_time
+            .bundle_created_at
             .saturating_sub(drand_round_time_unix_ms)
             .max(0),
         node_id: node.node_id.clone(),
@@ -2683,17 +2965,10 @@ fn verify_snp_node(
     bundle_created_at: i64,
     bundle_expires_at: i64,
     collateral: &AmdCollateralStack,
+    hardware_policy: &HardwarePolicy,
 ) -> Result<(), Error> {
-    use sev::{
-        certs::snp::{Chain, Verifiable},
-        firmware::guest::AttestationReport,
-        parser::ByteParser,
-    };
-
     let report_bytes = decode_snp_report(&node.quote, &node.node_id)?;
-    check_raw_report_bindings(node, policy, &report_bytes)?;
-    let report = AttestationReport::from_bytes(&report_bytes)
-        .map_err(|error| Error::Node(format!("{} SNP report: {error}", node.node_id)))?;
+    check_raw_report_bindings(node, policy, &report_bytes, Some(hardware_policy))?;
     verify_amd_collateral_stack(
         collateral,
         &node.chip_id,
@@ -2705,11 +2980,7 @@ fn verify_snp_node(
     let expected_policy = u64::from_str_radix(policy.launch.policy.trim_start_matches("0x"), 16)
         .map_err(|_| Error::Node("invalid launch policy value".into()))?;
     validate_snp_launch_policy(expected_policy, Some(product))?;
-    let chain = Chain::from_der(&collateral.ark, &collateral.ask, &collateral.vek)
-        .map_err(|error| Error::Node(format!("{} AMD chain: {error}", node.node_id)))?;
-    (&chain, &report)
-        .verify()
-        .map_err(|error| Error::Node(format!("{} SNP signature: {error}", node.node_id)))
+    verify_raw_snp_report_signature_with_vcek(&report_bytes, &collateral.vek, &node.node_id)
 }
 
 #[cfg(not(feature = "snp"))]
@@ -2719,6 +2990,7 @@ fn verify_snp_node(
     _bundle_created_at: i64,
     _bundle_expires_at: i64,
     _collateral: &AmdCollateralStack,
+    _hardware_policy: &HardwarePolicy,
 ) -> Result<(), Error> {
     Err(Error::Node(
         "AMD SNP verification is unavailable in this build".into(),
@@ -2730,6 +3002,7 @@ fn check_raw_report_bindings(
     node: &Node,
     policy: &LaunchPolicy,
     report: &[u8],
+    hardware_policy: Option<&HardwarePolicy>,
 ) -> Result<(), Error> {
     fn bytes<const N: usize>(value: &str, label: &str) -> Result<[u8; N], Error> {
         let decoded = hex::decode(value).map_err(|_| Error::Node(format!("invalid {label}")))?;
@@ -2747,15 +3020,24 @@ fn check_raw_report_bindings(
         .map_err(|_| Error::Node("invalid launch policy value".into()))?;
     validate_snp_launch_policy(expected_policy, None)?;
     let report_version = u32_at(0x00);
-    if (2..=5).contains(&report_version) {
-        let (_, _, _, report_product) = inspect_report_product(report, report_version)?;
-        if let Some(product) = report_product {
-            validate_snp_launch_policy(expected_policy, Some(product))?;
-        }
+    if !(2..=5).contains(&report_version) {
+        return Err(Error::Node(format!(
+            "{} SNP report version differs",
+            node.node_id
+        )));
     }
+    let (_, _, _, report_product) = inspect_report_product(report, report_version)?;
+    if let Some(product) = report_product {
+        validate_snp_launch_policy(expected_policy, Some(product))?;
+    }
+    validate_raw_snp_report_encoding(report, report_version, report_product, &node.node_id)?;
     let report_info = u32_at(0x48);
+    let author_key_present = policy
+        .launch
+        .author_key_digest
+        .bytes()
+        .any(|byte| byte != b'0');
     let checks = [
-        ((2..=5).contains(&report_version), "report version"),
         (
             report[0x10..0x20] == bytes::<16>(&policy.launch.family_id, "family id")?,
             "family id",
@@ -2796,15 +3078,200 @@ fn check_raw_report_bindings(
         (u32_at(0x30) == u32::from(policy.launch.vmpl), "VMPL"),
         (u64_at(0x08) == expected_policy, "guest policy"),
         (u32_at(0x34) == 1, "signature algorithm"),
-        ((report_info & 0b10) == 0, "masked chip key flag"),
-        ((report_info >> 2).trailing_zeros() >= 3, "VCEK signing key"),
+        ((report_info & !1) == 0, "VCEK signing key information"),
+        (
+            (report_info & 1 != 0) == author_key_present,
+            "author key flag",
+        ),
+        (
+            expected_policy & SNP_POLICY_MIGRATE_MA != 0
+                || report[0x160..0x180].iter().all(|byte| *byte == 0),
+            "migration-agent report id",
+        ),
     ];
     for (valid, label) in checks {
         if !valid {
             return Err(Error::Node(format!("{} SNP {label} differs", node.node_id)));
         }
     }
+    if let Some(hardware_policy) = hardware_policy {
+        appraise_snp_report(
+            report,
+            report_version,
+            report_product,
+            hardware_policy,
+            &node.node_id,
+        )?;
+    }
     Ok(())
+}
+
+#[cfg(feature = "snp")]
+fn validate_raw_snp_report_encoding(
+    report: &[u8],
+    report_version: u32,
+    product: Option<&AmdProductProfile>,
+    node_id: &str,
+) -> Result<(), Error> {
+    let zero_ranges: &[(usize, usize)] = if report_version == 5 {
+        &[(0x4c, 0x50), (0x18b, 0x1a0), (0x208, 0x2a0)]
+    } else {
+        &[(0x4c, 0x50), (0x188, 0x1a0), (0x1f8, 0x2a0)]
+    };
+    if zero_ranges
+        .iter()
+        .any(|(start, end)| report[*start..*end].iter().any(|byte| *byte != 0))
+        || report[0x1eb] != 0
+        || report[0x1ef] != 0
+    {
+        return Err(Error::Node(format!(
+            "{node_id} SNP report reserved bytes are nonzero"
+        )));
+    }
+    let platform_info = u64::from_le_bytes(report[0x40..0x48].try_into().unwrap_or_default());
+    if platform_info & !SNP_PLATFORM_INFO_KNOWN_MASK != 0 {
+        return Err(Error::Node(format!(
+            "{node_id} SNP platform information sets reserved bits"
+        )));
+    }
+    if product.is_some_and(|profile| profile.tcb_layout == AmdTcbLayout::Family19h) {
+        for (offset, label) in [
+            (0x38, "current"),
+            (0x180, "reported"),
+            (0x1e0, "committed"),
+            (0x1f0, "launch"),
+        ] {
+            if report[offset + 2..offset + 6].iter().any(|byte| *byte != 0) {
+                return Err(Error::Node(format!(
+                    "{node_id} SNP {label} TCB reserved bytes are nonzero"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(feature = "snp")]
+fn appraise_snp_report(
+    report: &[u8],
+    report_version: u32,
+    product: Option<&AmdProductProfile>,
+    policy: &HardwarePolicy,
+    node_id: &str,
+) -> Result<(), Error> {
+    if report_version != 5 {
+        return Err(Error::Node(format!(
+            "{node_id} SNP report version is below hardware policy"
+        )));
+    }
+    let family = report[0x188];
+    let model = report[0x189];
+    let stepping = report[0x18a];
+    let profile = policy
+        .amd_sev_snp
+        .iter()
+        .find(|profile| {
+            profile.cpuid_family == family
+                && profile.cpuid_model == model
+                && profile.cpuid_stepping == stepping
+        })
+        .ok_or_else(|| Error::Node(format!("{node_id} CPUID is absent from hardware policy")))?;
+    if profile.report_version != report_version
+        || product.map(|product| product.product_name) != Some(profile.product.as_str())
+    {
+        return Err(Error::Node(format!(
+            "{node_id} SNP processor identity differs from hardware policy"
+        )));
+    }
+
+    let current = family19h_tcb(&report[0x38..0x40]);
+    let reported = family19h_tcb(&report[0x180..0x188]);
+    let committed = family19h_tcb(&report[0x1e0..0x1e8]);
+    let launch = family19h_tcb(&report[0x1f0..0x1f8]);
+    for (label, actual) in [
+        ("current", current),
+        ("reported", reported),
+        ("committed", committed),
+        ("launch", launch),
+    ] {
+        if !tcb_at_least(actual, profile.minimum_tcb) {
+            return Err(Error::Node(format!(
+                "{node_id} SNP {label} TCB is below hardware policy"
+            )));
+        }
+    }
+    if !tcb_at_least(committed, reported) || !tcb_at_least(current, committed) {
+        return Err(Error::Node(format!(
+            "{node_id} SNP TCB fields have an invalid downgrade order"
+        )));
+    }
+
+    let current_version = (report[0x1ea], report[0x1e9], report[0x1e8]);
+    let committed_version = (report[0x1ee], report[0x1ed], report[0x1ec]);
+    if committed_version > current_version {
+        return Err(Error::Node(format!(
+            "{node_id} SNP committed firmware version exceeds current version"
+        )));
+    }
+
+    let platform_info = u64::from_le_bytes(report[0x40..0x48].try_into().unwrap_or_default());
+    let required_platform = parse_u64_hex(
+        &profile.required_platform_info_mask,
+        "required platform-info mask",
+    )?;
+    let forbidden_platform = parse_u64_hex(
+        &profile.forbidden_platform_info_mask,
+        "forbidden platform-info mask",
+    )?;
+    if platform_info & required_platform != required_platform
+        || platform_info & forbidden_platform != 0
+    {
+        return Err(Error::Node(format!(
+            "{node_id} SNP platform information is below hardware policy"
+        )));
+    }
+
+    let launch_mitigations =
+        u64::from_le_bytes(report[0x1f8..0x200].try_into().unwrap_or_default());
+    let current_mitigations =
+        u64::from_le_bytes(report[0x200..0x208].try_into().unwrap_or_default());
+    let required_launch = parse_u64_hex(
+        &profile.required_launch_mitigation_mask,
+        "required launch mitigation mask",
+    )?;
+    let required_current = parse_u64_hex(
+        &profile.required_current_mitigation_mask,
+        "required current mitigation mask",
+    )?;
+    if launch_mitigations & required_launch != required_launch {
+        return Err(Error::Node(format!(
+            "{node_id} SNP launch mitigations are below hardware policy"
+        )));
+    }
+    if current_mitigations & required_current != required_current {
+        return Err(Error::Node(format!(
+            "{node_id} SNP current mitigations are below hardware policy"
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(feature = "snp")]
+fn family19h_tcb(bytes: &[u8]) -> AmdTcb {
+    AmdTcb {
+        bootloader: bytes[0],
+        tee: bytes[1],
+        snp: bytes[6],
+        microcode: bytes[7],
+    }
+}
+
+#[cfg(feature = "snp")]
+const fn tcb_at_least(actual: AmdTcb, minimum: AmdTcb) -> bool {
+    actual.bootloader >= minimum.bootloader
+        && actual.tee >= minimum.tee
+        && actual.snp >= minimum.snp
+        && actual.microcode >= minimum.microcode
 }
 
 #[cfg(feature = "snp")]
@@ -3195,7 +3662,9 @@ fn canonical_json(value: &Value) -> Result<String, Error> {
             Value::Bool(value) => output.push_str(if *value { "true" } else { "false" }),
             Value::Number(value) => output.push_str(&value.to_string()),
             Value::String(value) => {
-                output.push_str(&serde_json::to_string(value).unwrap_or_default());
+                output.push_str(&serde_json::to_string(value).map_err(|error| {
+                    Error::InvalidBundle(format!("serialize canonical JSON string: {error}"))
+                })?);
             }
             Value::Array(values) => {
                 output.push('[');
@@ -3215,7 +3684,9 @@ fn canonical_json(value: &Value) -> Result<String, Error> {
                     if index > 0 {
                         output.push(',');
                     }
-                    output.push_str(&serde_json::to_string(key).unwrap_or_default());
+                    output.push_str(&serde_json::to_string(key).map_err(|error| {
+                        Error::InvalidBundle(format!("serialize canonical JSON key: {error}"))
+                    })?);
                     output.push(':');
                     write(&values[key], output)?;
                 }
@@ -3256,7 +3727,9 @@ fn canonical_report_data(report: &ReportData) -> Result<String, Error> {
     );
     value.insert(
         "accepted_cert_sha256".into(),
-        serde_json::to_value(certs).unwrap_or_default(),
+        serde_json::to_value(certs).map_err(|error| {
+            Error::InvalidBundle(format!("serialize accepted certificate hashes: {error}"))
+        })?,
     );
     value.insert(
         "hpke_public_key".into(),
@@ -3282,6 +3755,179 @@ fn canonical_report_data(report: &ReportData) -> Result<String, Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn signed_hardware_policy_fixture() -> SignedHardwarePolicy {
+        serde_json::from_value(serde_json::json!({
+            "policy": {
+                "amd_sev_snp": [{
+                    "cpuid_family": 25,
+                    "cpuid_model": 1,
+                    "cpuid_stepping": 1,
+                    "forbidden_platform_info_mask": "0x0000000000000001",
+                    "minimum_tcb": {"bootloader": 4, "microcode": 222, "snp": 29, "tee": 0},
+                    "product": "Milan",
+                    "report_version": 5,
+                    "required_current_mitigation_mask": "0x000000000000000b",
+                    "required_launch_mitigation_mask": "0x000000000000000b",
+                    "required_platform_info_mask": "0x0000000000000024"
+                }],
+                "schema": "stogas.hardware-policy.v1",
+                "sequence": 2
+            },
+            "stogas_signature": {
+                "algorithm": "Ed25519",
+                "key_id": "test",
+                "schema": "stogas.hardware-policy.signature.v1",
+                "signature": "test",
+                "signed": "hardware-policy.json"
+            }
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn verifies_the_stogas_policy_signature_and_accepts_an_explicit_local_replacement() {
+        let signed: SignedHardwarePolicy = serde_json::from_str(include_str!(
+            "../tests/fixtures/milan-hardware-policy.signed.json"
+        ))
+        .unwrap();
+        let stogas = select_hardware_policy(&signed, None, &Environment::stogas()).unwrap();
+        assert!(matches!(
+            stogas.verified.source,
+            HardwarePolicySource::StogasBundle
+        ));
+        assert_eq!(stogas.verified.sequence, 2);
+        assert_eq!(
+            stogas.verified.stogas_signing_key_id.as_deref(),
+            Some(STOGAS_RELEASE_KEY_ID)
+        );
+
+        let mut local: HardwarePolicy =
+            serde_json::from_str(include_str!("../tests/fixtures/milan-hardware-policy.json"))
+                .unwrap();
+        local.sequence = 9;
+        local.amd_sev_snp[0].minimum_tcb.snp = 30;
+        let local = select_hardware_policy(
+            &signed,
+            Some(&serde_json::to_vec(&local).unwrap()),
+            &Environment::stogas(),
+        )
+        .unwrap();
+        assert!(matches!(local.verified.source, HardwarePolicySource::Local));
+        assert_eq!(local.verified.sequence, 9);
+        assert_eq!(local.policy.amd_sev_snp[0].minimum_tcb.snp, 30);
+        assert!(local.verified.stogas_signing_key_id.is_none());
+    }
+
+    #[test]
+    fn rejects_tampered_stogas_hardware_policy() {
+        let mut signed: SignedHardwarePolicy = serde_json::from_str(include_str!(
+            "../tests/fixtures/milan-hardware-policy.signed.json"
+        ))
+        .unwrap();
+        signed.policy.amd_sev_snp[0].minimum_tcb.snp -= 1;
+        assert!(verify_signed_hardware_policy(&signed, &Environment::stogas()).is_err());
+    }
+
+    #[cfg(feature = "snp")]
+    fn appraisable_milan_report() -> (Vec<u8>, HardwarePolicy, &'static AmdProductProfile) {
+        let policy: HardwarePolicy =
+            serde_json::from_str(include_str!("../tests/fixtures/milan-hardware-policy.json"))
+                .unwrap();
+        let profile = amd_product_from_cpuid(0x19, 0x01).unwrap();
+        let mut report = vec![0_u8; 0x4a0];
+        report[0x00..0x04].copy_from_slice(&5_u32.to_le_bytes());
+        let tcb = [4, 0, 0, 0, 0, 0, 29, 222];
+        for offset in [0x38, 0x180, 0x1e0, 0x1f0] {
+            report[offset..offset + 8].copy_from_slice(&tcb);
+        }
+        report[0x40..0x48].copy_from_slice(&0x24_u64.to_le_bytes());
+        report[0x188..0x18b].copy_from_slice(&[0x19, 0x01, 0x01]);
+        report[0x1f8..0x200].copy_from_slice(&0x0b_u64.to_le_bytes());
+        report[0x200..0x208].copy_from_slice(&0x0b_u64.to_le_bytes());
+        (report, policy, profile)
+    }
+
+    #[cfg(feature = "snp")]
+    #[test]
+    fn report_v5_appraisal_enforces_every_dynamic_amd_security_field() {
+        let (report, policy, product) = appraisable_milan_report();
+        appraise_snp_report(&report, 5, Some(product), &policy, "node").unwrap();
+
+        for (label, offset, value) in [
+            ("current TCB", 0x3e, 28_u8),
+            ("reported TCB", 0x186, 28),
+            ("committed TCB", 0x1e6, 28),
+            ("launch TCB", 0x1f6, 28),
+        ] {
+            let mut invalid = report.clone();
+            invalid[offset] = value;
+            let error = appraise_snp_report(&invalid, 5, Some(product), &policy, "node")
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("below hardware policy"), "{label}: {error}");
+        }
+
+        for (label, offset) in [("launch", 0x1f8), ("current", 0x200)] {
+            let mut invalid = report.clone();
+            invalid[offset..offset + 8].copy_from_slice(&0x12_u64.to_le_bytes());
+            let error = appraise_snp_report(&invalid, 5, Some(product), &policy, "node")
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains(&format!("{label} mitigations")), "{error}");
+        }
+
+        let mut missing_alias_check = report.clone();
+        missing_alias_check[0x40..0x48].copy_from_slice(&0_u64.to_le_bytes());
+        assert!(
+            appraise_snp_report(&missing_alias_check, 5, Some(product), &policy, "node")
+                .unwrap_err()
+                .to_string()
+                .contains("platform information")
+        );
+
+        let mut smt_enabled = report.clone();
+        smt_enabled[0x40..0x48].copy_from_slice(&0x25_u64.to_le_bytes());
+        assert!(
+            appraise_snp_report(&smt_enabled, 5, Some(product), &policy, "node")
+                .unwrap_err()
+                .to_string()
+                .contains("platform information")
+        );
+
+        assert!(
+            appraise_snp_report(&report, 4, Some(product), &policy, "node")
+                .unwrap_err()
+                .to_string()
+                .contains("report version")
+        );
+    }
+
+    #[cfg(feature = "snp")]
+    #[test]
+    fn report_v5_appraisal_rejects_tcb_and_firmware_downgrade_inconsistency() {
+        let (mut report, mut policy, product) = appraisable_milan_report();
+        policy.amd_sev_snp[0].minimum_tcb = AmdTcb {
+            bootloader: 0,
+            microcode: 0,
+            snp: 0,
+            tee: 0,
+        };
+        report[0x187] = 3;
+        report[0x1e7] = 2;
+        let error = appraise_snp_report(&report, 5, Some(product), &policy, "node")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("invalid downgrade order"));
+
+        let (mut report, policy, product) = appraisable_milan_report();
+        report[0x1e8..0x1eb].copy_from_slice(&[1, 0, 1]);
+        report[0x1ec..0x1ef].copy_from_slice(&[2, 0, 1]);
+        let error = appraise_snp_report(&report, 5, Some(product), &policy, "node")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("committed firmware version exceeds current"));
+    }
 
     #[test]
     fn csr_submission_cannot_supply_its_own_node_identity() {
@@ -3458,6 +4104,7 @@ mod tests {
                 allowed_igvms: vec![release_fixture()],
                 created_at: "2026-07-23T16:00:00.000Z".into(),
                 expires_at: "2026-07-23T16:15:00.000Z".into(),
+                hardware_policy: signed_hardware_policy_fixture(),
                 nodes: Vec::new(),
                 schema: "stogas.confidential-bundle.v1".into(),
                 sequence: 0,
@@ -3649,10 +4296,7 @@ mod tests {
             },
             "launch_policies": [release],
             "region": "local",
-            "trusted_platforms": [{
-                "chip_id": "66".repeat(64),
-                "reported_tcb": "00".repeat(8)
-            }]
+            "trusted_chip_ids": ["66".repeat(64)]
         });
         let heartbeat: HeartbeatCandidate =
             serde_json::from_value(request["heartbeat"].clone()).unwrap();
@@ -3686,15 +4330,15 @@ mod tests {
         };
         let report = vec![0_u8; 0x4a0];
 
-        let error = check_raw_report_bindings(&node, &policy, &report).unwrap_err();
+        let error = check_raw_report_bindings(&node, &policy, &report, None).unwrap_err();
         assert!(
             error
                 .to_string()
                 .contains("required admitted platform protections")
         );
 
-        policy.launch.policy = "0x000000000213013a".into();
-        let error = check_raw_report_bindings(&node, &policy, &report).unwrap_err();
+        policy.launch.policy = "0x000000000212013a".into();
+        let error = check_raw_report_bindings(&node, &policy, &report, None).unwrap_err();
         assert!(error.to_string().contains("SNP report version differs"));
     }
 
@@ -3750,18 +4394,15 @@ mod tests {
         );
 
         let mut ambiguous = request;
-        ambiguous["trusted_platforms"]
+        ambiguous["trusted_chip_ids"]
             .as_array_mut()
             .unwrap()
-            .push(serde_json::json!({
-                "chip_id": "77".repeat(64),
-                "reported_tcb": "00".repeat(8)
-            }));
+            .push(serde_json::json!("77".repeat(64)));
         assert!(
             verify_local_heartbeat_admission(&serde_json::to_vec(&ambiguous).unwrap(), now)
                 .unwrap_err()
                 .to_string()
-                .contains("exactly one platform")
+                .contains("exactly one chip")
         );
     }
 

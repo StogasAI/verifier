@@ -32,6 +32,16 @@ const verified = verify_github_attestation_at(
 	1_784_246_400_000
 );
 assert.equal(verified.subjects.length, 2);
+assert.throws(
+	() =>
+		verify_github_attestation_at(
+			attestation,
+			JSON.stringify(subjects),
+			JSON.stringify(policy),
+			Number.MAX_SAFE_INTEGER + 1
+		),
+	/safe integer/
+);
 
 const mutation = JSON.parse(attestation);
 const hash = mutation.verificationMaterial.tlogEntries[0].inclusionProof.hashes[0];

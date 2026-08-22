@@ -22,3 +22,7 @@ wasm-bindgen = "0.2.101"
 
 [lints]
 workspace = true
+
+[package.metadata.cargo-machete]
+# This direct dependency enables the JavaScript entropy backend for transitive getrandom 0.2 users.
+ignored = ["getrandom-02"]

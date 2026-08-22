@@ -1,10 +1,12 @@
 import init, {
 	Verifier as CoreVerifier,
-	verify_bundle
+	verify_bundle,
+	verify_bundle_with_policy
 } from '../../pkg/browser/stogas_verifier.js';
+import { createVerifierBindings } from '../shared/verifier.js';
 
 export default init;
-export { verify_bundle };
+export { verify_bundle, verify_bundle_with_policy };
 
 const PRODUCTION_API_BASE_URL = 'https://api.stogas.ai/v1';
 const PRODUCTION_BUNDLE_URL = 'https://evidence.stogas.ai/bundles/latest.json';
@@ -14,128 +16,33 @@ const STAGING_BUNDLE_URL = 'https://evidence-staging.stogas.ai/bundles/latest.js
 const STAGING_BUNDLE_FALLBACK_URL = 'https://evidence2-staging.stogas.ai/bundles/latest.json';
 const DEFAULT_REFRESH_SECONDS = 300;
 const MAX_BUNDLE_BYTES = 16 * 1024 * 1024;
-const MAX_E2EE_REQUEST_BYTES = 64 * 1024 * 1024;
+const MAX_E2EE_REQUEST_BYTES = 94 * 1024 * 1024;
 const BUNDLE_ORIGIN_TIMEOUT_MS = 5_000;
-const EXPIRY_REFRESH_LEAD_MS = 60_000;
+const EXPIRY_REFRESH_LEAD_MIN_MS = 40_000;
+const EXPIRY_REFRESH_LEAD_MAX_MS = 70_000;
+const REFRESH_RETRY_MIN_MS = 4_000;
+const REFRESH_RETRY_MAX_MS = 8_000;
+const REFRESH_INTERVAL_JITTER_MIN_PERCENT = 90;
+const REFRESH_INTERVAL_JITTER_MAX_PERCENT = 110;
 const E2EE_CONTENT_TYPE = 'application/vnd.stogas.e2ee';
 const E2EE_TRANSCRIPT_HEADER = 'x-stogas-e2ee-transcript-sha256';
 const E2EE_PATHS = new Set(['/v1/chat/completions', '/v1/responses']);
 
-export class Verifier {
-	#core;
-
-	constructor() {
-		this.#core = new CoreVerifier();
-	}
-
-	verify_bundle(bundle) {
-		return this.#core.verify_bundle(bundle);
-	}
-
-	verify_response_proof(proof, requestBody, responseBody, e2eeTranscriptSHA256) {
-		return this.#core.verify_response_proof(proof, requestBody, responseBody, e2eeTranscriptSHA256);
-	}
-
-	start_response_proof(requestBody) {
-		return new ResponseProofStream(this.#core.start_response_proof(requestBody), this.#core);
-	}
-
-	verify_historical_response_proof(
-		proof,
-		requestBody,
-		responseBody,
-		ledger,
-		catalog,
-		e2eeTranscriptSHA256
-	) {
-		return this.#core.verify_historical_response_proof(
-			proof,
-			requestBody,
-			responseBody,
-			ledger,
-			catalog,
-			e2eeTranscriptSHA256
-		);
-	}
-
-	verify_node_ledger_record(ledger) {
-		return this.#core.verify_node_ledger_record(ledger);
-	}
-
-	verify_release_approval(release) {
-		return this.#core.verify_release_approval(release);
-	}
-
-	verify_catalog_approval(catalog) {
-		return this.#core.verify_catalog_approval(catalog);
-	}
-
-	free() {
-		this.#core.free();
-	}
-}
-
-export class ResponseProofStream {
-	#core;
-	#verifier;
-
-	constructor(core, verifier) {
-		this.#core = core;
-		this.#verifier = verifier;
-	}
-
-	write(chunk) {
-		this.#assertOpen();
-		this.#core.write(chunk);
-	}
-
-	finish(proof, e2eeTranscriptSHA256) {
-		this.#assertOpen();
-		try {
-			return this.#core.finish(this.#verifier, proof, e2eeTranscriptSHA256);
-		} finally {
-			this.free();
-		}
-	}
-
-	finishHistorical(proof, ledger, catalog, e2eeTranscriptSHA256) {
-		this.#assertOpen();
-		try {
-			return this.#core.finish_historical(
-				this.#verifier,
-				proof,
-				ledger,
-				catalog,
-				e2eeTranscriptSHA256
-			);
-		} finally {
-			this.free();
-		}
-	}
-
-	free() {
-		this.#core?.free();
-		this.#core = undefined;
-		this.#verifier = undefined;
-	}
-
-	#assertOpen() {
-		if (!this.#core || !this.#verifier) throw new Error('ResponseProofStream is closed');
-	}
-}
+export const { ResponseProofStream, Verifier } = createVerifierBindings(CoreVerifier);
 
 export class StogasTransport {
 	#active;
 	#baseURL;
 	#bundleURLs;
 	#bundleAbort;
+	#candidateCore;
 	#closed = false;
 	#core;
 	#fetchImpl;
 	#listeners = new Set();
+	#hardwarePolicy;
 	#refreshIntervalMs;
 	#refreshPromise;
-	#retryCount = 0;
 	#snapshot = Object.freeze({
 		bundle: null,
 		bundleURL: null,
@@ -199,7 +106,13 @@ export class StogasTransport {
 			throw new TypeError('a Fetch API implementation is required');
 		}
 		this.#refreshIntervalMs = refreshIntervalSeconds * 1_000;
-		this.#core = new CoreVerifier(environment === 'staging' ? true : undefined);
+		if (options.hardwarePolicy !== undefined && !(options.hardwarePolicy instanceof Uint8Array)) {
+			throw new TypeError('hardwarePolicy must be a Uint8Array');
+		}
+		this.#hardwarePolicy = options.hardwarePolicy?.slice();
+		const staging = environment === 'staging' ? true : undefined;
+		this.#core = new CoreVerifier(staging);
+		this.#candidateCore = new CoreVerifier(staging);
 		this.fetch = this.fetch.bind(this);
 	}
 
@@ -219,7 +132,12 @@ export class StogasTransport {
 		if (typeof listener !== 'function') throw new TypeError('listener must be a function');
 		this.#assertOpen();
 		this.#listeners.add(listener);
-		listener(this.#snapshot);
+		try {
+			listener(this.#snapshot);
+		} catch (error) {
+			this.#listeners.delete(listener);
+			throw error;
+		}
 		return () => this.#listeners.delete(listener);
 	}
 
@@ -279,7 +197,7 @@ export class StogasTransport {
 			url.origin !== new URL(this.#baseURL).origin ||
 			!E2EE_PATHS.has(url.pathname)
 		) {
-			return this.#fetchImpl(input, init);
+			return this.#fetchImpl(input, { ...init, redirect: 'error' });
 		}
 		if (url.search !== '') {
 			throw new TypeError('encrypted inference does not accept URL query parameters');
@@ -287,13 +205,16 @@ export class StogasTransport {
 		await this.#ensureCurrentBundle();
 
 		const apiKey = bearerAPIKey(request.headers.get('authorization'));
+		const upstream = upstreamCredential(request.headers);
 		const body = await readBoundedBody(request, MAX_E2EE_REQUEST_BYTES, 'request');
 		const session = this.#core.seal_e2ee_request(
 			url.pathname,
 			apiKey,
 			body,
 			request.headers.get('accept') ?? undefined,
-			extraFieldsEnabled(request.headers)
+			extraFieldsEnabled(request.headers),
+			upstream?.provider,
+			upstream?.apiKey
 		);
 		let response;
 		try {
@@ -321,6 +242,7 @@ export class StogasTransport {
 		clearTimeout(this.#timer);
 		this.#bundleAbort?.abort();
 		this.#core.free();
+		this.#candidateCore.free();
 		this.#active = undefined;
 		this.#listeners.clear();
 	}
@@ -331,6 +253,9 @@ export class StogasTransport {
 		}
 		if (!this.#active || Date.now() >= this.#active.expiresAtUnixMs) {
 			throw new Error('the active verified bundle has expired');
+		}
+		if (this.#active.bundle.nodes.length === 0) {
+			throw new Error('the verified fleet is unavailable');
 		}
 	}
 
@@ -343,18 +268,14 @@ export class StogasTransport {
 					? [this.#bundleURLs[1], this.#bundleURLs[0]]
 					: this.#bundleURLs;
 			const failures = [];
+			let candidateCoreSha256 = null;
+			let currentUnavailableObserved = false;
+			let pendingUnavailable = null;
+			let unavailableCandidates = 0;
 			for (const url of urls) {
 				try {
 					const candidate = await this.#fetchBundleCandidate(url);
 					const unchangedBytes = this.#active?.sha256 === candidate.sha256;
-					const verificationStartedAt = monotonicNow();
-					const output = unchangedBytes
-						? { bundle: this.#active.bundle }
-						: this.#core.verify_bundle(candidate.bytes);
-					const verificationDurationMs = unchangedBytes
-						? this.#active.verificationDurationMs
-						: monotonicNow() - verificationStartedAt;
-					const verifiedAtUnixMs = unchangedBytes ? this.#active.verifiedAtUnixMs : Date.now();
 					const fetchedAtUnixMs = Date.now();
 					if (this.#active && unchangedBytes) {
 						this.#active.bundleURL = url;
@@ -364,45 +285,77 @@ export class StogasTransport {
 							bundleURL: url,
 							error: null,
 							fetchedAtUnixMs,
-							status: 'ready'
+							status: this.#active.bundle.nodes.length === 0 ? 'unavailable' : 'ready'
 						});
-						this.#retryCount = 0;
 						this.#scheduleRefresh();
+						if (this.#active.bundle.nodes.length === 0) {
+							currentUnavailableObserved = true;
+							continue;
+						}
+						if (pendingUnavailable) continue;
 						return false;
 					}
+					const verificationStartedAt = monotonicNow();
+					const output = this.#verifyBundle(this.#candidateCore, candidate.bytes);
+					candidateCoreSha256 = candidate.sha256;
+					const verificationDurationMs = monotonicNow() - verificationStartedAt;
+					const verifiedAtUnixMs = Date.now();
 					if (
 						this.#active &&
 						output.bundle.created_at_unix_ms <= this.#active.bundle.created_at_unix_ms
 					) {
 						throw new Error('origin returned a non-advancing verified snapshot');
 					}
-					this.#active = {
-						bundle: output.bundle,
-						bundleURL: url,
-						expiresAtUnixMs: output.bundle.expires_at_unix_ms,
+					const verifiedCandidate = {
+						bytes: candidate.bytes,
 						fetchedAtUnixMs,
+						output,
 						sha256: candidate.sha256,
+						url,
 						verificationDurationMs,
 						verifiedAtUnixMs
 					};
-					this.#publish({
-						bundle: output.bundle,
-						bundleURL: url,
-						envelopeSha256: candidate.sha256,
-						error: null,
-						fetchedAtUnixMs,
-						status: 'ready',
-						verificationDurationMs,
-						verifiedAtUnixMs
-					});
-					this.#retryCount = 0;
-					this.#scheduleRefresh();
+					if (output.bundle.nodes.length === 0 && urls.length === 2) {
+						unavailableCandidates += 1;
+						if (
+							!pendingUnavailable ||
+							output.bundle.created_at_unix_ms > pendingUnavailable.output.bundle.created_at_unix_ms
+						) {
+							pendingUnavailable = verifiedCandidate;
+						}
+						continue;
+					}
+					this.#activateCandidate(verifiedCandidate);
 					return true;
 				} catch (error) {
 					failures.push(new Error(`${new URL(url).host}: ${errorMessage(error)}`));
 					if (this.#closed) throw error;
 				}
 			}
+			if (pendingUnavailable) {
+				const canActivate =
+					!this.#active ||
+					this.#active.bundle.nodes.length === 0 ||
+					unavailableCandidates === urls.length;
+				if (canActivate) {
+					if (candidateCoreSha256 !== pendingUnavailable.sha256) {
+						pendingUnavailable.output = this.#verifyBundle(
+							this.#candidateCore,
+							pendingUnavailable.bytes
+						);
+					}
+					this.#activateCandidate(pendingUnavailable);
+					return true;
+				}
+				this.#publish({
+					...this.#snapshot,
+					error: null,
+					status: this.#active.bundle.nodes.length === 0 ? 'unavailable' : 'ready'
+				});
+				this.#scheduleRetry();
+				return false;
+			}
+			if (currentUnavailableObserved) return false;
 			throw new AggregateError(
 				failures,
 				`every evidence origin failed: ${failures.map(errorMessage).join('; ')}`
@@ -418,6 +371,38 @@ export class StogasTransport {
 		}
 	}
 
+	#verifyBundle(core, bundle) {
+		return this.#hardwarePolicy
+			? core.verify_bundle_with_policy(bundle, this.#hardwarePolicy)
+			: core.verify_bundle(bundle);
+	}
+
+	#activateCandidate(candidate) {
+		const activeCore = this.#core;
+		this.#core = this.#candidateCore;
+		this.#candidateCore = activeCore;
+		this.#active = {
+			bundle: candidate.output.bundle,
+			bundleURL: candidate.url,
+			expiresAtUnixMs: candidate.output.bundle.expires_at_unix_ms,
+			fetchedAtUnixMs: candidate.fetchedAtUnixMs,
+			sha256: candidate.sha256,
+			verificationDurationMs: candidate.verificationDurationMs,
+			verifiedAtUnixMs: candidate.verifiedAtUnixMs
+		};
+		this.#publish({
+			bundle: candidate.output.bundle,
+			bundleURL: candidate.url,
+			envelopeSha256: candidate.sha256,
+			error: null,
+			fetchedAtUnixMs: candidate.fetchedAtUnixMs,
+			status: candidate.output.bundle.nodes.length === 0 ? 'unavailable' : 'ready',
+			verificationDurationMs: candidate.verificationDurationMs,
+			verifiedAtUnixMs: candidate.verifiedAtUnixMs
+		});
+		this.#scheduleRefresh();
+	}
+
 	async #fetchBundleCandidate(url) {
 		const abort = new AbortController();
 		this.#bundleAbort = abort;
@@ -431,7 +416,10 @@ export class StogasTransport {
 				redirect: 'error',
 				signal: abort.signal
 			});
-			if (!response.ok) throw new Error(`returned HTTP ${response.status}`);
+			if (!response.ok) {
+				await response.body?.cancel().catch(() => {});
+				throw new Error(`returned HTTP ${response.status}`);
+			}
 			const bytes = await readBoundedBody(response, MAX_BUNDLE_BYTES, 'bundle', true);
 			return { bytes, sha256: await sha256Hex(bytes) };
 		} finally {
@@ -442,10 +430,18 @@ export class StogasTransport {
 
 	#scheduleRefresh() {
 		if (this.#closed) return;
+		if (this.#active?.bundle.nodes.length === 0) {
+			const spread = REFRESH_RETRY_MAX_MS - REFRESH_RETRY_MIN_MS;
+			this.#setTimer(REFRESH_RETRY_MIN_MS + Math.floor(Math.random() * (spread + 1)));
+			return;
+		}
 		const now = Date.now();
+		const expiryLeadSpread = EXPIRY_REFRESH_LEAD_MAX_MS - EXPIRY_REFRESH_LEAD_MIN_MS;
+		const expiryLeadMs =
+			EXPIRY_REFRESH_LEAD_MIN_MS + Math.floor(Math.random() * (expiryLeadSpread + 1));
 		const scheduledAt = Math.min(
-			now + this.#refreshIntervalMs,
-			(this.#active?.expiresAtUnixMs ?? now) - EXPIRY_REFRESH_LEAD_MS
+			now + jitteredRefreshIntervalMs(this.#refreshIntervalMs),
+			(this.#active?.expiresAtUnixMs ?? now) - expiryLeadMs
 		);
 		if (scheduledAt <= now) {
 			this.#scheduleRetry();
@@ -456,11 +452,8 @@ export class StogasTransport {
 
 	#scheduleRetry() {
 		if (this.#closed) return;
-		const exponent = Math.min(this.#retryCount, 4);
-		this.#retryCount += 1;
-		const base = Math.min(4_000 * 2 ** exponent, 60_000);
-		const jitter = Math.floor(Math.random() * Math.max(1, base / 4));
-		this.#setTimer(base + jitter);
+		const spread = REFRESH_RETRY_MAX_MS - REFRESH_RETRY_MIN_MS;
+		this.#setTimer(REFRESH_RETRY_MIN_MS + Math.floor(Math.random() * (spread + 1)));
 	}
 
 	#setTimer(delay) {
@@ -477,8 +470,20 @@ export class StogasTransport {
 
 	#publish(snapshot) {
 		this.#snapshot = Object.freeze(snapshot);
-		for (const listener of this.#listeners) listener(this.#snapshot);
+		for (const listener of this.#listeners) {
+			try {
+				listener(this.#snapshot);
+			} catch {
+				this.#listeners.delete(listener);
+			}
+		}
 	}
+}
+
+function jitteredRefreshIntervalMs(intervalMs) {
+	const spread = REFRESH_INTERVAL_JITTER_MAX_PERCENT - REFRESH_INTERVAL_JITTER_MIN_PERCENT;
+	const percent = REFRESH_INTERVAL_JITTER_MIN_PERCENT + Math.floor(Math.random() * (spread + 1));
+	return Math.max(1, Math.round((intervalMs * percent) / 100));
 }
 
 function normalizeBaseURL(value) {
@@ -487,6 +492,8 @@ function normalizeBaseURL(value) {
 		url.protocol !== 'https:' ||
 		url.username !== '' ||
 		url.password !== '' ||
+		url.href.includes('?') ||
+		url.href.includes('#') ||
 		url.search !== '' ||
 		url.hash !== '' ||
 		!['', '/', '/v1', '/v1/'].includes(url.pathname)
@@ -503,6 +510,8 @@ function normalizeBundleURL(value) {
 		url.protocol !== 'https:' ||
 		url.username !== '' ||
 		url.password !== '' ||
+		url.href.includes('?') ||
+		url.href.includes('#') ||
 		url.search !== '' ||
 		url.hash !== ''
 	) {
@@ -541,6 +550,28 @@ function extraFieldsEnabled(headers) {
 	throw new TypeError('X-Stogas-Extra-Fields must be true or false');
 }
 
+function upstreamCredential(headers) {
+	const apiKey = headers.get('x-stogas-upstream-api-key');
+	const provider = headers.get('x-stogas-upstream-provider');
+	if (apiKey === null) {
+		if (provider !== null) {
+			throw new TypeError('an upstream API key is required with credential metadata');
+		}
+		return undefined;
+	}
+	if (apiKey.length === 0) throw new TypeError('the upstream API key must not be empty');
+	if (provider === null || provider.trim() === '') {
+		throw new TypeError('X-Stogas-Upstream-Provider is required with a pass-through credential');
+	}
+	if (provider === 'azure') {
+		throw new TypeError('Azure pass-through credentials are not supported');
+	}
+	return {
+		apiKey,
+		provider
+	};
+}
+
 async function sha256Hex(bytes) {
 	const subtle = globalThis.crypto?.subtle;
 	if (!subtle) throw new Error('Web Crypto SHA-256 is unavailable');
@@ -551,6 +582,7 @@ async function sha256Hex(bytes) {
 async function readBoundedBody(message, limit, label, required = false) {
 	const declaredLength = Number(message.headers.get('content-length'));
 	if (Number.isFinite(declaredLength) && declaredLength > limit) {
+		await message.body?.cancel().catch(() => {});
 		throw new Error(`${label} exceeds ${limit} bytes`);
 	}
 	if (!message.body) {
@@ -591,6 +623,7 @@ async function decryptResponse(response, session) {
 		response.headers.get('x-stogas-e2ee') !== '1' ||
 		!response.body
 	) {
+		await response.body?.cancel().catch(() => {});
 		session.free();
 		throw new Error('upstream did not return an encrypted response');
 	}

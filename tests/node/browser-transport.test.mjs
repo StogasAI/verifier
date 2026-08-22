@@ -14,6 +14,14 @@ assert.throws(
 	/positive safe integer/
 );
 new StogasTransport({ bundleRefreshIntervalSeconds: 86_400 }).close();
+for (const options of [
+	{ baseURL: 'https://api.example/v1?' },
+	{ baseURL: 'https://api.example/v1#' },
+	{ bundleURL: 'https://evidence.example/bundles/latest.json?' },
+	{ bundleURL: 'https://evidence.example/bundles/latest.json#' }
+]) {
+	assert.throws(() => new StogasTransport(options), /without credentials|HTTPS origin/);
+}
 assert.throws(
 	() =>
 		new StogasTransport({
@@ -39,6 +47,24 @@ assert.deepEqual(defaultTransport.bundleSnapshot, {
 	verifiedAtUnixMs: null
 });
 defaultTransport.close();
+
+let passThroughOptions;
+const passThroughTransport = new StogasTransport({
+	baseURL: 'https://api.example/v1',
+	bundleURL: 'https://evidence.example/bundles/latest.json',
+	fetch: async (_input, options) => {
+		passThroughOptions = options;
+		return new Response(null, { status: 204 });
+	}
+});
+try {
+	await passThroughTransport.fetch('https://api.example/v1/models', {
+		headers: { authorization: 'Bearer secret' }
+	});
+	assert.equal(passThroughOptions.redirect, 'error');
+} finally {
+	passThroughTransport.close();
+}
 
 const originalFetch = globalThis.fetch;
 let defaultFetchReceiverMatches = false;
@@ -128,6 +154,27 @@ try {
 	transport.close();
 }
 
+let subscriberFetches = 0;
+let subscriberCalls = 0;
+const subscriberTransport = new StogasTransport({
+	bundleURL: 'https://evidence.example/bundles/latest.json',
+	fetch: async () => {
+		subscriberFetches += 1;
+		return new Response(null, { status: 503 });
+	}
+});
+subscriberTransport.subscribe(() => {
+	subscriberCalls += 1;
+	if (subscriberCalls > 1) throw new Error('consumer listener failed');
+});
+try {
+	await assert.rejects(subscriberTransport.refreshBundle(), /every evidence origin failed/);
+	assert.equal(subscriberFetches, 1, 'a listener exception must not stop evidence retrieval');
+	assert.equal(subscriberCalls, 2, 'a failing listener must be removed after its first failure');
+} finally {
+	subscriberTransport.close();
+}
+
 const browserSource = await readFile(
 	new URL('../../bindings/browser/browser.js', import.meta.url),
 	'utf8'
@@ -142,3 +189,37 @@ assert.match(
 	/if \(raw === null\) return false;/,
 	'response fields must remain opt-in when the header is absent'
 );
+assert.match(
+	browserSource,
+	/the verified fleet is unavailable/,
+	'a verified empty trust set must fail inference without invalidating the transport'
+);
+assert.match(
+	browserSource,
+	/status: candidate\.output\.bundle\.nodes\.length === 0 \? 'unavailable' : 'ready'/,
+	'a verified empty trust set must be exposed as unavailable'
+);
+assert.match(
+	browserSource,
+	/unavailableCandidates === urls\.length/,
+	'an active non-empty trust set must require empty candidates from both official origins'
+);
+assert.match(
+	browserSource,
+	/this\.#verifyBundle\(this\.#candidateCore, candidate\.bytes\)/,
+	'candidate verification must not mutate the active request verifier'
+);
+assert.match(
+	browserSource,
+	/core\.verify_bundle_with_policy\(bundle, this\.#hardwarePolicy\)/,
+	'a caller-owned hardware policy must use the isolated verification path'
+);
+assert.match(
+	browserSource,
+	/core\.verify_bundle\(bundle\)/,
+	'the signed bundle policy must remain the default'
+);
+assert.match(browserSource, /DEFAULT_REFRESH_SECONDS = 300/);
+assert.match(browserSource, /REFRESH_INTERVAL_JITTER_MIN_PERCENT = 90/);
+assert.match(browserSource, /REFRESH_INTERVAL_JITTER_MAX_PERCENT = 110/);
+assert.match(browserSource, /jitteredRefreshIntervalMs\(this\.#refreshIntervalMs\)/);

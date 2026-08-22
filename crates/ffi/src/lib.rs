@@ -41,10 +41,9 @@ pub struct StogasTransport {
 struct AbiTransportOptions {
     security: String,
     bundle_refresh_interval_seconds: u64,
-    #[serde(alias = "baseURL")]
     base_url: Option<String>,
-    #[serde(alias = "bundleURL")]
     bundle_url: Option<String>,
+    hardware_policy: Option<serde_json::Value>,
 }
 
 impl Default for AbiTransportOptions {
@@ -54,6 +53,7 @@ impl Default for AbiTransportOptions {
             bundle_refresh_interval_seconds: 300,
             base_url: None,
             bundle_url: None,
+            hardware_policy: None,
         }
     }
 }
@@ -152,6 +152,11 @@ pub unsafe extern "C" fn stogas_transport_start(
             ),
             base_url: configuration.base_url.unwrap_or(defaults.base_url),
             bundle_url: configuration.bundle_url.unwrap_or(defaults.bundle_url),
+            hardware_policy: configuration
+                .hardware_policy
+                .map(|policy| serde_json::to_vec(&policy))
+                .transpose()
+                .map_err(|error| format!("invalid hardware policy: {error}"))?,
         };
         let transport = ManagedTransport::start(&options).map_err(|error| error.to_string())?;
         let base_url = transport.base_url().to_owned();
@@ -242,6 +247,58 @@ pub unsafe extern "C" fn stogas_verifier_verify_bundle(
     })
 }
 
+/// Verify one bundle with caller-owned hardware appraisal rules.
+///
+/// The policy cannot disable fixed cryptographic, identity, launch, or freshness checks.
+///
+/// # Safety
+///
+/// `verifier` must point to a live session. Both byte pointers must address their declared readable
+/// lengths for the duration of the call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stogas_verifier_verify_bundle_with_policy(
+    verifier: *const StogasVerifier,
+    bundle: *const u8,
+    bundle_len: usize,
+    policy: *const u8,
+    policy_len: usize,
+    now_unix_ms: i64,
+) -> *mut c_char {
+    response(|| {
+        // SAFETY: pointers are validated before use and live for this synchronous call.
+        let verifier = unsafe { verifier_ref(verifier)? };
+        // SAFETY: pointer and bound are validated by `input_slice`.
+        let bundle = unsafe {
+            input_slice(
+                bundle,
+                bundle_len,
+                stogas_verifier::MAX_INPUT_BYTES,
+                "bundle",
+            )?
+        };
+        // SAFETY: pointer and bound are validated by `input_slice`.
+        let policy = unsafe {
+            input_slice(
+                policy,
+                policy_len,
+                stogas_verifier::MAX_INPUT_BYTES,
+                "hardware policy",
+            )?
+        };
+        let mut session = verifier
+            .session
+            .lock()
+            .map_err(|_| "verifier session lock is poisoned".to_owned())?;
+        let environment = session.environment.clone();
+        let output = session
+            .core
+            .verify_bundle_with_policy(bundle, policy, now_unix_ms, &environment)
+            .map_err(|error| error.to_string())?;
+        drop(session);
+        Ok::<VerificationOutput, String>(output)
+    })
+}
+
 /// Verify one response receipt against the session's active verified bundle.
 ///
 /// An empty transcript slice means ordinary TLS mode. A non-empty slice must contain the expected
@@ -267,43 +324,28 @@ pub unsafe extern "C" fn stogas_verifier_verify_response_proof(
     response(|| {
         // SAFETY: pointers are validated before use and live for this synchronous call.
         let verifier = unsafe { verifier_ref(verifier)? };
-        // SAFETY: each pointer and bound is validated by `input_slice`.
-        let proof = unsafe { input_slice(proof, proof_len, MAX_PROOF_BYTES, "response proof")? };
-        // SAFETY: each pointer and bound is validated by `input_slice`.
-        let request_body = unsafe {
-            input_slice(
-                request_body,
-                request_body_len,
-                MAX_BODY_BYTES,
-                "request body",
+        // SAFETY: each pointer addresses its declared readable length for this synchronous call.
+        let inputs = unsafe {
+            response_proof_inputs(
+                (proof, proof_len),
+                (request_body, request_body_len),
+                (response_body, response_body_len),
+                (e2ee_transcript_sha256, e2ee_transcript_sha256_len),
             )?
         };
-        // SAFETY: each pointer and bound is validated by `input_slice`.
-        let response_body = unsafe {
-            input_slice(
-                response_body,
-                response_body_len,
-                MAX_BODY_BYTES,
-                "response body",
-            )?
-        };
-        // SAFETY: each pointer and bound is validated by `input_slice`.
-        let transcript = unsafe {
-            input_slice(
-                e2ee_transcript_sha256,
-                e2ee_transcript_sha256_len,
-                64,
-                "E2EE transcript SHA-256",
-            )?
-        };
-        let transcript = optional_utf8(transcript, "E2EE transcript SHA-256")?;
         let session = verifier
             .session
             .lock()
             .map_err(|_| "verifier session lock is poisoned".to_owned())?;
         session
             .core
-            .verify_response_proof(proof, request_body, response_body, transcript, now_unix_ms)
+            .verify_response_proof(
+                inputs.proof,
+                inputs.request_body,
+                inputs.response_body,
+                inputs.transcript,
+                now_unix_ms,
+            )
             .map_err(|error| error.to_string())
     })
 }
@@ -334,24 +376,13 @@ pub unsafe extern "C" fn stogas_verifier_verify_historical_response_proof(
     response(|| {
         // SAFETY: pointers are validated before use and live for this synchronous call.
         let verifier = unsafe { verifier_ref(verifier)? };
-        // SAFETY: each pointer and bound is validated by `input_slice`.
-        let proof = unsafe { input_slice(proof, proof_len, MAX_PROOF_BYTES, "response proof")? };
-        // SAFETY: each pointer and bound is validated by `input_slice`.
-        let request_body = unsafe {
-            input_slice(
-                request_body,
-                request_body_len,
-                MAX_BODY_BYTES,
-                "request body",
-            )?
-        };
-        // SAFETY: each pointer and bound is validated by `input_slice`.
-        let response_body = unsafe {
-            input_slice(
-                response_body,
-                response_body_len,
-                MAX_BODY_BYTES,
-                "response body",
+        // SAFETY: each pointer addresses its declared readable length for this synchronous call.
+        let inputs = unsafe {
+            response_proof_inputs(
+                (proof, proof_len),
+                (request_body, request_body_len),
+                (response_body, response_body_len),
+                (e2ee_transcript_sha256, e2ee_transcript_sha256_len),
             )?
         };
         // SAFETY: each pointer and bound is validated by `input_slice`.
@@ -372,16 +403,6 @@ pub unsafe extern "C" fn stogas_verifier_verify_historical_response_proof(
                 "catalog approval",
             )?
         };
-        // SAFETY: each pointer and bound is validated by `input_slice`.
-        let transcript = unsafe {
-            input_slice(
-                e2ee_transcript_sha256,
-                e2ee_transcript_sha256_len,
-                64,
-                "E2EE transcript SHA-256",
-            )?
-        };
-        let transcript = optional_utf8(transcript, "E2EE transcript SHA-256")?;
         let session = verifier
             .session
             .lock()
@@ -390,10 +411,10 @@ pub unsafe extern "C" fn stogas_verifier_verify_historical_response_proof(
         session
             .core
             .verify_historical_response_proof(&stogas_verifier::HistoricalResponseProofInput {
-                proof_bytes: proof,
-                request_body,
-                response_body,
-                expected_e2ee_transcript_sha256: transcript,
+                proof_bytes: inputs.proof,
+                request_body: inputs.request_body,
+                response_body: inputs.response_body,
+                expected_e2ee_transcript_sha256: inputs.transcript,
                 now_unix_ms,
                 ledger_bytes: ledger,
                 catalog_approval_bytes: catalog,
@@ -444,9 +465,13 @@ where
     .unwrap_or_else(|_| {
         br#"{"ok":false,"error":"verifier response serialization failed"}"#.to_vec()
     });
-    // Serialized JSON cannot contain an unescaped NUL byte.
+    // Serialized JSON cannot contain an unescaped NUL byte. Keep the ABI fail-closed if that
+    // invariant changes in a future serializer.
     CString::new(bytes)
-        .expect("serialized verifier response contains no NUL")
+        .unwrap_or_else(|_| {
+            CString::new("{\"ok\":false,\"error\":\"invalid verifier response\"}")
+                .unwrap_or_default()
+        })
         .into_raw()
 }
 
@@ -482,6 +507,50 @@ fn optional_utf8<'a>(bytes: &'a [u8], label: &str) -> Result<Option<&'a str>, St
     std::str::from_utf8(bytes)
         .map(Some)
         .map_err(|_| format!("{label} is not UTF-8"))
+}
+
+struct ResponseProofInputs<'a> {
+    proof: &'a [u8],
+    request_body: &'a [u8],
+    response_body: &'a [u8],
+    transcript: Option<&'a str>,
+}
+
+unsafe fn response_proof_inputs<'a>(
+    proof: (*const u8, usize),
+    request_body: (*const u8, usize),
+    response_body: (*const u8, usize),
+    transcript: (*const u8, usize),
+) -> Result<ResponseProofInputs<'a>, String> {
+    // SAFETY: the caller guarantees each pointer addresses its declared readable length.
+    let proof = unsafe { input_slice(proof.0, proof.1, MAX_PROOF_BYTES, "response proof")? };
+    // SAFETY: the caller guarantees each pointer addresses its declared readable length.
+    let request_body = unsafe {
+        input_slice(
+            request_body.0,
+            request_body.1,
+            MAX_BODY_BYTES,
+            "request body",
+        )?
+    };
+    // SAFETY: the caller guarantees each pointer addresses its declared readable length.
+    let response_body = unsafe {
+        input_slice(
+            response_body.0,
+            response_body.1,
+            MAX_BODY_BYTES,
+            "response body",
+        )?
+    };
+    // SAFETY: the caller guarantees each pointer addresses its declared readable length.
+    let transcript =
+        unsafe { input_slice(transcript.0, transcript.1, 64, "E2EE transcript SHA-256")? };
+    Ok(ResponseProofInputs {
+        proof,
+        request_body,
+        response_body,
+        transcript: optional_utf8(transcript, "E2EE transcript SHA-256")?,
+    })
 }
 
 #[cfg(test)]
