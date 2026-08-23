@@ -690,6 +690,11 @@ pub fn verify_node_ledger_record(
     let release = verify_release(&record.release, environment, admitted_at)?;
     let hardware_policy = verify_signed_hardware_policy(&record.hardware_policy, environment)?;
     let node = ledger_record_node(&record);
+    if hardware_policy.policy.chip_id != node.chip_id {
+        return Err(Error::InvalidBundle(
+            "node ledger hardware policy is bound to a different chip id".into(),
+        ));
+    }
     validate_node_shape(&node)?;
     let node_preimage = format!(
         "{{\"chip_id\":\"{}\",\"tls_spki_sha256\":\"{}\"}}",
@@ -919,6 +924,11 @@ pub fn verify_heartbeat_admission(
         }
     }
     let identity = inspect_snp_quote(&heartbeat.quote)?;
+    if hardware_policy.policy.chip_id != identity.chip_id {
+        return Err(Error::Node(
+            "SNP chip id differs from the signed hardware policy".into(),
+        ));
+    }
     if !request
         .trusted_chip_ids
         .iter()
@@ -1682,14 +1692,26 @@ struct SelectedHardwarePolicy {
     verified: VerifiedHardwarePolicy,
 }
 
-fn select_hardware_policy(
-    signed: &SignedHardwarePolicy,
+fn select_hardware_policies(
+    signed: &[SignedHardwarePolicy],
     local_policy_bytes: Option<&[u8]>,
     environment: &Environment,
-) -> Result<SelectedHardwarePolicy, Error> {
-    let signed_policy = verify_signed_hardware_policy(signed, environment)?;
+) -> Result<Vec<SelectedHardwarePolicy>, Error> {
+    let mut selected = signed
+        .iter()
+        .map(|policy| verify_signed_hardware_policy(policy, environment))
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut chip_ids = BTreeSet::new();
+    if selected
+        .iter()
+        .any(|policy| !chip_ids.insert(policy.policy.chip_id.as_str()))
+    {
+        return Err(Error::InvalidBundle(
+            "hardware policies contain a duplicate chip id".into(),
+        ));
+    }
     let Some(local_policy_bytes) = local_policy_bytes else {
-        return Ok(signed_policy);
+        return Ok(selected);
     };
     if local_policy_bytes.len() > MAX_INPUT_BYTES {
         return Err(Error::TooLarge);
@@ -1699,15 +1721,26 @@ fn select_hardware_policy(
     let policy: HardwarePolicy = serde_json::from_value(value)
         .map_err(|error| Error::InvalidBundle(format!("invalid local hardware policy: {error}")))?;
     let canonical = validate_hardware_policy(&policy)?;
-    Ok(SelectedHardwarePolicy {
+    let local = SelectedHardwarePolicy {
         verified: VerifiedHardwarePolicy {
+            chip_id: policy.chip_id.clone(),
             sequence: policy.sequence,
             sha256: hex::encode(Sha256::digest(canonical.as_bytes())),
             source: HardwarePolicySource::Local,
             stogas_signing_key_id: None,
         },
         policy,
-    })
+    };
+    let index = selected
+        .iter()
+        .position(|candidate| candidate.policy.chip_id == local.policy.chip_id)
+        .ok_or_else(|| {
+            Error::InvalidBundle(
+                "local hardware policy chip id is absent from the signed bundle policies".into(),
+            )
+        })?;
+    selected[index] = local;
+    Ok(selected)
 }
 
 fn verify_signed_hardware_policy(
@@ -1734,6 +1767,7 @@ fn verify_signed_hardware_policy(
         .map_err(|error| Error::InvalidBundle(format!("hardware policy signature: {error}")))?;
     Ok(SelectedHardwarePolicy {
         verified: VerifiedHardwarePolicy {
+            chip_id: signed.policy.chip_id.clone(),
             sequence: signed.policy.sequence,
             sha256: hex::encode(Sha256::digest(canonical.as_bytes())),
             source: HardwarePolicySource::StogasBundle,
@@ -1746,64 +1780,49 @@ fn verify_signed_hardware_policy(
 fn validate_hardware_policy(policy: &HardwarePolicy) -> Result<String, Error> {
     if policy.schema != "stogas.hardware-policy.v1"
         || policy.sequence == 0
-        || policy.amd_sev_snp.is_empty()
-        || policy.amd_sev_snp.len() > 32
+        || !is_lower_hex(&policy.chip_id, 64)
     {
         return Err(Error::InvalidBundle(
             "unsupported or invalid hardware policy".into(),
         ));
     }
-    let mut profiles = BTreeSet::new();
-    for profile in &policy.amd_sev_snp {
-        if profile.report_version != 5
-            || profile.product.is_empty()
-            || profile.product.len() > 32
-            || !profiles.insert((
-                profile.cpuid_family,
-                profile.cpuid_model,
-                profile.cpuid_stepping,
-            ))
-        {
-            return Err(Error::InvalidBundle(
-                "hardware policy has an invalid or duplicate AMD profile".into(),
-            ));
-        }
-        let built_in = amd_product_from_cpuid(profile.cpuid_family, profile.cpuid_model)
-            .ok_or_else(|| {
-                Error::InvalidBundle("hardware policy has an unsupported CPUID".into())
-            })?;
-        if profile.product != built_in.product_name
-            || built_in.tcb_layout != AmdTcbLayout::Family19h
-        {
-            return Err(Error::InvalidBundle(
-                "hardware policy product differs from its CPUID or TCB layout".into(),
-            ));
-        }
-        let required_platform = parse_u64_hex(
-            &profile.required_platform_info_mask,
-            "required platform-info mask",
-        )?;
-        let forbidden_platform = parse_u64_hex(
-            &profile.forbidden_platform_info_mask,
-            "forbidden platform-info mask",
-        )?;
-        if required_platform & forbidden_platform != 0
-            || required_platform & !SNP_PLATFORM_INFO_KNOWN_MASK != 0
-            || forbidden_platform & !SNP_PLATFORM_INFO_KNOWN_MASK != 0
-        {
-            return Err(Error::InvalidBundle(
-                "hardware policy has invalid platform-info masks".into(),
-            ));
-        }
-        parse_u64_hex(
-            &profile.required_launch_mitigation_mask,
-            "required launch mitigation mask",
-        )?;
-        parse_u64_hex(
-            &profile.required_current_mitigation_mask,
-            "required current mitigation mask",
-        )?;
+    let profile = &policy.amd_sev_snp;
+    if profile.report_version != 5 || profile.product.is_empty() || profile.product.len() > 32 {
+        return Err(Error::InvalidBundle(
+            "hardware policy has an invalid AMD profile".into(),
+        ));
     }
+    let built_in = amd_product_from_cpuid(profile.cpuid_family, profile.cpuid_model)
+        .ok_or_else(|| Error::InvalidBundle("hardware policy has an unsupported CPUID".into()))?;
+    if profile.product != built_in.product_name || built_in.tcb_layout != AmdTcbLayout::Family19h {
+        return Err(Error::InvalidBundle(
+            "hardware policy product differs from its CPUID or TCB layout".into(),
+        ));
+    }
+    let required_platform = parse_u64_hex(
+        &profile.required_platform_info_mask,
+        "required platform-info mask",
+    )?;
+    let forbidden_platform = parse_u64_hex(
+        &profile.forbidden_platform_info_mask,
+        "forbidden platform-info mask",
+    )?;
+    if required_platform & forbidden_platform != 0
+        || required_platform & !SNP_PLATFORM_INFO_KNOWN_MASK != 0
+        || forbidden_platform & !SNP_PLATFORM_INFO_KNOWN_MASK != 0
+    {
+        return Err(Error::InvalidBundle(
+            "hardware policy has invalid platform-info masks".into(),
+        ));
+    }
+    parse_u64_hex(
+        &profile.required_launch_mitigation_mask,
+        "required launch mitigation mask",
+    )?;
+    parse_u64_hex(
+        &profile.required_current_mitigation_mask,
+        "required current mitigation mask",
+    )?;
     let value = serde_json::to_value(policy)
         .map_err(|error| Error::InvalidBundle(format!("hardware policy: {error}")))?;
     canonical_json(&value)
@@ -1847,11 +1866,15 @@ fn verify_bundle_inner(
 ) -> Result<(VerificationOutput, VerificationCache), Error> {
     let envelope = parse_and_verify_bundle_envelope(bundle_bytes)?;
 
-    let hardware_policy = select_hardware_policy(
-        &envelope.body.hardware_policy,
+    let hardware_policies = select_hardware_policies(
+        &envelope.body.hardware_policies,
         local_policy_bytes,
         environment,
     )?;
+    let hardware_policy_map: BTreeMap<_, _> = hardware_policies
+        .iter()
+        .map(|policy| (policy.policy.chip_id.as_str(), &policy.policy))
+        .collect();
 
     let created_at = parse_time(&envelope.body.created_at)?;
     let expires_at = parse_time(&envelope.body.expires_at)?;
@@ -1919,7 +1942,7 @@ fn verify_bundle_inner(
         &launch_policies,
         &amd_stacks,
         &catalog_policies,
-        &hardware_policy.policy,
+        &hardware_policy_map,
     )?;
     Ok((
         VerificationOutput {
@@ -1929,7 +1952,10 @@ fn verify_bundle_inner(
                 created_at_unix_ms: created_at,
                 expires_at_unix_ms: expires_at,
                 excluded_nodes,
-                hardware_policy: hardware_policy.verified,
+                hardware_policies: hardware_policies
+                    .into_iter()
+                    .map(|policy| policy.verified)
+                    .collect(),
                 releases,
                 nodes,
                 original: envelope.clone(),
@@ -1948,12 +1974,20 @@ fn verify_and_partition_nodes(
     launch_policies: &BTreeMap<&str, &LaunchPolicy>,
     amd_stacks: &BTreeMap<String, AmdCollateralStack>,
     catalog_policies: &BTreeMap<&str, u64>,
-    hardware_policy: &HardwarePolicy,
+    hardware_policies: &BTreeMap<&str, &HardwarePolicy>,
 ) -> Result<(Vec<VerifiedNode>, Vec<ExcludedNode>), Error> {
     let mut nodes = Vec::new();
     let mut excluded = Vec::new();
     for node in bundle_nodes {
         verify_node_catalog_policy(&node.node_id, &node.report_data.catalog, catalog_policies)?;
+        let hardware_policy = hardware_policies
+            .get(node.chip_id.as_str())
+            .ok_or_else(|| {
+                Error::Node(format!(
+                    "{} chip id is absent from the verified hardware policy stack",
+                    node.node_id
+                ))
+            })?;
         let verified = verify_node(
             node,
             verification_time,
@@ -2025,13 +2059,14 @@ fn validate_shape(envelope: &BundleEnvelope) -> Result<(), Error> {
     if envelope.body.schema != "stogas.confidential-bundle.v1" {
         return Err(Error::InvalidBundle("unsupported schema".into()));
     }
-    if !(1..=2).contains(&envelope.body.allowed_igvms.len()) {
+    if envelope.body.allowed_igvms.len() > 2 {
         return Err(Error::InvalidBundle("invalid release count".into()));
     }
-    if !(1..=2).contains(&envelope.body.allowed_catalogs.len()) {
+    if envelope.body.allowed_catalogs.len() > 2 {
         return Err(Error::InvalidBundle("invalid catalog release count".into()));
     }
     if envelope.body.nodes.len() > MAX_NODES
+        || envelope.body.hardware_policies.len() > MAX_NODES
         || envelope.body.vendor_collateral.len() > MAX_VENDOR_COLLATERAL
     {
         return Err(Error::InvalidBundle("resource limit exceeded".into()));
@@ -2056,12 +2091,46 @@ fn validate_shape(envelope: &BundleEnvelope) -> Result<(), Error> {
             ));
         }
     }
+    let mut hardware_chip_ids = BTreeSet::new();
+    for policy in &envelope.body.hardware_policies {
+        if !hardware_chip_ids.insert(policy.policy.chip_id.as_str()) {
+            return Err(Error::InvalidBundle(
+                "duplicate hardware policy chip id".into(),
+            ));
+        }
+    }
     let mut node_ids = BTreeSet::new();
+    let mut referenced_measurements = BTreeSet::new();
+    let mut referenced_catalogs = BTreeSet::new();
+    let mut referenced_chip_ids = BTreeSet::new();
     for node in &envelope.body.nodes {
         validate_node_shape(node)?;
         if !node_ids.insert(node.node_id.as_str()) {
             return Err(Error::InvalidBundle("duplicate node id".into()));
         }
+        referenced_measurements.insert(node.release_measurement.as_str());
+        referenced_catalogs.insert((
+            node.report_data.catalog.sequence,
+            node.report_data.catalog.digest.as_str(),
+        ));
+        referenced_chip_ids.insert(node.chip_id.as_str());
+    }
+    let catalog_authorizations = envelope
+        .body
+        .allowed_catalogs
+        .iter()
+        .map(|catalog| {
+            let manifest = &catalog.signed_release.manifest;
+            (manifest.sequence, manifest.runtime.as_str())
+        })
+        .collect::<BTreeSet<_>>();
+    if measurements != referenced_measurements
+        || catalog_authorizations != referenced_catalogs
+        || hardware_chip_ids != referenced_chip_ids
+    {
+        return Err(Error::InvalidBundle(
+            "bundle authorizations must match the included nodes exactly".into(),
+        ));
     }
     Ok(())
 }
@@ -2550,6 +2619,12 @@ fn verify_node(
     amd_stacks: &BTreeMap<String, AmdCollateralStack>,
     hardware_policy: &HardwarePolicy,
 ) -> Result<VerifiedNode, Error> {
+    if hardware_policy.chip_id != node.chip_id {
+        return Err(Error::Node(format!(
+            "{} chip id differs from its hardware policy",
+            node.node_id
+        )));
+    }
     let launch_policy = launch_policies
         .get(node.release_measurement.as_str())
         .ok_or_else(|| {
@@ -3167,15 +3242,15 @@ fn appraise_snp_report(
     let family = report[0x188];
     let model = report[0x189];
     let stepping = report[0x18a];
-    let profile = policy
-        .amd_sev_snp
-        .iter()
-        .find(|profile| {
-            profile.cpuid_family == family
-                && profile.cpuid_model == model
-                && profile.cpuid_stepping == stepping
-        })
-        .ok_or_else(|| Error::Node(format!("{node_id} CPUID is absent from hardware policy")))?;
+    let profile = &policy.amd_sev_snp;
+    if profile.cpuid_family != family
+        || profile.cpuid_model != model
+        || profile.cpuid_stepping != stepping
+    {
+        return Err(Error::Node(format!(
+            "{node_id} CPUID differs from hardware policy"
+        )));
+    }
     if profile.report_version != report_version
         || product.map(|product| product.product_name) != Some(profile.product.as_str())
     {
@@ -3756,49 +3831,22 @@ fn canonical_report_data(report: &ReportData) -> Result<String, Error> {
 mod tests {
     use super::*;
 
-    fn signed_hardware_policy_fixture() -> SignedHardwarePolicy {
-        serde_json::from_value(serde_json::json!({
-            "policy": {
-                "amd_sev_snp": [{
-                    "cpuid_family": 25,
-                    "cpuid_model": 1,
-                    "cpuid_stepping": 1,
-                    "forbidden_platform_info_mask": "0x0000000000000001",
-                    "minimum_tcb": {"bootloader": 4, "microcode": 222, "snp": 29, "tee": 0},
-                    "product": "Milan",
-                    "report_version": 5,
-                    "required_current_mitigation_mask": "0x000000000000000b",
-                    "required_launch_mitigation_mask": "0x000000000000000b",
-                    "required_platform_info_mask": "0x0000000000000024"
-                }],
-                "schema": "stogas.hardware-policy.v1",
-                "sequence": 2
-            },
-            "stogas_signature": {
-                "algorithm": "Ed25519",
-                "key_id": "test",
-                "schema": "stogas.hardware-policy.signature.v1",
-                "signature": "test",
-                "signed": "hardware-policy.json"
-            }
-        }))
-        .unwrap()
-    }
-
     #[test]
     fn verifies_the_stogas_policy_signature_and_accepts_an_explicit_local_replacement() {
         let signed: SignedHardwarePolicy = serde_json::from_str(include_str!(
             "../tests/fixtures/milan-hardware-policy.signed.json"
         ))
         .unwrap();
-        let stogas = select_hardware_policy(&signed, None, &Environment::stogas()).unwrap();
+        let stogas =
+            select_hardware_policies(std::slice::from_ref(&signed), None, &Environment::stogas())
+                .unwrap();
         assert!(matches!(
-            stogas.verified.source,
+            stogas[0].verified.source,
             HardwarePolicySource::StogasBundle
         ));
-        assert_eq!(stogas.verified.sequence, 2);
+        assert_eq!(stogas[0].verified.sequence, 3);
         assert_eq!(
-            stogas.verified.stogas_signing_key_id.as_deref(),
+            stogas[0].verified.stogas_signing_key_id.as_deref(),
             Some(STOGAS_RELEASE_KEY_ID)
         );
 
@@ -3806,17 +3854,20 @@ mod tests {
             serde_json::from_str(include_str!("../tests/fixtures/milan-hardware-policy.json"))
                 .unwrap();
         local.sequence = 9;
-        local.amd_sev_snp[0].minimum_tcb.snp = 30;
-        let local = select_hardware_policy(
-            &signed,
+        local.amd_sev_snp.minimum_tcb.snp = 30;
+        let local = select_hardware_policies(
+            std::slice::from_ref(&signed),
             Some(&serde_json::to_vec(&local).unwrap()),
             &Environment::stogas(),
         )
         .unwrap();
-        assert!(matches!(local.verified.source, HardwarePolicySource::Local));
-        assert_eq!(local.verified.sequence, 9);
-        assert_eq!(local.policy.amd_sev_snp[0].minimum_tcb.snp, 30);
-        assert!(local.verified.stogas_signing_key_id.is_none());
+        assert!(matches!(
+            local[0].verified.source,
+            HardwarePolicySource::Local
+        ));
+        assert_eq!(local[0].verified.sequence, 9);
+        assert_eq!(local[0].policy.amd_sev_snp.minimum_tcb.snp, 30);
+        assert!(local[0].verified.stogas_signing_key_id.is_none());
     }
 
     #[test]
@@ -3825,7 +3876,7 @@ mod tests {
             "../tests/fixtures/milan-hardware-policy.signed.json"
         ))
         .unwrap();
-        signed.policy.amd_sev_snp[0].minimum_tcb.snp -= 1;
+        signed.policy.amd_sev_snp.minimum_tcb.snp -= 1;
         assert!(verify_signed_hardware_policy(&signed, &Environment::stogas()).is_err());
     }
 
@@ -3888,12 +3939,7 @@ mod tests {
 
         let mut smt_enabled = report.clone();
         smt_enabled[0x40..0x48].copy_from_slice(&0x25_u64.to_le_bytes());
-        assert!(
-            appraise_snp_report(&smt_enabled, 5, Some(product), &policy, "node")
-                .unwrap_err()
-                .to_string()
-                .contains("platform information")
-        );
+        appraise_snp_report(&smt_enabled, 5, Some(product), &policy, "node").unwrap();
 
         assert!(
             appraise_snp_report(&report, 4, Some(product), &policy, "node")
@@ -3907,7 +3953,7 @@ mod tests {
     #[test]
     fn report_v5_appraisal_rejects_tcb_and_firmware_downgrade_inconsistency() {
         let (mut report, mut policy, product) = appraisable_milan_report();
-        policy.amd_sev_snp[0].minimum_tcb = AmdTcb {
+        policy.amd_sev_snp.minimum_tcb = AmdTcb {
             bootloader: 0,
             microcode: 0,
             snp: 0,
@@ -4071,6 +4117,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "staging")]
     fn catalog_fixture() -> AllowedCatalog {
         serde_json::from_value(serde_json::json!({
             "github_in_toto": [{}],
@@ -4100,11 +4147,11 @@ mod tests {
     fn bundle_sequence_is_not_a_trust_input() {
         let envelope = BundleEnvelope {
             body: BundleBody {
-                allowed_catalogs: vec![catalog_fixture()],
-                allowed_igvms: vec![release_fixture()],
+                allowed_catalogs: Vec::new(),
+                allowed_igvms: Vec::new(),
                 created_at: "2026-07-23T16:00:00.000Z".into(),
                 expires_at: "2026-07-23T16:15:00.000Z".into(),
-                hardware_policy: signed_hardware_policy_fixture(),
+                hardware_policies: Vec::new(),
                 nodes: Vec::new(),
                 schema: "stogas.confidential-bundle.v1".into(),
                 sequence: 0,
@@ -4115,6 +4162,43 @@ mod tests {
         };
 
         validate_shape(&envelope).unwrap();
+    }
+
+    #[test]
+    fn bundle_shape_rejects_orphan_and_duplicate_hardware_policies() {
+        let policy: SignedHardwarePolicy = serde_json::from_str(include_str!(
+            "../tests/fixtures/milan-hardware-policy.signed.json"
+        ))
+        .unwrap();
+        let mut envelope = BundleEnvelope {
+            body: BundleBody {
+                allowed_catalogs: Vec::new(),
+                allowed_igvms: Vec::new(),
+                created_at: "2026-07-23T16:00:00.000Z".into(),
+                expires_at: "2026-07-23T16:15:00.000Z".into(),
+                hardware_policies: vec![policy.clone()],
+                nodes: Vec::new(),
+                schema: "stogas.confidential-bundle.v1".into(),
+                sequence: 1,
+                ttl_ms: 900_000,
+                vendor_collateral: Vec::new(),
+            },
+            body_sha256: "00".repeat(32),
+        };
+        assert!(
+            validate_shape(&envelope)
+                .unwrap_err()
+                .to_string()
+                .contains("must match the included nodes exactly")
+        );
+
+        envelope.body.hardware_policies.push(policy);
+        assert!(
+            validate_shape(&envelope)
+                .unwrap_err()
+                .to_string()
+                .contains("duplicate hardware policy chip id")
+        );
     }
 
     #[test]
@@ -4337,7 +4421,7 @@ mod tests {
                 .contains("required admitted platform protections")
         );
 
-        policy.launch.policy = "0x000000000212013a".into();
+        policy.launch.policy = "0x000000000213013a".into();
         let error = check_raw_report_bindings(&node, &policy, &report, None).unwrap_err();
         assert!(error.to_string().contains("SNP report version differs"));
     }

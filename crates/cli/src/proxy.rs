@@ -1441,9 +1441,9 @@ mod tests {
                 "allowed_igvms": [],
                 "created_at": "2026-07-23T16:00:00.000Z",
                 "expires_at": "2026-07-23T16:15:00.000Z",
-                "hardware_policy": {
+                "hardware_policies": [{
                     "policy": {
-                        "amd_sev_snp": [{
+                        "amd_sev_snp": {
                             "cpuid_family": 25,
                             "cpuid_model": 1,
                             "cpuid_stepping": 1,
@@ -1454,7 +1454,8 @@ mod tests {
                             "required_current_mitigation_mask": "0x000000000000000b",
                             "required_launch_mitigation_mask": "0x000000000000000b",
                             "required_platform_info_mask": "0x0000000000000024"
-                        }],
+                        },
+                        "chip_id": "22".repeat(64),
                         "schema": "stogas.hardware-policy.v1",
                         "sequence": 2
                     },
@@ -1465,7 +1466,7 @@ mod tests {
                         "signature": "test",
                         "signed": "hardware-policy.json"
                     }
-                },
+                }],
                 "nodes": [],
                 "schema": "stogas.confidential-bundle.v1",
                 "sequence": 1,
@@ -1494,12 +1495,13 @@ mod tests {
                 created_at_unix_ms: 0,
                 expires_at_unix_ms,
                 excluded_nodes: Vec::new(),
-                hardware_policy: stogas_verifier::VerifiedHardwarePolicy {
+                hardware_policies: vec![stogas_verifier::VerifiedHardwarePolicy {
+                    chip_id: "22".repeat(64),
                     sequence: 1,
                     sha256: "00".repeat(32),
                     source: stogas_verifier::HardwarePolicySource::StogasBundle,
                     stogas_signing_key_id: Some("test".into()),
-                },
+                }],
                 releases: Vec::new(),
                 nodes: vec![node],
                 original,

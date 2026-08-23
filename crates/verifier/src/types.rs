@@ -16,7 +16,7 @@ pub struct BundleBody {
     pub allowed_igvms: Vec<AllowedIgvm>,
     pub created_at: String,
     pub expires_at: String,
-    pub hardware_policy: SignedHardwarePolicy,
+    pub hardware_policies: Vec<SignedHardwarePolicy>,
     pub nodes: Vec<Node>,
     pub schema: String,
     pub sequence: u64,
@@ -44,7 +44,8 @@ pub struct HardwarePolicySignature {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct HardwarePolicy {
-    pub amd_sev_snp: Vec<AmdSevSnpPolicy>,
+    pub amd_sev_snp: AmdSevSnpPolicy,
+    pub chip_id: String,
     pub schema: String,
     pub sequence: u64,
 }
@@ -389,7 +390,7 @@ pub struct VerifiedBundle {
     pub created_at_unix_ms: i64,
     pub expires_at_unix_ms: i64,
     pub excluded_nodes: Vec<ExcludedNode>,
-    pub hardware_policy: VerifiedHardwarePolicy,
+    pub hardware_policies: Vec<VerifiedHardwarePolicy>,
     pub releases: Vec<VerifiedRelease>,
     pub nodes: Vec<VerifiedNode>,
     pub original: BundleEnvelope,
@@ -404,6 +405,7 @@ pub enum HardwarePolicySource {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct VerifiedHardwarePolicy {
+    pub chip_id: String,
     pub sequence: u64,
     pub sha256: String,
     pub source: HardwarePolicySource,

@@ -10,12 +10,12 @@ fn fixture() -> Value {
 }
 
 #[test]
-fn rejects_legacy_quote_without_catalog_binding() {
-    let error = Verifier::default()
-        .verify_bundle(LEGACY_BUNDLE, VERIFIED_AT_UNIX_MS, &Environment::stogas())
-        .unwrap_err()
-        .to_string();
-    assert!(error.contains("catalog_hash") || error.contains("node-report.v1"));
+fn rejects_legacy_bundle_shape() {
+    assert!(
+        Verifier::default()
+            .verify_bundle(LEGACY_BUNDLE, VERIFIED_AT_UNIX_MS, &Environment::stogas())
+            .is_err()
+    );
 }
 
 #[test]

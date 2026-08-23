@@ -57,9 +57,9 @@ stogas-verify verify bundle.json
 
 Use `-` to read from standard input. The command prints the verified release, trusted gateways, excluded stale gateways, and bundle expiry.
 
-Each bundle contains a Stogas-signed default hardware policy. It defines mutable AMD advisory appraisal, such as minimum TCB components, required report-v5 mitigation bits, and required platform state. The signature proves that Stogas selected the policy. It does not prove that the policy matches every customer's risk decision.
+Each active chip has one Stogas-signed hardware policy in the bundle. It binds the exact SNP chip ID to mutable AMD appraisal rules, such as minimum TCB components, required report-v5 mitigation bits, and required platform state. The signature proves that Stogas selected the policy. It does not prove that the policy matches every customer's risk decision.
 
-To own that decision, copy `body.hardware_policy.policy` from a bundle, review or change it, and pass the bare policy file:
+To own that decision, copy the matching `body.hardware_policies[].policy` entry from a bundle, review or change it, and pass the bare policy file:
 
 ```console
 stogas-verify verify bundle.json --policy hardware-policy.json
@@ -69,7 +69,7 @@ stogas-verify serve --policy hardware-policy.json
 The local file does not need a Stogas signature. Its file distribution is the caller's trust boundary. The verifier still checks the bundled policy signature and every fixed quote, certificate, report binding, release, encoding, and freshness rule. A stricter local policy can make the complete fleet unavailable until its hardware is updated.
 
 The shipped policy accepts one reviewed Milan B1 floor: bootloader 4, SNP 29, microcode 222,
-mitigation bits 0, 1, and 3, ECC, completed alias checking, and disabled SMT. It does not claim
+mitigation bits 0, 1, and 3, ECC, completed alias checking, and either SMT state. It does not claim
 mitigation bits 2 or 4. A customer that requires either bit can supply a stricter local policy,
 which rejects the current fleet. AMD documents those additional mitigations in
 [AMD-SB-3016](https://www.amd.com/en/resources/product-security/bulletin/amd-sb-3016.html) and
@@ -95,7 +95,7 @@ const result = verifier.verify_bundle(new Uint8Array(await response.arrayBuffer(
 console.log(result.bundle.nodes);
 ```
 
-Use `verify_bundle_with_policy(bundleBytes, policyBytes)` to replace only mutable hardware appraisal. Managed SDK transports accept the same bare policy as `hardwarePolicy` in JavaScript, `hardware_policy` in Rust and Python, and `HardwarePolicy` in Go. `result.bundle.hardware_policy` reports the applied policy hash, sequence, source, and Stogas key ID when the bundled default was used.
+Use `verify_bundle_with_policy(bundleBytes, policyBytes)` to replace the matching chip's mutable hardware appraisal. Managed SDK transports accept the same bare policy as `hardwarePolicy` in JavaScript, `hardware_policy` in Rust and Python, and `HardwarePolicy` in Go. `result.bundle.hardware_policies` reports each applied policy's chip ID, hash, sequence, source, and Stogas key ID when the bundled default was used.
 
 `result.bundle.catalogs` contains the verified catalog approvals. Each approval requires one
 GitHub Actions attestation over the runtime and public hashes and one separate Stogas-signed
