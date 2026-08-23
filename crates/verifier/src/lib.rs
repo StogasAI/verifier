@@ -3160,7 +3160,7 @@ fn check_raw_report_bindings(
         ),
         (
             expected_policy & SNP_POLICY_MIGRATE_MA != 0
-                || report[0x160..0x180].iter().all(|byte| *byte == 0),
+                || is_absent_snp_migration_agent_id(&report[0x160..0x180]),
             "migration-agent report id",
         ),
     ];
@@ -3179,6 +3179,13 @@ fn check_raw_report_bindings(
         )?;
     }
     Ok(())
+}
+
+#[cfg(feature = "snp")]
+fn is_absent_snp_migration_agent_id(value: &[u8]) -> bool {
+    // The ABI specifies zero at launch. Milan firmware 1.58 uses all ones as its
+    // absent-agent report sentinel. The signed policy bit remains authoritative.
+    value.iter().all(|byte| *byte == 0) || value.iter().all(|byte| *byte == 0xff)
 }
 
 #[cfg(feature = "snp")]
@@ -4424,6 +4431,17 @@ mod tests {
         policy.launch.policy = "0x000000000213013a".into();
         let error = check_raw_report_bindings(&node, &policy, &report, None).unwrap_err();
         assert!(error.to_string().contains("SNP report version differs"));
+    }
+
+    #[cfg(feature = "snp")]
+    #[test]
+    fn raw_snp_binding_accepts_only_absent_migration_agent_ids() {
+        assert!(is_absent_snp_migration_agent_id(&[0; 32]));
+        assert!(is_absent_snp_migration_agent_id(&[0xff; 32]));
+
+        let mut migration_agent_id = [0; 32];
+        migration_agent_id[31] = 1;
+        assert!(!is_absent_snp_migration_agent_id(&migration_agent_id));
     }
 
     #[test]
