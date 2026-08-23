@@ -2125,11 +2125,11 @@ fn validate_shape(envelope: &BundleEnvelope) -> Result<(), Error> {
         })
         .collect::<BTreeSet<_>>();
     if measurements != referenced_measurements
-        || catalog_authorizations != referenced_catalogs
+        || !referenced_catalogs.is_subset(&catalog_authorizations)
         || hardware_chip_ids != referenced_chip_ids
     {
         return Err(Error::InvalidBundle(
-            "bundle authorizations must match the included nodes exactly".into(),
+            "bundle release and hardware authorizations must match its nodes, and catalog authorizations must cover them".into(),
         ));
     }
     Ok(())
@@ -4124,7 +4124,6 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "staging")]
     fn catalog_fixture() -> AllowedCatalog {
         serde_json::from_value(serde_json::json!({
             "github_in_toto": [{}],
@@ -4172,7 +4171,7 @@ mod tests {
     }
 
     #[test]
-    fn bundle_shape_rejects_orphan_and_duplicate_hardware_policies() {
+    fn bundle_shape_allows_catalog_preauthorization_but_rejects_orphan_hardware_policies() {
         let policy: SignedHardwarePolicy = serde_json::from_str(include_str!(
             "../tests/fixtures/milan-hardware-policy.signed.json"
         ))
@@ -4196,10 +4195,18 @@ mod tests {
             validate_shape(&envelope)
                 .unwrap_err()
                 .to_string()
-                .contains("must match the included nodes exactly")
+                .contains("release and hardware authorizations must match its nodes")
         );
 
+        envelope.body.hardware_policies.clear();
+        envelope.body.allowed_catalogs.push(catalog_fixture());
+        validate_shape(&envelope).unwrap();
+
         envelope.body.hardware_policies.push(policy);
+        envelope
+            .body
+            .hardware_policies
+            .push(envelope.body.hardware_policies[0].clone());
         assert!(
             validate_shape(&envelope)
                 .unwrap_err()
