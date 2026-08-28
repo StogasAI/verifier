@@ -21,7 +21,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        target: [sigstore, bundle_x509_snp_drand, heartbeat_admission, c_abi]
+        target: [sigstore, bundle_x509_snp_drand, heartbeat_admission, c_abi, e2ee_client]
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
         with:
@@ -32,6 +32,14 @@ jobs:
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32
         with:
           workspaces: fuzz
+      - name: Restore generated fuzz corpus
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: fuzz/corpus/${{ matrix.target }}
+          key: verifier-fuzz-${{ runner.os }}-${{ matrix.target }}-${{ hashFiles('fuzz/Cargo.lock', 'fuzz/Cargo.toml') }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            verifier-fuzz-${{ runner.os }}-${{ matrix.target }}-${{ hashFiles('fuzz/Cargo.lock', 'fuzz/Cargo.toml') }}-
+            verifier-fuzz-${{ runner.os }}-${{ matrix.target }}-
       - run: cargo install cargo-fuzz --version =0.13.2 --locked
       - run: cargo fuzz run "${{ matrix.target }}" -- -max_total_time=300 -timeout=15
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a

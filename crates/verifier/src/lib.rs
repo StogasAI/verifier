@@ -21,7 +21,9 @@ use serde::Deserialize;
 use serde_json::Value;
 use sha2::{Digest, Sha256, Sha512};
 use std::collections::{BTreeMap, BTreeSet};
-use stogas_offline_sigstore::{GithubPolicy, Subject, verify_github_attestation};
+use stogas_offline_sigstore::{
+    GithubPolicy, Subject, verify_github_attestation, verify_keyed_dsse,
+};
 use thiserror::Error;
 use x509_parser::{
     cri_attributes::ParsedCriAttribute,
@@ -63,8 +65,12 @@ const STOGAS_RELEASE_PUBLIC_KEY_DER_BASE64: &str =
 const STAGING_PROVENANCE_TYPE: &str = "https://stogas.ai/attestations/staging-development/v1";
 const HEARTBEAT_SIGNATURE_DOMAIN: &[u8] = b"stogas.gateway-heartbeat.v1\0";
 const CSR_SIGNATURE_DOMAIN: &[u8] = b"stogas.gateway-csr-submission.v1\0";
-const HARDWARE_POLICY_SIGNATURE_DOMAIN: &[u8] = b"stogas hardware policy v1\n";
+const HARDWARE_POLICY_DSSE_PAYLOAD_TYPE: &str = "application/vnd.stogas.hardware-policies.v1+json";
 const SNP_PLATFORM_INFO_KNOWN_MASK: u64 = 0xbf;
+
+fn stogas_release_key(key_id: &str) -> Option<&'static str> {
+    (key_id == STOGAS_RELEASE_KEY_ID).then_some(STOGAS_RELEASE_PUBLIC_KEY_DER_BASE64)
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum AmdTcbLayout {
@@ -248,42 +254,6 @@ struct CertificateCsrTrustedContext {
     order_id: String,
 }
 
-/// Runtime-independent trust configuration.
-#[derive(Clone, Debug)]
-pub struct Environment {
-    /// Trusted Stogas release signing keys, keyed by key id, as base64 SPKI DER.
-    pub release_keys: BTreeMap<String, String>,
-    #[cfg(feature = "staging")]
-    allow_staging_development_provenance: bool,
-}
-
-impl Environment {
-    /// Standard Stogas trust roots and freshness policy.
-    #[must_use]
-    pub fn stogas() -> Self {
-        let release_keys = BTreeMap::from([(
-            STOGAS_RELEASE_KEY_ID.to_owned(),
-            STOGAS_RELEASE_PUBLIC_KEY_DER_BASE64.to_owned(),
-        )]);
-        Self {
-            release_keys,
-            #[cfg(feature = "staging")]
-            allow_staging_development_provenance: false,
-        }
-    }
-
-    #[cfg(feature = "staging")]
-    #[doc(hidden)]
-    #[must_use]
-    pub fn staging() -> Self {
-        Self {
-            #[cfg(feature = "staging")]
-            allow_staging_development_provenance: true,
-            ..Self::stogas()
-        }
-    }
-}
-
 /// Complete verification failure. No state may be persisted after this error.
 #[derive(Debug, Error)]
 pub enum Error {
@@ -305,29 +275,29 @@ pub enum Error {
     ResponseProof(String),
 }
 
-/// Verifier with a bounded in-memory cache for immutable release evidence.
+/// Verifier with a bounded in-memory cache for immutable release and catalog approvals.
 ///
-/// The cache is only a performance optimization. It is deliberately ephemeral and cannot bypass
-/// GitHub or Stogas signature verification for new release bytes.
+/// The cache is only a performance optimization. It is deliberately ephemeral and cannot change
+/// the compiled provenance policy for new approval bytes.
 #[derive(Debug, Default)]
 pub struct Verifier {
     active_bundle: Option<VerificationOutput>,
-    verified_catalogs: BTreeMap<String, VerifiedCatalogRelease>,
-    verified_releases: BTreeMap<String, VerifiedRelease>,
+    verified_catalogs: BTreeMap<ApprovalCacheKey, VerifiedCatalogRelease>,
+    verified_releases: BTreeMap<ApprovalCacheKey, VerifiedRelease>,
 }
+
+type ApprovalCacheKey = [u8; 32];
 
 struct VerificationCache {
-    catalogs: BTreeMap<String, VerifiedCatalogRelease>,
-    releases: BTreeMap<String, VerifiedRelease>,
+    catalogs: BTreeMap<ApprovalCacheKey, VerifiedCatalogRelease>,
+    releases: BTreeMap<ApprovalCacheKey, VerifiedRelease>,
 }
 
-/// Exact bytes and trust context required to verify one historical response receipt.
+/// Exact bytes required to verify one historical response receipt.
 pub struct HistoricalResponseProofInput<'a> {
-    /// Compact response receipt bytes.
-    pub proof_bytes: &'a [u8],
     /// Exact plaintext request body.
     pub request_body: &'a [u8],
-    /// Exact plaintext response body.
+    /// Complete buffered JSON response with its final `stogas` object.
     pub response_body: &'a [u8],
     /// Expected E2EE transcript hash when application encryption was used.
     pub expected_e2ee_transcript_sha256: Option<&'a str>,
@@ -337,11 +307,9 @@ pub struct HistoricalResponseProofInput<'a> {
     pub ledger_bytes: &'a [u8],
     /// Immutable catalog approval bytes selected by the signed catalog sequence.
     pub catalog_approval_bytes: &'a [u8],
-    /// Release and hardware trust policy.
-    pub environment: &'a Environment,
 }
 
-/// Locally computed hashes and trust context for constant-memory historical verification.
+/// Locally computed hashes for constant-memory historical verification.
 pub struct HistoricalResponseProofHashInput<'a> {
     /// Compact response receipt bytes.
     pub proof_bytes: &'a [u8],
@@ -357,8 +325,6 @@ pub struct HistoricalResponseProofHashInput<'a> {
     pub ledger_bytes: &'a [u8],
     /// Immutable catalog approval bytes selected by the signed catalog sequence.
     pub catalog_approval_bytes: &'a [u8],
-    /// Release and hardware trust policy.
-    pub environment: &'a Environment,
 }
 
 impl Verifier {
@@ -366,14 +332,13 @@ impl Verifier {
     ///
     /// # Errors
     ///
-    /// Returns an error without changing the release cache.
+    /// Returns an error without changing the approval caches.
     pub fn verify_bundle(
         &mut self,
         bundle_bytes: &[u8],
         now_unix_ms: i64,
-        environment: &Environment,
     ) -> Result<VerificationOutput, Error> {
-        self.verify_bundle_using_policy(bundle_bytes, None, now_unix_ms, environment)
+        self.verify_bundle_using_policy(bundle_bytes, None, now_unix_ms)
     }
 
     /// Verify a bundle while replacing only its mutable hardware appraisal rules.
@@ -383,20 +348,14 @@ impl Verifier {
     ///
     /// # Errors
     ///
-    /// Returns an error without changing the active bundle or release cache.
+    /// Returns an error without changing the active bundle or approval caches.
     pub fn verify_bundle_with_policy(
         &mut self,
         bundle_bytes: &[u8],
         local_policy_bytes: &[u8],
         now_unix_ms: i64,
-        environment: &Environment,
     ) -> Result<VerificationOutput, Error> {
-        self.verify_bundle_using_policy(
-            bundle_bytes,
-            Some(local_policy_bytes),
-            now_unix_ms,
-            environment,
-        )
+        self.verify_bundle_using_policy(bundle_bytes, Some(local_policy_bytes), now_unix_ms)
     }
 
     fn verify_bundle_using_policy(
@@ -404,13 +363,11 @@ impl Verifier {
         bundle_bytes: &[u8],
         local_policy_bytes: Option<&[u8]>,
         now_unix_ms: i64,
-        environment: &Environment,
     ) -> Result<VerificationOutput, Error> {
         let (output, next_cache) = verify_bundle_inner(
             bundle_bytes,
             local_policy_bytes,
             now_unix_ms,
-            environment,
             &self.verified_catalogs,
             &self.verified_releases,
         )?;
@@ -428,7 +385,6 @@ impl Verifier {
     /// drand, or E2EE transcript binding differs.
     pub fn verify_response_proof(
         &self,
-        proof_bytes: &[u8],
         request_body: &[u8],
         response_body: &[u8],
         expected_e2ee_transcript_sha256: Option<&str>,
@@ -438,7 +394,6 @@ impl Verifier {
             Error::ResponseProof("a bundle must be verified before a response proof".into())
         })?;
         response_proof::verify_with_bundle(
-            proof_bytes,
             request_body,
             response_body,
             expected_e2ee_transcript_sha256,
@@ -483,14 +438,9 @@ impl Verifier {
         &self,
         input: &HistoricalResponseProofInput<'_>,
     ) -> Result<response_proof::VerifiedResponseProof, Error> {
-        let ledger = verify_node_ledger_record(input.ledger_bytes, input.environment)?;
-        let catalog = verify_catalog_approval_with_environment(
-            input.catalog_approval_bytes,
-            input.environment,
-            input.now_unix_ms,
-        )?;
+        let ledger = verify_node_ledger_record(input.ledger_bytes)?;
+        let catalog = verify_catalog_approval(input.catalog_approval_bytes, input.now_unix_ms)?;
         response_proof::verify_with_ledger(
-            input.proof_bytes,
             input.request_body,
             input.response_body,
             input.expected_e2ee_transcript_sha256,
@@ -509,12 +459,8 @@ impl Verifier {
         &self,
         input: &HistoricalResponseProofHashInput<'_>,
     ) -> Result<response_proof::VerifiedResponseProof, Error> {
-        let ledger = verify_node_ledger_record(input.ledger_bytes, input.environment)?;
-        let catalog = verify_catalog_approval_with_environment(
-            input.catalog_approval_bytes,
-            input.environment,
-            input.now_unix_ms,
-        )?;
+        let ledger = verify_node_ledger_record(input.ledger_bytes)?;
+        let catalog = verify_catalog_approval(input.catalog_approval_bytes, input.now_unix_ms)?;
         response_proof::verify_with_ledger_hashes(
             input.proof_bytes,
             input.request_sha256,
@@ -531,12 +477,8 @@ impl Verifier {
 /// # Errors
 ///
 /// Returns an error if any parsing, cryptographic, policy, or freshness check fails.
-pub fn verify_bundle(
-    bundle_bytes: &[u8],
-    now_unix_ms: i64,
-    environment: &Environment,
-) -> Result<VerificationOutput, Error> {
-    Verifier::default().verify_bundle(bundle_bytes, now_unix_ms, environment)
+pub fn verify_bundle(bundle_bytes: &[u8], now_unix_ms: i64) -> Result<VerificationOutput, Error> {
+    Verifier::default().verify_bundle(bundle_bytes, now_unix_ms)
 }
 
 /// Verify a bundle with caller-owned hardware appraisal rules.
@@ -548,14 +490,8 @@ pub fn verify_bundle_with_policy(
     bundle_bytes: &[u8],
     local_policy_bytes: &[u8],
     now_unix_ms: i64,
-    environment: &Environment,
 ) -> Result<VerificationOutput, Error> {
-    Verifier::default().verify_bundle_with_policy(
-        bundle_bytes,
-        local_policy_bytes,
-        now_unix_ms,
-        environment,
-    )
+    Verifier::default().verify_bundle_with_policy(bundle_bytes, local_policy_bytes, now_unix_ms)
 }
 
 /// Verify one release authorization before Control persists it.
@@ -578,7 +514,7 @@ pub fn verify_release_approval(
         .map_err(|error| Error::InvalidJson(error.to_string()))?;
     let release: AllowedIgvm =
         serde_json::from_value(value).map_err(|error| Error::InvalidBundle(error.to_string()))?;
-    verify_release(&release, &Environment::stogas(), now_unix_ms)
+    verify_release(&release, now_unix_ms)
 }
 
 /// Verify one catalog authorization before Control persists it.
@@ -594,23 +530,6 @@ pub fn verify_catalog_approval(
     approval_bytes: &[u8],
     now_unix_ms: i64,
 ) -> Result<VerifiedCatalogRelease, Error> {
-    verify_catalog_approval_with_environment(approval_bytes, &Environment::stogas(), now_unix_ms)
-}
-
-#[cfg(feature = "staging")]
-#[doc(hidden)]
-pub fn verify_staging_catalog_approval(
-    approval_bytes: &[u8],
-    now_unix_ms: i64,
-) -> Result<VerifiedCatalogRelease, Error> {
-    verify_catalog_approval_with_environment(approval_bytes, &Environment::staging(), now_unix_ms)
-}
-
-fn verify_catalog_approval_with_environment(
-    approval_bytes: &[u8],
-    environment: &Environment,
-    now_unix_ms: i64,
-) -> Result<VerifiedCatalogRelease, Error> {
     if approval_bytes.len() > MAX_INPUT_BYTES {
         return Err(Error::TooLarge);
     }
@@ -618,26 +537,10 @@ fn verify_catalog_approval_with_environment(
         .map_err(|error| Error::InvalidJson(error.to_string()))?;
     let catalog: AllowedCatalog =
         serde_json::from_value(value).map_err(|error| Error::InvalidBundle(error.to_string()))?;
-    verify_catalog(&catalog, environment, now_unix_ms)
+    verify_catalog(&catalog, now_unix_ms)
 }
 
-#[cfg(feature = "staging")]
-#[doc(hidden)]
-pub fn verify_staging_release_approval(
-    release_bytes: &[u8],
-    now_unix_ms: i64,
-) -> Result<VerifiedRelease, Error> {
-    if release_bytes.len() > MAX_INPUT_BYTES {
-        return Err(Error::TooLarge);
-    }
-    let value = strict_json::from_slice(release_bytes)
-        .map_err(|error| Error::InvalidJson(error.to_string()))?;
-    let release: AllowedIgvm =
-        serde_json::from_value(value).map_err(|error| Error::InvalidBundle(error.to_string()))?;
-    verify_release(&release, &Environment::staging(), now_unix_ms)
-}
-
-/// Verify one immutable historical node-admission ledger record.
+/// Verify one historical node-admission evidence response.
 ///
 /// Verification is anchored to the recorded admission time, so an expired certificate or AMD
 /// collateral does not invalidate evidence that was valid when Control admitted the node.
@@ -647,20 +550,19 @@ pub fn verify_staging_release_approval(
 ///
 /// Returns an error when the release provenance, SNP quote, AMD collateral, report data, drand
 /// evidence, or node identity is invalid.
-pub fn verify_node_ledger_record(
-    record_bytes: &[u8],
-    environment: &Environment,
-) -> Result<VerifiedNodeLedgerRecord, Error> {
+pub fn verify_node_ledger_record(record_bytes: &[u8]) -> Result<VerifiedNodeLedgerRecord, Error> {
     if record_bytes.len() > MAX_INPUT_BYTES {
         return Err(Error::TooLarge);
     }
     let value = strict_json::from_slice(record_bytes)
         .map_err(|error| Error::InvalidJson(error.to_string()))?;
-    let record: NodeLedgerRecord = serde_json::from_value(value)
-        .map_err(|error| Error::InvalidBundle(format!("invalid node ledger record: {error}")))?;
-    if record.schema != "stogas.node-ledger.v1" || !is_lower_hex(&record.node_id, 32) {
+    let hydrated: HydratedNodeEvidence = serde_json::from_value(value).map_err(|error| {
+        Error::InvalidBundle(format!("invalid hydrated node evidence: {error}"))
+    })?;
+    let record = &hydrated.evidence;
+    if record.schema != "stogas.node-evidence.v1" || !is_lower_hex(&record.node_id, 32) {
         return Err(Error::InvalidBundle(
-            "unsupported or invalid node ledger record".into(),
+            "unsupported or invalid node evidence".into(),
         ));
     }
     if !is_lower_hex(&record.release_measurement, 32)
@@ -670,7 +572,7 @@ pub fn verify_node_ledger_record(
             "node ledger release measurement is invalid".into(),
         ));
     }
-    if record.release_measurement != record.release.launch_policy.measurement {
+    if record.release_measurement != hydrated.release.release_manifest.sev_snp.launch_measurement {
         return Err(Error::InvalidBundle(
             "node ledger release reference differs from its stapled provenance".into(),
         ));
@@ -681,63 +583,140 @@ pub fn verify_node_ledger_record(
             "node ledger admission timestamps differ".into(),
         ));
     }
-    if record.certificate_history.is_empty() || record.certificate_history.len() > 64 {
+    validate_node_certificate_history(record, &hydrated.certificates, admitted_at)?;
+    let release = verify_release(&hydrated.release, admitted_at)?;
+    let hardware_policy = verify_signed_hardware_policy(&hydrated.hardware_policy, admitted_at)?;
+    if hardware_policy.verified.sha256 != record.hardware_policy_sha256 {
         return Err(Error::InvalidBundle(
-            "node ledger certificate history is empty or too large".into(),
+            "node ledger hardware policy reference differs from its stapled policy".into(),
         ));
     }
-    validate_ledger_certificate_history(&record, admitted_at)?;
-    let release = verify_release(&record.release, environment, admitted_at)?;
-    let hardware_policy = verify_signed_hardware_policy(&record.hardware_policy, environment)?;
-    let node = ledger_record_node(&record);
-    if hardware_policy.policy.chip_id != node.chip_id {
-        return Err(Error::InvalidBundle(
-            "node ledger hardware policy is bound to a different chip id".into(),
-        ));
-    }
+    let node = ledger_record_node(record);
+    let hardware_policy = compatible_hardware(&hardware_policy.policy, &node.chip_id)?;
     validate_node_shape(&node)?;
-    let node_preimage = format!(
-        "{{\"chip_id\":\"{}\",\"tls_spki_sha256\":\"{}\"}}",
-        node.chip_id, node.report_data.tls_spki_sha256
-    );
-    let derived_node_id = hex::encode(Sha256::digest(node_preimage.as_bytes()));
-    if derived_node_id != record.node_id {
-        return Err(Error::Node(
-            "node ledger node ID differs from its attested identity".into(),
-        ));
-    }
-    let launch_policies = BTreeMap::from([(
+    verify_node_id(
+        &record.node_id,
+        &node.chip_id,
+        &node.report_data.tls_spki_sha256,
+    )?;
+    let release_manifests = BTreeMap::from([(
         record.release_measurement.as_str(),
-        &record.release.launch_policy,
+        &hydrated.release.release_manifest,
     )]);
+    let amd_node_identities = [AmdNodeIdentity {
+        chip_id: node.chip_id.clone(),
+        node_id: node.node_id.clone(),
+        reported_tcb: node.reported_tcb.clone(),
+    }];
     let amd_stacks = verified_amd_stacks(
         &record.admission.endorsements,
-        std::slice::from_ref(&node),
+        &amd_node_identities,
         admitted_at,
         admitted_at,
     )?;
     let verified_node = verify_node(
         &node,
         NodeVerificationTime::at(admitted_at),
-        &launch_policies,
+        &release_manifests,
         &amd_stacks,
-        &hardware_policy.policy,
+        hardware_policy,
     )?;
     Ok(VerifiedNodeLedgerRecord {
         admitted_at_unix_ms: admitted_at,
-        node_id: record.node_id,
+        node_id: record.node_id.clone(),
         node: verified_node,
         release,
     })
 }
 
-fn validate_ledger_certificate_history(
-    record: &NodeLedgerRecord,
+/// Verify one Stogas hardware policy, its Ed25519 DSSE signature, and its Rekor inclusion proof.
+///
+/// # Errors
+///
+/// Returns an error when the document, trusted key, signature, Rekor body, checkpoint, or Merkle
+/// inclusion proof is invalid.
+pub fn verify_hardware_policy(
+    policy_bytes: &[u8],
+    now_unix_ms: i64,
+) -> Result<VerifiedHardwarePolicy, Error> {
+    if policy_bytes.len() > MAX_INPUT_BYTES {
+        return Err(Error::TooLarge);
+    }
+    let value = strict_json::from_slice(policy_bytes)
+        .map_err(|error| Error::InvalidJson(error.to_string()))?;
+    let policy: SignedHardwarePolicy = serde_json::from_value(value)
+        .map_err(|error| Error::InvalidBundle(format!("invalid hardware policy: {error}")))?;
+    Ok(verify_signed_hardware_policy(&policy, now_unix_ms)?.verified)
+}
+
+/// Reappraise the exact signed reports for all live nodes before a hardware policy is activated.
+///
+/// The reports come from Control's previously verified database rows, so this repeats only the
+/// checks that the candidate policy can change.
+///
+/// # Errors
+///
+/// Returns an error if the policy proof is invalid or any node does not meet the candidate policy.
+pub fn verify_hardware_policy_fleet(
+    request_bytes: &[u8],
+    now_unix_ms: i64,
+) -> Result<VerifiedHardwarePolicyFleet, Error> {
+    if request_bytes.len() > MAX_INPUT_BYTES {
+        return Err(Error::TooLarge);
+    }
+    let value = strict_json::from_slice(request_bytes)
+        .map_err(|error| Error::InvalidJson(error.to_string()))?;
+    let request: HardwarePolicyFleetRequest = serde_json::from_value(value).map_err(|error| {
+        Error::InvalidBundle(format!("invalid hardware policy fleet appraisal: {error}"))
+    })?;
+    if request.nodes.len() > MAX_NODES {
+        return Err(Error::InvalidBundle(
+            "hardware policy fleet appraisal has too many nodes".into(),
+        ));
+    }
+    let selected = verify_signed_hardware_policy(&request.hardware_policy, now_unix_ms)?;
+    let mut seen = BTreeSet::new();
+    let mut nodes = Vec::with_capacity(request.nodes.len());
+    for node in &request.nodes {
+        if !seen.insert(node.node_id.as_str()) {
+            return Err(Error::InvalidBundle(
+                "hardware policy fleet appraisal has a duplicate node".into(),
+            ));
+        }
+        let evidence = inspect_bundle_node(node)?;
+        let policy = compatible_hardware(&selected.policy, &evidence.identity.chip_id)?;
+        appraise_stored_node_hardware(&evidence, policy)?;
+        nodes.push(VerifiedHardwarePolicyNode {
+            chip_id: evidence.identity.chip_id,
+            node_id: node.node_id.clone(),
+            reported_tcb: evidence.identity.reported_tcb,
+        });
+    }
+    nodes.sort_unstable_by(|left, right| left.node_id.cmp(&right.node_id));
+    Ok(VerifiedHardwarePolicyFleet {
+        hardware_policy: selected.verified,
+        nodes,
+    })
+}
+
+fn validate_node_certificate_history(
+    record: &NodeEvidence,
+    history: &NodeCertificateHistory,
     admitted_at: i64,
 ) -> Result<(), Error> {
+    use x509_parser::{parse_x509_certificate, pem::parse_x509_pem};
+
+    if history.schema != "stogas.node-certificate-history.v1"
+        || history.node_id != record.node_id
+        || history.certificates.len() > 256
+    {
+        return Err(Error::InvalidBundle(
+            "unsupported or invalid node certificate history".into(),
+        ));
+    }
     let mut certificate_hashes = BTreeSet::new();
     let mut previous_certificate = None;
-    for certificate in &record.certificate_history {
+    for certificate in &history.certificates {
         if !is_lower_hex(&certificate.sha256, 32) {
             return Err(Error::InvalidBundle(
                 "node ledger certificate history contains an invalid SHA-256".into(),
@@ -761,6 +740,35 @@ fn validate_ledger_certificate_history(
                 "node ledger certificate history contains a duplicate".into(),
             ));
         }
+        let leaf_der = URL_SAFE_NO_PAD.decode(&certificate.leaf_der).map_err(|_| {
+            Error::InvalidBundle("node certificate history contains invalid leaf DER".into())
+        })?;
+        if URL_SAFE_NO_PAD.encode(&leaf_der) != certificate.leaf_der
+            || hex::encode(Sha256::digest(&leaf_der)) != certificate.sha256
+        {
+            return Err(Error::InvalidBundle(
+                "node certificate history leaf DER differs from its SHA-256".into(),
+            ));
+        }
+        let (_, pem) =
+            parse_x509_pem(certificate.certificate_chain_pem.as_bytes()).map_err(|_| {
+                Error::InvalidBundle(
+                    "node certificate history contains an invalid PEM chain".into(),
+                )
+            })?;
+        if pem.label != "CERTIFICATE" || pem.contents != leaf_der {
+            return Err(Error::InvalidBundle(
+                "node certificate history chain differs from its leaf DER".into(),
+            ));
+        }
+        let (remaining, _) = parse_x509_certificate(&leaf_der).map_err(|_| {
+            Error::InvalidBundle("node certificate history contains an invalid certificate".into())
+        })?;
+        if !remaining.is_empty() {
+            return Err(Error::InvalidBundle(
+                "node certificate history leaf DER has trailing data".into(),
+            ));
+        }
     }
     if record
         .admission
@@ -776,12 +784,12 @@ fn validate_ledger_certificate_history(
     Ok(())
 }
 
-fn ledger_record_node(record: &NodeLedgerRecord) -> Node {
+fn ledger_record_node(record: &NodeEvidence) -> Node {
     Node {
         cert_expires_at: record.admission.cert_expires_at.clone(),
         chip_id: record.admission.chip_id.clone(),
         health: NodeHealth {
-            last_quote_error: None,
+            last_quote_failure_class: None,
             ready: true,
             secret_versions: BTreeMap::new(),
         },
@@ -885,6 +893,31 @@ pub fn inspect_snp_quote(quote: &str) -> Result<InspectedSnpQuote, Error> {
     })
 }
 
+fn validate_admission_request_bounds(
+    request: &AdmissionRequest,
+    now_unix_ms: i64,
+) -> Result<(), Error> {
+    if request.release_manifests.is_empty() || request.release_manifests.len() > 2 {
+        return Err(Error::InvalidBundle(
+            "admission requires one or two release manifests".into(),
+        ));
+    }
+    if request.vendor_collateral.len() > MAX_VENDOR_COLLATERAL {
+        return Err(Error::InvalidBundle(
+            "admission contains too many collateral records".into(),
+        ));
+    }
+    for (label, value) in [
+        ("heartbeat observation", &request.heartbeat.observed_at),
+        ("quote generation", &request.heartbeat.quote_generated_at),
+    ] {
+        if parse_time(value)? > now_unix_ms + MAX_CLOCK_SKEW_MS {
+            return Err(Error::Node(format!("{label} time is in the future")));
+        }
+    }
+    Ok(())
+}
+
 /// Verify one heartbeat admission using the same SNP, AMD, report-data, and drand code as bundle
 /// verification. Release provenance must have been authorized before its launch policy is supplied.
 ///
@@ -902,33 +935,10 @@ pub fn verify_heartbeat_admission(
         .map_err(|error| Error::InvalidJson(error.to_string()))?;
     let request: AdmissionRequest = serde_json::from_value(value)
         .map_err(|error| Error::InvalidBundle(format!("invalid admission request: {error}")))?;
-    let hardware_policy =
-        verify_signed_hardware_policy(&request.hardware_policy, &Environment::stogas())?;
-    if request.launch_policies.is_empty() || request.launch_policies.len() > 2 {
-        return Err(Error::InvalidBundle(
-            "admission requires one or two launch policies".into(),
-        ));
-    }
-    if request.vendor_collateral.len() > MAX_VENDOR_COLLATERAL {
-        return Err(Error::InvalidBundle(
-            "admission contains too many collateral records".into(),
-        ));
-    }
+    let hardware_policy = verify_signed_hardware_policy(&request.hardware_policy, now_unix_ms)?;
+    validate_admission_request_bounds(&request, now_unix_ms)?;
     let heartbeat = &request.heartbeat;
-    for (label, value) in [
-        ("heartbeat observation", &heartbeat.observed_at),
-        ("quote generation", &heartbeat.quote_generated_at),
-    ] {
-        if parse_time(value)? > now_unix_ms + MAX_CLOCK_SKEW_MS {
-            return Err(Error::Node(format!("{label} time is in the future")));
-        }
-    }
     let identity = inspect_snp_quote(&heartbeat.quote)?;
-    if hardware_policy.policy.chip_id != identity.chip_id {
-        return Err(Error::Node(
-            "SNP chip id differs from the signed hardware policy".into(),
-        ));
-    }
     if !request
         .trusted_chip_ids
         .iter()
@@ -936,30 +946,38 @@ pub fn verify_heartbeat_admission(
     {
         return Err(Error::Node("unknown chip id".into()));
     }
-    let mut policies = BTreeMap::new();
-    for policy in &request.launch_policies {
-        if policies
-            .insert(policy.measurement.as_str(), policy)
+    let mut release_manifests = BTreeMap::new();
+    for manifest in &request.release_manifests {
+        validate_gateway_release_manifest(manifest)?;
+        if release_manifests
+            .insert(manifest.sev_snp.launch_measurement.as_str(), manifest)
             .is_some()
         {
             return Err(Error::InvalidBundle(
-                "admission launch policies contain a duplicate measurement".into(),
+                "admission release manifests contain a duplicate measurement".into(),
             ));
         }
     }
-    if !policies.contains_key(identity.release_measurement.as_str()) {
+    if !release_manifests.contains_key(identity.release_measurement.as_str()) {
         return Err(Error::Node(
             "SNP measurement is absent from the authorized release stack".into(),
         ));
     }
+    let hardware_policy = compatible_hardware(&hardware_policy.policy, &identity.chip_id)?;
+    validate_heartbeat_operational_state(heartbeat)?;
     if parse_time(&heartbeat.cert_expires_at)? <= now_unix_ms {
         return Err(Error::Node("active certificate is expired".into()));
     }
+    let node_id = normalize_admission_node_id(
+        &heartbeat.node_id,
+        &identity.chip_id,
+        &heartbeat.report_data,
+    )?;
     let node = Node {
         cert_expires_at: heartbeat.cert_expires_at.clone(),
         chip_id: identity.chip_id,
         health: heartbeat.health.clone(),
-        node_id: heartbeat.node_id.clone(),
+        node_id,
         quote: heartbeat.quote.clone(),
         quote_verified_at: DateTime::<Utc>::from_timestamp_millis(now_unix_ms)
             .ok_or_else(|| Error::Node("captured time is out of range".into()))?
@@ -970,18 +988,23 @@ pub fn verify_heartbeat_admission(
         report_data: heartbeat.report_data.clone(),
         report_data_sha512: heartbeat.report_data_sha512.clone(),
     };
+    let amd_node_identities = [AmdNodeIdentity {
+        chip_id: node.chip_id.clone(),
+        node_id: node.node_id.clone(),
+        reported_tcb: node.reported_tcb.clone(),
+    }];
     let amd_stacks = verified_amd_stacks(
         &request.vendor_collateral,
-        std::slice::from_ref(&node),
+        &amd_node_identities,
         now_unix_ms,
         now_unix_ms,
     )?;
     let verified = verify_node(
         &node,
         NodeVerificationTime::at(now_unix_ms),
-        &policies,
+        &release_manifests,
         &amd_stacks,
-        &hardware_policy.policy,
+        hardware_policy,
     )?;
     verify_heartbeat_candidate_signature(heartbeat, &heartbeat.report_data.ed25519_public_key)?;
     Ok(VerifiedAdmission { node, verified })
@@ -1241,12 +1264,13 @@ pub fn verify_local_heartbeat_admission(
     {
         return Err(Error::Node("unknown local chip id".into()));
     }
-    let launch_policy = request
-        .launch_policies
+    let release_manifest = request
+        .release_manifests
         .iter()
-        .find(|policy| {
-            policy
-                .measurement
+        .find(|manifest| {
+            manifest
+                .sev_snp
+                .launch_measurement
                 .eq_ignore_ascii_case(&identity.release_measurement)
         })
         .ok_or_else(|| {
@@ -1279,8 +1303,9 @@ pub fn verify_local_heartbeat_admission(
         )?;
         verify_quicknet(&node.report_data.drand)?;
         if let Some(report) = identity.raw_report.as_deref() {
-            check_raw_report_bindings(&node, launch_policy, report, None)?;
-            verify_local_raw_report_signature(
+            verify_local_raw_snp_report(
+                &node,
+                release_manifest,
                 report,
                 request.amd_report_signing_public_key.as_deref(),
             )?;
@@ -1298,7 +1323,6 @@ pub fn verify_local_heartbeat_admission(
         node_id: node.node_id.clone(),
         quote: node.quote.clone(),
         quote_verified_at_unix_ms: now_unix_ms,
-        region: node.region.clone(),
         report_data: node.report_data.clone(),
         report_data_sha512: node.report_data_sha512.clone(),
         release_measurement: node.release_measurement.clone(),
@@ -1335,10 +1359,14 @@ fn heartbeat_signature_transcript(heartbeat: &HeartbeatCandidate) -> Result<Vec<
     }
 
     let mut transcript = Vec::with_capacity(512);
+    let catalog_sequence = heartbeat.catalog.sequence.to_string();
     transcript.extend_from_slice(HEARTBEAT_SIGNATURE_DOMAIN);
     for field in [
         heartbeat.node_id.as_bytes(),
+        heartbeat.active_cert_sha256.as_bytes(),
         heartbeat.cert_expires_at.as_bytes(),
+        heartbeat.catalog.digest.as_bytes(),
+        catalog_sequence.as_bytes(),
         heartbeat.observed_at.as_bytes(),
         heartbeat.quote_generated_at.as_bytes(),
         &quote_sha256[..],
@@ -1350,7 +1378,7 @@ fn heartbeat_signature_transcript(heartbeat: &HeartbeatCandidate) -> Result<Vec<
         },
         heartbeat
             .health
-            .last_quote_error
+            .last_quote_failure_class
             .as_deref()
             .unwrap_or_default()
             .as_bytes(),
@@ -1409,10 +1437,13 @@ fn parse_local_admission_request(request_bytes: &[u8]) -> Result<LocalAdmissionR
     let request: LocalAdmissionRequest = serde_json::from_value(value).map_err(|error| {
         Error::InvalidBundle(format!("invalid local admission request: {error}"))
     })?;
-    if request.launch_policies.is_empty() || request.launch_policies.len() > 2 {
+    if request.release_manifests.is_empty() || request.release_manifests.len() > 2 {
         return Err(Error::InvalidBundle(
-            "local admission requires one or two launch policies".into(),
+            "local admission requires one or two release manifests".into(),
         ));
+    }
+    for manifest in &request.release_manifests {
+        validate_gateway_release_manifest(manifest)?;
     }
     if request.trusted_chip_ids.is_empty()
         || request.trusted_chip_ids.len() > 16
@@ -1437,6 +1468,7 @@ fn parse_local_admission_request(request_bytes: &[u8]) -> Result<LocalAdmissionR
 }
 
 fn validate_local_heartbeat(heartbeat: &HeartbeatCandidate, now_unix_ms: i64) -> Result<(), Error> {
+    validate_heartbeat_operational_state(heartbeat)?;
     for (label, value) in [
         ("heartbeat observation", &heartbeat.observed_at),
         ("quote generation", &heartbeat.quote_generated_at),
@@ -1451,6 +1483,17 @@ fn validate_local_heartbeat(heartbeat: &HeartbeatCandidate, now_unix_ms: i64) ->
     let canonical_report = canonical_report_data(&heartbeat.report_data)?;
     if hex::encode(Sha512::digest(canonical_report.as_bytes())) != heartbeat.report_data_sha512 {
         return Err(Error::Node("report-data hash differs".into()));
+    }
+    Ok(())
+}
+
+fn validate_heartbeat_operational_state(heartbeat: &HeartbeatCandidate) -> Result<(), Error> {
+    if !is_lower_hex(&heartbeat.active_cert_sha256, 32)
+        || !is_sha256_identity(&heartbeat.catalog.digest)
+    {
+        return Err(Error::Node(
+            "heartbeat certificate or catalog state is invalid".into(),
+        ));
     }
     Ok(())
 }
@@ -1529,7 +1572,7 @@ fn inspect_local_mock_quote(
     {
         return Err(Error::Node("local mock quote binding differs".into()));
     }
-    if request.trusted_chip_ids.len() != 1 || request.launch_policies.len() != 1 {
+    if request.trusted_chip_ids.len() != 1 || request.release_manifests.len() != 1 {
         return Err(Error::Node(
             "local mock admission requires exactly one chip and release".into(),
         ));
@@ -1537,7 +1580,10 @@ fn inspect_local_mock_quote(
     Ok(LocalQuoteIdentity {
         chip_id: request.trusted_chip_ids[0].to_lowercase(),
         raw_report: None,
-        release_measurement: request.launch_policies[0].measurement.to_lowercase(),
+        release_measurement: request.release_manifests[0]
+            .sev_snp
+            .launch_measurement
+            .to_lowercase(),
         reported_tcb: "0000000000000000".into(),
     })
 }
@@ -1588,6 +1634,45 @@ fn inspect_local_raw_quote(request: &LocalAdmissionRequest) -> Result<LocalQuote
         release_measurement: hex::encode(&report[0x90..0xc0]),
         reported_tcb: hex::encode(&report[0x180..0x188]),
     })
+}
+
+#[cfg(feature = "snp")]
+fn verify_local_raw_snp_report(
+    node: &Node,
+    release_manifest: &GatewayReleaseManifest,
+    report: &[u8],
+    public_key: Option<&str>,
+) -> Result<(), Error> {
+    let launch =
+        compatible_launch_policy(&release_manifest.sev_snp.launch_policies, &node.chip_id)?;
+    let report_version = u32::from_le_bytes(report[0x00..0x04].try_into().unwrap_or_default());
+    let product = inspect_report_product(report, report_version)?
+        .3
+        .ok_or_else(|| Error::Node("local SNP report has no processor generation".into()))?;
+    let evidence = AttestedNode {
+        chip_id: &node.chip_id,
+        node_id: &node.node_id,
+        quote: &node.quote,
+        release_measurement: &node.release_measurement,
+        report_data: &node.report_data,
+        report_data_sha512: &node.report_data_sha512,
+        reported_tcb: &node.reported_tcb,
+    };
+    check_raw_report_bindings(&evidence, release_manifest, launch, report, None)?;
+    let expected_policy = u64::from_str_radix(launch.policy.trim_start_matches("0x"), 16)
+        .map_err(|_| Error::Node("invalid launch policy value".into()))?;
+    validate_snp_launch_policy(expected_policy, Some(product))?;
+    verify_local_raw_report_signature(report, public_key)
+}
+
+#[cfg(not(feature = "snp"))]
+fn verify_local_raw_snp_report(
+    _node: &Node,
+    _release_manifest: &GatewayReleaseManifest,
+    report: &[u8],
+    public_key: Option<&str>,
+) -> Result<(), Error> {
+    verify_local_raw_report_signature(report, public_key)
 }
 
 #[cfg(feature = "snp")]
@@ -1668,6 +1753,7 @@ fn verify_local_raw_report_signature(
     ))
 }
 
+#[cfg(feature = "snp")]
 fn decode_public_key_material(value: &str) -> Result<Vec<u8>, Error> {
     let trimmed = value.trim();
     let encoded = if trimmed.contains("-----BEGIN") {
@@ -1692,24 +1778,12 @@ struct SelectedHardwarePolicy {
     verified: VerifiedHardwarePolicy,
 }
 
-fn select_hardware_policies(
-    signed: &[SignedHardwarePolicy],
+fn select_hardware_policy(
+    signed: &SignedHardwarePolicy,
     local_policy_bytes: Option<&[u8]>,
-    environment: &Environment,
-) -> Result<Vec<SelectedHardwarePolicy>, Error> {
-    let mut selected = signed
-        .iter()
-        .map(|policy| verify_signed_hardware_policy(policy, environment))
-        .collect::<Result<Vec<_>, _>>()?;
-    let mut chip_ids = BTreeSet::new();
-    if selected
-        .iter()
-        .any(|policy| !chip_ids.insert(policy.policy.chip_id.as_str()))
-    {
-        return Err(Error::InvalidBundle(
-            "hardware policies contain a duplicate chip id".into(),
-        ));
-    }
+    now_unix_ms: i64,
+) -> Result<SelectedHardwarePolicy, Error> {
+    let selected = verify_signed_hardware_policy(signed, now_unix_ms)?;
     let Some(local_policy_bytes) = local_policy_bytes else {
         return Ok(selected);
     };
@@ -1721,111 +1795,189 @@ fn select_hardware_policies(
     let policy: HardwarePolicy = serde_json::from_value(value)
         .map_err(|error| Error::InvalidBundle(format!("invalid local hardware policy: {error}")))?;
     let canonical = validate_hardware_policy(&policy)?;
-    let local = SelectedHardwarePolicy {
-        verified: VerifiedHardwarePolicy {
-            chip_id: policy.chip_id.clone(),
-            sequence: policy.sequence,
-            sha256: hex::encode(Sha256::digest(canonical.as_bytes())),
-            source: HardwarePolicySource::Local,
-            stogas_signing_key_id: None,
-        },
-        policy,
-    };
-    let index = selected
+    let signed_assignments = selected
+        .policy
+        .policies
         .iter()
-        .position(|candidate| candidate.policy.chip_id == local.policy.chip_id)
-        .ok_or_else(|| {
-            Error::InvalidBundle(
-                "local hardware policy chip id is absent from the signed bundle policies".into(),
-            )
-        })?;
-    selected[index] = local;
-    Ok(selected)
+        .flat_map(|policy| policy.chip_ids.iter().cloned())
+        .collect::<BTreeSet<_>>();
+    let local_assignments = policy
+        .policies
+        .iter()
+        .flat_map(|policy| policy.chip_ids.iter().cloned())
+        .collect::<BTreeSet<_>>();
+    if local_assignments != signed_assignments {
+        return Err(Error::InvalidBundle(
+            "local hardware policy must keep the signed chip IDs".into(),
+        ));
+    }
+    Ok(SelectedHardwarePolicy {
+        verified: verified_hardware_policy(
+            &policy,
+            &canonical,
+            HardwarePolicySource::Local,
+            None,
+            None,
+        ),
+        policy,
+    })
 }
 
 fn verify_signed_hardware_policy(
     signed: &SignedHardwarePolicy,
-    environment: &Environment,
+    now_unix_ms: i64,
 ) -> Result<SelectedHardwarePolicy, Error> {
-    let signature = &signed.stogas_signature;
-    if signature.schema != "stogas.hardware-policy.signature.v1"
-        || signature.algorithm != "Ed25519"
-        || signature.signed != "hardware-policy.json"
-    {
-        return Err(Error::InvalidBundle(
-            "unsupported hardware policy signature".into(),
-        ));
-    }
-    let key = environment
-        .release_keys
-        .get(&signature.key_id)
+    let key_id = signed
+        .sigstore
+        .pointer("/dsseEnvelope/signatures/0/keyid")
+        .and_then(Value::as_str)
+        .ok_or_else(|| Error::InvalidBundle("hardware policy signing key id is absent".into()))?;
+    let key = stogas_release_key(key_id)
         .ok_or_else(|| Error::InvalidBundle("hardware policy signing key is not trusted".into()))?;
     let canonical = validate_hardware_policy(&signed.policy)?;
-    let mut payload = HARDWARE_POLICY_SIGNATURE_DOMAIN.to_vec();
-    payload.extend_from_slice(canonical.as_bytes());
-    verify_ed25519(key, &payload, &signature.signature)
-        .map_err(|error| Error::InvalidBundle(format!("hardware policy signature: {error}")))?;
+    let public_key_spki = STANDARD.decode(key).map_err(|error| {
+        Error::InvalidBundle(format!("hardware policy public key encoding: {error}"))
+    })?;
+    let integrated_time = verify_keyed_dsse(
+        &signed.sigstore,
+        canonical.as_bytes(),
+        HARDWARE_POLICY_DSSE_PAYLOAD_TYPE,
+        key_id,
+        &public_key_spki,
+        now_unix_ms,
+    )
+    .map_err(|error| Error::InvalidBundle(format!("hardware policy transparency: {error}")))?;
+    let integrated_time_unix_ms = rekor_seconds_to_millis(integrated_time)?;
     Ok(SelectedHardwarePolicy {
-        verified: VerifiedHardwarePolicy {
-            chip_id: signed.policy.chip_id.clone(),
-            sequence: signed.policy.sequence,
-            sha256: hex::encode(Sha256::digest(canonical.as_bytes())),
-            source: HardwarePolicySource::StogasBundle,
-            stogas_signing_key_id: Some(signature.key_id.clone()),
-        },
+        verified: verified_hardware_policy(
+            &signed.policy,
+            &canonical,
+            HardwarePolicySource::StogasBundle,
+            Some(key_id.to_owned()),
+            Some(integrated_time_unix_ms),
+        ),
         policy: signed.policy.clone(),
     })
 }
 
+fn rekor_seconds_to_millis(seconds: i64) -> Result<i64, Error> {
+    seconds.checked_mul(1000).ok_or_else(|| {
+        Error::InvalidBundle("hardware policy transparency time is out of range".into())
+    })
+}
+
+fn verified_hardware_policy(
+    policy: &HardwarePolicy,
+    canonical: &str,
+    source: HardwarePolicySource,
+    stogas_signing_key_id: Option<String>,
+    rekor_integrated_time_unix_ms: Option<i64>,
+) -> VerifiedHardwarePolicy {
+    let mut chip_ids = policy
+        .policies
+        .iter()
+        .flat_map(|policy| policy.chip_ids.iter().cloned())
+        .collect::<Vec<_>>();
+    chip_ids.sort_unstable();
+    VerifiedHardwarePolicy {
+        chip_ids,
+        policy_count: policy.policies.len(),
+        rekor_integrated_time_unix_ms,
+        sha256: hex::encode(Sha256::digest(canonical.as_bytes())),
+        source,
+        stogas_signing_key_id,
+    }
+}
+
 fn validate_hardware_policy(policy: &HardwarePolicy) -> Result<String, Error> {
-    if policy.schema != "stogas.hardware-policy.v1"
-        || policy.sequence == 0
-        || !is_lower_hex(&policy.chip_id, 64)
+    if policy.schema != "stogas.hardware-policies.v1"
+        || policy.policies.is_empty()
+        || policy.policies.len() > MAX_NODES
     {
         return Err(Error::InvalidBundle(
             "unsupported or invalid hardware policy".into(),
         ));
     }
-    let profile = &policy.amd_sev_snp;
-    if profile.report_version != 5 || profile.product.is_empty() || profile.product.len() > 32 {
-        return Err(Error::InvalidBundle(
-            "hardware policy has an invalid AMD profile".into(),
-        ));
+    let mut chip_ids = BTreeSet::new();
+    let mut previous_group_first: Option<&str> = None;
+    for profile in &policy.policies {
+        if profile.chip_ids.is_empty() || profile.chip_ids.len() > MAX_NODES {
+            return Err(Error::InvalidBundle(
+                "hardware policy group has no chip ids or is too large".into(),
+            ));
+        }
+        let mut previous_chip: Option<&str> = None;
+        for chip_id in &profile.chip_ids {
+            if !is_lower_hex(chip_id, 64)
+                || previous_chip.is_some_and(|previous| previous >= chip_id.as_str())
+                || !chip_ids.insert(chip_id.as_str())
+            {
+                return Err(Error::InvalidBundle(
+                    "hardware policy has an invalid, unsorted, or duplicate chip id".into(),
+                ));
+            }
+            previous_chip = Some(chip_id);
+        }
+        let group_first = profile.chip_ids[0].as_str();
+        if previous_group_first.is_some_and(|previous| previous >= group_first) {
+            return Err(Error::InvalidBundle(
+                "hardware policy groups are not canonically ordered".into(),
+            ));
+        }
+        previous_group_first = Some(group_first);
+        let built_in = amd_product_from_cpuid(profile.cpuid_family, profile.cpuid_model)
+            .ok_or_else(|| {
+                Error::InvalidBundle("hardware policy has an unsupported CPUID".into())
+            })?;
+        if built_in.tcb_layout != AmdTcbLayout::Family19h {
+            return Err(Error::InvalidBundle(
+                "hardware policy CPUID is not supported by this policy format".into(),
+            ));
+        }
+        let required_platform = parse_u64_hex(
+            &profile.required_platform_info_mask,
+            "required platform-info mask",
+        )?;
+        let forbidden_platform = parse_u64_hex(
+            &profile.forbidden_platform_info_mask,
+            "forbidden platform-info mask",
+        )?;
+        if required_platform & forbidden_platform != 0
+            || required_platform & !SNP_PLATFORM_INFO_KNOWN_MASK != 0
+            || forbidden_platform & !SNP_PLATFORM_INFO_KNOWN_MASK != 0
+        {
+            return Err(Error::InvalidBundle(
+                "hardware policy has invalid platform-info masks".into(),
+            ));
+        }
+        parse_u64_hex(
+            &profile.required_launch_mitigation_mask,
+            "required launch mitigation mask",
+        )?;
+        parse_u64_hex(
+            &profile.required_current_mitigation_mask,
+            "required current mitigation mask",
+        )?;
     }
-    let built_in = amd_product_from_cpuid(profile.cpuid_family, profile.cpuid_model)
-        .ok_or_else(|| Error::InvalidBundle("hardware policy has an unsupported CPUID".into()))?;
-    if profile.product != built_in.product_name || built_in.tcb_layout != AmdTcbLayout::Family19h {
-        return Err(Error::InvalidBundle(
-            "hardware policy product differs from its CPUID or TCB layout".into(),
-        ));
-    }
-    let required_platform = parse_u64_hex(
-        &profile.required_platform_info_mask,
-        "required platform-info mask",
-    )?;
-    let forbidden_platform = parse_u64_hex(
-        &profile.forbidden_platform_info_mask,
-        "forbidden platform-info mask",
-    )?;
-    if required_platform & forbidden_platform != 0
-        || required_platform & !SNP_PLATFORM_INFO_KNOWN_MASK != 0
-        || forbidden_platform & !SNP_PLATFORM_INFO_KNOWN_MASK != 0
-    {
-        return Err(Error::InvalidBundle(
-            "hardware policy has invalid platform-info masks".into(),
-        ));
-    }
-    parse_u64_hex(
-        &profile.required_launch_mitigation_mask,
-        "required launch mitigation mask",
-    )?;
-    parse_u64_hex(
-        &profile.required_current_mitigation_mask,
-        "required current mitigation mask",
-    )?;
     let value = serde_json::to_value(policy)
         .map_err(|error| Error::InvalidBundle(format!("hardware policy: {error}")))?;
     canonical_json(&value)
+}
+
+fn compatible_hardware<'a>(
+    policy: &'a HardwarePolicy,
+    chip_id: &str,
+) -> Result<&'a AmdSevSnpPolicy, Error> {
+    policy
+        .policies
+        .iter()
+        .find(|policy| {
+            policy
+                .chip_ids
+                .iter()
+                .any(|candidate| candidate.eq_ignore_ascii_case(chip_id))
+        })
+        .ok_or_else(|| Error::Node("chip id is absent from the signed hardware policy".into()))
 }
 
 fn parse_u64_hex(value: &str, label: &str) -> Result<u64, Error> {
@@ -1856,78 +2008,122 @@ fn parse_and_verify_bundle_envelope(bundle_bytes: &[u8]) -> Result<BundleEnvelop
     Ok(envelope)
 }
 
+fn verify_bundle_approvals(
+    body: &BundleBody,
+    now_unix_ms: i64,
+    verified_catalogs: &BTreeMap<ApprovalCacheKey, VerifiedCatalogRelease>,
+    verified_releases: &BTreeMap<ApprovalCacheKey, VerifiedRelease>,
+) -> Result<
+    (
+        Vec<VerifiedCatalogRelease>,
+        Vec<VerifiedRelease>,
+        VerificationCache,
+    ),
+    Error,
+> {
+    let mut catalog_cache = BTreeMap::new();
+    let catalogs = body
+        .catalogs
+        .iter()
+        .map(|catalog| {
+            let key = approval_cache_key(catalog)?;
+            let verified = verified_catalogs.get(&key).map_or_else(
+                || verify_catalog(catalog, now_unix_ms),
+                |catalog| Ok(catalog.clone()),
+            )?;
+            catalog_cache.insert(key, verified.clone());
+            Ok(verified)
+        })
+        .collect::<Result<Vec<_>, Error>>()?;
+    let mut release_cache = BTreeMap::new();
+    let releases = body
+        .allowed_igvms
+        .iter()
+        .map(|release| {
+            let key = approval_cache_key(release)?;
+            let verified = verified_releases.get(&key).map_or_else(
+                || verify_release(release, now_unix_ms),
+                |release| Ok(release.clone()),
+            )?;
+            release_cache.insert(key, verified.clone());
+            Ok(verified)
+        })
+        .collect::<Result<Vec<_>, Error>>()?;
+    Ok((
+        catalogs,
+        releases,
+        VerificationCache {
+            catalogs: catalog_cache,
+            releases: release_cache,
+        },
+    ))
+}
+
 fn verify_bundle_inner(
     bundle_bytes: &[u8],
     local_policy_bytes: Option<&[u8]>,
     now_unix_ms: i64,
-    environment: &Environment,
-    verified_catalogs: &BTreeMap<String, VerifiedCatalogRelease>,
-    verified_releases: &BTreeMap<String, VerifiedRelease>,
+    verified_catalogs: &BTreeMap<ApprovalCacheKey, VerifiedCatalogRelease>,
+    verified_releases: &BTreeMap<ApprovalCacheKey, VerifiedRelease>,
 ) -> Result<(VerificationOutput, VerificationCache), Error> {
     let envelope = parse_and_verify_bundle_envelope(bundle_bytes)?;
 
-    let hardware_policies = select_hardware_policies(
-        &envelope.body.hardware_policies,
+    let hardware_policy = select_hardware_policy(
+        &envelope.body.hardware_policy,
         local_policy_bytes,
-        environment,
+        now_unix_ms,
     )?;
-    let hardware_policy_map: BTreeMap<_, _> = hardware_policies
+    let hardware_policy_map: BTreeMap<_, _> = hardware_policy
+        .policy
+        .policies
         .iter()
-        .map(|policy| (policy.policy.chip_id.as_str(), &policy.policy))
+        .flat_map(|policy| {
+            policy
+                .chip_ids
+                .iter()
+                .map(move |chip_id| (chip_id.as_str(), policy))
+        })
         .collect();
 
     let created_at = parse_time(&envelope.body.created_at)?;
     let expires_at = parse_time(&envelope.body.expires_at)?;
-    validate_time(created_at, expires_at, envelope.body.ttl_ms, now_unix_ms)?;
+    validate_time(created_at, expires_at, now_unix_ms)?;
 
-    let mut next_catalog_cache = BTreeMap::new();
-    let catalogs = envelope
-        .body
-        .allowed_catalogs
-        .iter()
-        .map(|catalog| {
-            let key = catalog_cache_key(catalog, environment)?;
-            let verified = verified_catalogs.get(&key).map_or_else(
-                || verify_catalog(catalog, environment, now_unix_ms),
-                |catalog| Ok(catalog.clone()),
-            )?;
-            next_catalog_cache.insert(key, verified.clone());
-            Ok(verified)
-        })
-        .collect::<Result<Vec<_>, Error>>()?;
-    let mut next_release_cache = BTreeMap::new();
-    let releases = envelope
-        .body
-        .allowed_igvms
-        .iter()
-        .map(|release| {
-            let key = release_cache_key(release, environment)?;
-            let verified = verified_releases.get(&key).map_or_else(
-                || verify_release(release, environment, now_unix_ms),
-                |release| Ok(release.clone()),
-            )?;
-            next_release_cache.insert(key, verified.clone());
-            Ok(verified)
-        })
-        .collect::<Result<Vec<_>, Error>>()?;
-    let catalog_policies: BTreeMap<_, _> = catalogs
-        .iter()
-        .map(|catalog| (catalog.runtime_digest.as_str(), catalog.sequence))
-        .collect();
-    let launch_policies: BTreeMap<_, _> = envelope
+    let (catalogs, releases, next_cache) = verify_bundle_approvals(
+        &envelope.body,
+        now_unix_ms,
+        verified_catalogs,
+        verified_releases,
+    )?;
+    let release_manifests: BTreeMap<_, _> = envelope
         .body
         .allowed_igvms
         .iter()
         .map(|release| {
             (
-                release.launch_policy.measurement.as_str(),
-                &release.launch_policy,
+                release.release_manifest.sev_snp.launch_measurement.as_str(),
+                &release.release_manifest,
             )
         })
         .collect();
+    let bundle_nodes = envelope
+        .body
+        .nodes
+        .iter()
+        .map(inspect_bundle_node)
+        .collect::<Result<Vec<_>, Error>>()?;
+    let amd_node_identities = bundle_nodes
+        .iter()
+        .map(|node| AmdNodeIdentity {
+            chip_id: node.identity.chip_id.clone(),
+            node_id: node.node.node_id.clone(),
+            reported_tcb: node.identity.reported_tcb.clone(),
+        })
+        .collect::<Vec<_>>();
+    let bundle_collateral = expand_bundle_vendor_collateral(&envelope.body.vendor_collateral)?;
     let amd_stacks = verified_amd_stacks(
-        &envelope.body.vendor_collateral,
-        &envelope.body.nodes,
+        &bundle_collateral,
+        &amd_node_identities,
         created_at,
         expires_at,
     )?;
@@ -1937,11 +2133,10 @@ fn verify_bundle_inner(
         now_unix_ms,
     };
     let (nodes, excluded_nodes) = verify_and_partition_nodes(
-        &envelope.body.nodes,
+        &bundle_nodes,
         verification_time,
-        &launch_policies,
+        &release_manifests,
         &amd_stacks,
-        &catalog_policies,
         &hardware_policy_map,
     )?;
     Ok((
@@ -1952,46 +2147,38 @@ fn verify_bundle_inner(
                 created_at_unix_ms: created_at,
                 expires_at_unix_ms: expires_at,
                 excluded_nodes,
-                hardware_policies: hardware_policies
-                    .into_iter()
-                    .map(|policy| policy.verified)
-                    .collect(),
+                hardware_policy: hardware_policy.verified,
                 releases,
                 nodes,
                 original: envelope.clone(),
             },
         },
-        VerificationCache {
-            catalogs: next_catalog_cache,
-            releases: next_release_cache,
-        },
+        next_cache,
     ))
 }
 
 fn verify_and_partition_nodes(
-    bundle_nodes: &[Node],
+    bundle_nodes: &[BundleNodeEvidence<'_>],
     verification_time: NodeVerificationTime,
-    launch_policies: &BTreeMap<&str, &LaunchPolicy>,
+    release_manifests: &BTreeMap<&str, &GatewayReleaseManifest>,
     amd_stacks: &BTreeMap<String, AmdCollateralStack>,
-    catalog_policies: &BTreeMap<&str, u64>,
-    hardware_policies: &BTreeMap<&str, &HardwarePolicy>,
+    hardware_policies: &BTreeMap<&str, &AmdSevSnpPolicy>,
 ) -> Result<(Vec<VerifiedNode>, Vec<ExcludedNode>), Error> {
     let mut nodes = Vec::new();
     let mut excluded = Vec::new();
     for node in bundle_nodes {
-        verify_node_catalog_policy(&node.node_id, &node.report_data.catalog, catalog_policies)?;
         let hardware_policy = hardware_policies
-            .get(node.chip_id.as_str())
+            .get(node.identity.chip_id.as_str())
             .ok_or_else(|| {
                 Error::Node(format!(
-                    "{} chip id is absent from the verified hardware policy stack",
-                    node.node_id
+                    "{} chip id is absent from the verified hardware policy",
+                    node.node.node_id
                 ))
             })?;
-        let verified = verify_node(
+        let verified = verify_bundle_node(
             node,
             verification_time,
-            launch_policies,
+            release_manifests,
             amd_stacks,
             hardware_policy,
         )?;
@@ -2014,45 +2201,10 @@ fn verify_and_partition_nodes(
     Ok((nodes, excluded))
 }
 
-fn verify_node_catalog_policy(
-    node_id: &str,
-    catalog: &CatalogIdentity,
-    catalog_policies: &BTreeMap<&str, u64>,
-) -> Result<(), Error> {
-    if catalog_policies.get(catalog.digest.as_str()) != Some(&catalog.sequence) {
-        return Err(Error::Node(format!(
-            "{node_id} catalog identity is absent from the verified catalog stack"
-        )));
-    }
-    Ok(())
-}
-
-fn release_cache_key(release: &AllowedIgvm, environment: &Environment) -> Result<String, Error> {
-    let trusted_key = environment
-        .release_keys
-        .get(&release.stogas_signature.key_id)
-        .ok_or_else(|| Error::Release("release signing key is not trusted".into()))?;
-    let encoded = serde_json::to_vec(release).map_err(|error| Error::Release(error.to_string()))?;
-    let mut digest = Sha256::new();
-    digest.update(b"stogas verified release cache v1\0");
-    digest.update(trusted_key.as_bytes());
-    digest.update([0]);
-    digest.update(encoded);
-    Ok(hex::encode(digest.finalize()))
-}
-
-fn catalog_cache_key(catalog: &AllowedCatalog, environment: &Environment) -> Result<String, Error> {
-    let trusted_key = environment
-        .release_keys
-        .get(&catalog.signed_release.key_id)
-        .ok_or_else(|| Error::Release("catalog signing key is not trusted".into()))?;
-    let encoded = serde_json::to_vec(catalog).map_err(|error| Error::Release(error.to_string()))?;
-    let mut digest = Sha256::new();
-    digest.update(b"stogas verified catalog cache v1\0");
-    digest.update(trusted_key.as_bytes());
-    digest.update([0]);
-    digest.update(encoded);
-    Ok(hex::encode(digest.finalize()))
+fn approval_cache_key(approval: &impl serde::Serialize) -> Result<ApprovalCacheKey, Error> {
+    let encoded =
+        serde_json::to_vec(approval).map_err(|error| Error::Release(error.to_string()))?;
+    Ok(Sha256::digest(encoded).into())
 }
 
 fn validate_shape(envelope: &BundleEnvelope) -> Result<(), Error> {
@@ -2062,11 +2214,10 @@ fn validate_shape(envelope: &BundleEnvelope) -> Result<(), Error> {
     if envelope.body.allowed_igvms.len() > 2 {
         return Err(Error::InvalidBundle("invalid release count".into()));
     }
-    if envelope.body.allowed_catalogs.len() > 2 {
+    if envelope.body.catalogs.len() > 2 {
         return Err(Error::InvalidBundle("invalid catalog release count".into()));
     }
     if envelope.body.nodes.len() > MAX_NODES
-        || envelope.body.hardware_policies.len() > MAX_NODES
         || envelope.body.vendor_collateral.len() > MAX_VENDOR_COLLATERAL
     {
         return Err(Error::InvalidBundle("resource limit exceeded".into()));
@@ -2074,75 +2225,79 @@ fn validate_shape(envelope: &BundleEnvelope) -> Result<(), Error> {
     let mut measurements = BTreeSet::new();
     for release in &envelope.body.allowed_igvms {
         validate_release_shape(release)?;
-        if !measurements.insert(release.launch_policy.measurement.as_str()) {
+        if !measurements.insert(release.release_manifest.sev_snp.launch_measurement.clone()) {
             return Err(Error::InvalidBundle("duplicate release measurement".into()));
         }
     }
-    let mut catalog_digests = BTreeSet::new();
     let mut catalog_sequences = BTreeSet::new();
-    for catalog in &envelope.body.allowed_catalogs {
+    for catalog in &envelope.body.catalogs {
         validate_catalog_shape(catalog)?;
         let manifest = &catalog.signed_release.manifest;
-        if !catalog_digests.insert(manifest.runtime.as_str())
-            || !catalog_sequences.insert(manifest.sequence)
-        {
-            return Err(Error::InvalidBundle(
-                "duplicate catalog runtime digest or sequence".into(),
-            ));
+        if !catalog_sequences.insert(manifest.sequence) {
+            return Err(Error::InvalidBundle("duplicate catalog sequence".into()));
         }
     }
-    let mut hardware_chip_ids = BTreeSet::new();
-    for policy in &envelope.body.hardware_policies {
-        if !hardware_chip_ids.insert(policy.policy.chip_id.as_str()) {
-            return Err(Error::InvalidBundle(
-                "duplicate hardware policy chip id".into(),
-            ));
-        }
-    }
+    let hardware_chip_ids = envelope
+        .body
+        .hardware_policy
+        .policy
+        .policies
+        .iter()
+        .flat_map(|policy| policy.chip_ids.iter().cloned())
+        .collect::<BTreeSet<_>>();
     let mut node_ids = BTreeSet::new();
+    let mut response_signing_keys = BTreeSet::new();
     let mut referenced_measurements = BTreeSet::new();
-    let mut referenced_catalogs = BTreeSet::new();
     let mut referenced_chip_ids = BTreeSet::new();
     for node in &envelope.body.nodes {
-        validate_node_shape(node)?;
+        let evidence = inspect_bundle_node(node)?;
         if !node_ids.insert(node.node_id.as_str()) {
             return Err(Error::InvalidBundle("duplicate node id".into()));
         }
-        referenced_measurements.insert(node.release_measurement.as_str());
-        referenced_catalogs.insert((
-            node.report_data.catalog.sequence,
-            node.report_data.catalog.digest.as_str(),
-        ));
-        referenced_chip_ids.insert(node.chip_id.as_str());
+        if !response_signing_keys.insert(node.report_data.ed25519_public_key.as_str()) {
+            return Err(Error::InvalidBundle(
+                "duplicate Ed25519 response signing key".into(),
+            ));
+        }
+        referenced_measurements.insert(evidence.identity.release_measurement.clone());
+        let release = envelope
+            .body
+            .allowed_igvms
+            .iter()
+            .find(|release| {
+                release.release_manifest.sev_snp.launch_measurement
+                    == evidence.identity.release_measurement
+            })
+            .ok_or_else(|| Error::InvalidBundle("node release evidence is absent".into()))?;
+        compatible_launch_policy(
+            &release.release_manifest.sev_snp.launch_policies,
+            &evidence.identity.chip_id,
+        )?;
+        referenced_chip_ids.insert(evidence.identity.chip_id.clone());
     }
-    let catalog_authorizations = envelope
-        .body
-        .allowed_catalogs
-        .iter()
-        .map(|catalog| {
-            let manifest = &catalog.signed_release.manifest;
-            (manifest.sequence, manifest.runtime.as_str())
-        })
-        .collect::<BTreeSet<_>>();
-    if measurements != referenced_measurements
-        || !referenced_catalogs.is_subset(&catalog_authorizations)
-        || hardware_chip_ids != referenced_chip_ids
+    if measurements != referenced_measurements || !referenced_chip_ids.is_subset(&hardware_chip_ids)
     {
         return Err(Error::InvalidBundle(
-            "bundle release and hardware authorizations must match its nodes, and catalog authorizations must cover them".into(),
+            "bundle release evidence must match its nodes and hardware evidence must cover them"
+                .into(),
         ));
     }
     Ok(())
 }
 
 fn validate_catalog_shape(catalog: &AllowedCatalog) -> Result<(), Error> {
+    const MAX_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
+
     let release = &catalog.signed_release;
     let manifest = &release.manifest;
     if catalog.github_in_toto.len() != 1
         || release.schema != "stogas.catalog.signed.v1"
         || manifest.schema != "stogas.catalog.release.v1"
         || manifest.catalog_schema != 1
+        || manifest.minimum_gateway_sequence == 0
+        || manifest.minimum_gateway_sequence > MAX_SAFE_INTEGER
         || manifest.sequence == 0
+        || manifest.sequence > MAX_SAFE_INTEGER
         || manifest.source.repository != "https://github.com/StogasAI/catalog"
         || manifest.source.tag != format!("catalog-v{}", manifest.sequence)
         || !is_lower_hex(&manifest.source.commit, 20)
@@ -2163,30 +2318,188 @@ fn is_sha256_identity(value: &str) -> bool {
         .is_some_and(|digest| is_lower_hex(digest, 32))
 }
 
-fn validate_release_shape(release: &AllowedIgvm) -> Result<(), Error> {
-    let policy = &release.launch_policy;
-    let launch = &policy.launch;
-    if policy.source.repository != "https://github.com/StogasAI/gateway"
-        || policy.sequence == 0
-        || policy.vcpu_count == 0
-        || policy.name.is_empty()
-        || policy.name.len() > 128
-        || !policy.release_tag.starts_with('v')
-        || policy.release_tag.len() > 64
-        || !is_lower_hex(&policy.igvm_sha256, 32)
-        || !is_lower_hex(&policy.measurement, 48)
-        || !is_lower_hex(&policy.source.commit, 20)
-        || !is_lower_hex(&policy.source.tree, 20)
-        || !is_lower_hex(&launch.family_id, 16)
+fn validate_gateway_release_manifest(manifest: &GatewayReleaseManifest) -> Result<(), Error> {
+    if !gateway_release_manifest_shape_is_valid(manifest) {
+        return Err(Error::InvalidBundle(
+            "invalid gateway release manifest shape".into(),
+        ));
+    }
+    validate_gateway_release_build(&manifest.build)?;
+    validate_gateway_launch_policies(&manifest.sev_snp.launch_policies)?;
+    let launch_policies = canonical_json(
+        &serde_json::to_value(&manifest.sev_snp.launch_policies).map_err(|error| {
+            Error::InvalidBundle(format!("launch policy serialization: {error}"))
+        })?,
+    )?;
+    let launch_policies_sha256 = hex::encode(Sha256::digest(launch_policies.as_bytes()));
+    if launch_policies_sha256 != manifest.artifacts.snp_launch_policies.sha256
+        || manifest
+            .build
+            .input_sha256
+            .get("stogas/release/snp-launch-policies.json")
+            != Some(&launch_policies_sha256)
+    {
+        return Err(Error::InvalidBundle(
+            "gateway launch policy artifact does not match the release manifest".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn gateway_release_manifest_shape_is_valid(manifest: &GatewayReleaseManifest) -> bool {
+    let sev_snp = &manifest.sev_snp;
+    let build = &manifest.build;
+    manifest.schema == "stogas.gateway.release.v1"
+        && manifest.git.repository == "https://github.com/StogasAI/gateway"
+        && gateway_release_sequence(&manifest.git.tag) == Some(manifest.sequence)
+        && manifest.git.git_ref == format!("refs/tags/{}", manifest.git.tag)
+        && manifest.git.tag.len() <= 100
+        && is_lower_hex(&manifest.git.commit, 20)
+        && is_lower_hex(&manifest.git.tree, 20)
+        && is_lower_hex(&manifest.artifacts.gateway_igvm.sha256, 32)
+        && manifest.artifacts.gateway_igvm.size_bytes > 0
+        && manifest.artifacts.gateway_igvm.size_bytes <= 128 * 1024 * 1024
+        && is_lower_hex(&manifest.artifacts.snp_launch_policies.sha256, 32)
+        && manifest.artifacts.snp_launch_policies.size_bytes > 0
+        && manifest.artifacts.snp_launch_policies.size_bytes <= 16 * 1024 * 1024
+        && sev_snp.check_kvm
+        && sev_snp.platform == "SEV_SNP"
+        && sev_snp.vmm == "qemu-kvm"
+        && sev_snp.measurement_command == "igvmmeasure --check-kvm gateway.igvm measure"
+        && sev_snp.measurement_tool == "igvmmeasure"
+        && !sev_snp.measurement_tool_version.is_empty()
+        && sev_snp.measurement_tool_version.len() <= 100
+        && is_lower_hex(&sev_snp.measurement_tool_sha256, 32)
+        && is_lower_hex(&sev_snp.launch_measurement, 48)
+        && sev_snp.vcpu_count > 0
+        && sev_snp.vcpu_count <= 1024
+        && build.environment.lc_all == "C"
+        && build.environment.source_date_epoch == "1"
+        && build.environment.tz == "UTC"
+        && build.environment.umask == "022"
+        && build.guest_ca_bundle_path == "/etc/ssl/certs/ca-certificates.crt"
+        && is_lower_hex(&build.guix_channel_commit, 20)
+        && !build.input_sha256.is_empty()
+        && build.input_sha256.len() <= 256
+        && !build.go_version.is_empty()
+        && build.go_version.len() <= 200
+        && !build.kernel_version.is_empty()
+        && build.kernel_version.len() <= 100
+}
+
+fn validate_gateway_release_build(build: &GatewayReleaseBuild) -> Result<(), Error> {
+    for digest in [
+        &build.cmdline_sha256,
+        &build.core_go_mod_sha256,
+        &build.core_go_sum_sha256,
+        &build.go_mod_sha256,
+        &build.go_sum_sha256,
+        &build.go_vendor_tree_sha256,
+        &build.guest_ca_bundle_sha256,
+        &build.kernel_config_sha256,
+        &build.linux_bz_image_sha256,
+        &build.os_release_sha256,
+        &build.ovmf_sha256,
+        &build.pins_lock_sha256,
+        &build.systemd_stub_sha256,
+        &build.uki_sha256,
+    ] {
+        if !is_lower_hex(digest, 32) {
+            return Err(Error::InvalidBundle(
+                "gateway release build digest is invalid".into(),
+            ));
+        }
+    }
+    if build
+        .input_sha256
+        .iter()
+        .any(|(name, digest)| name.is_empty() || name.len() > 256 || !is_lower_hex(digest, 32))
+    {
+        return Err(Error::InvalidBundle(
+            "gateway release build input is invalid".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_gateway_launch_policies(policies: &LaunchPolicies) -> Result<(), Error> {
+    if policies.schema != "stogas.snp-launch-policies.v1"
+        || policies.policies.is_empty()
+        || policies.policies.len() > MAX_NODES
+    {
+        return Err(Error::InvalidBundle(
+            "invalid gateway launch policies".into(),
+        ));
+    }
+    let mut chip_ids = BTreeSet::new();
+    let mut previous_group_first: Option<&str> = None;
+    for policy in &policies.policies {
+        if policy.chip_ids.is_empty() || policy.chip_ids.len() > MAX_NODES {
+            return Err(Error::InvalidBundle(
+                "invalid gateway launch-policy group".into(),
+            ));
+        }
+        let mut previous_chip: Option<&str> = None;
+        for chip_id in &policy.chip_ids {
+            if !is_lower_hex(chip_id, 64)
+                || previous_chip.is_some_and(|previous| previous >= chip_id.as_str())
+                || !chip_ids.insert(chip_id.as_str())
+            {
+                return Err(Error::InvalidBundle(
+                    "gateway launch policies contain an invalid, unsorted, or duplicate chip id"
+                        .into(),
+                ));
+            }
+            previous_chip = Some(chip_id);
+        }
+        let first = policy.chip_ids[0].as_str();
+        if previous_group_first.is_some_and(|previous| previous >= first) {
+            return Err(Error::InvalidBundle(
+                "gateway launch-policy groups are not canonically ordered".into(),
+            ));
+        }
+        previous_group_first = Some(first);
+        validate_gateway_launch_policy(&policy.launch)?;
+    }
+    Ok(())
+}
+
+fn validate_gateway_launch_policy(launch: &LaunchValues) -> Result<(), Error> {
+    if !is_lower_hex(&launch.family_id, 16)
         || !is_lower_hex(&launch.image_id, 16)
         || !is_lower_hex(&launch.host_data, 32)
         || !is_lower_hex(&launch.id_key_digest, 48)
         || !is_lower_hex(&launch.author_key_digest, 48)
-        || launch.vmpl > 3
+        || launch.vmpl != 0
         || !is_prefixed_lower_hex(&launch.policy, 8)
     {
-        return Err(Error::InvalidBundle("invalid launch policy shape".into()));
+        return Err(Error::InvalidBundle("invalid gateway launch policy".into()));
     }
+    let launch_policy = u64::from_str_radix(&launch.policy[2..], 16)
+        .map_err(|_| Error::InvalidBundle("invalid SNP launch policy".into()))?;
+    validate_snp_launch_policy(launch_policy, None)
+        .map_err(|error| Error::InvalidBundle(format!("invalid gateway launch policy: {error}")))
+}
+
+fn compatible_launch_policy<'a>(
+    policies: &'a LaunchPolicies,
+    chip_id: &str,
+) -> Result<&'a LaunchValues, Error> {
+    policies
+        .policies
+        .iter()
+        .find(|policy| {
+            policy
+                .chip_ids
+                .iter()
+                .any(|candidate| candidate.eq_ignore_ascii_case(chip_id))
+        })
+        .map(|policy| &policy.launch)
+        .ok_or_else(|| Error::Node("chip id is absent from the release launch policies".into()))
+}
+
+fn validate_release_shape(release: &AllowedIgvm) -> Result<(), Error> {
+    validate_gateway_release_manifest(&release.release_manifest)?;
     if release.github_in_toto.len() != 1 {
         return Err(Error::InvalidBundle(
             "a release must contain exactly one GitHub attestation".into(),
@@ -2195,10 +2508,36 @@ fn validate_release_shape(release: &AllowedIgvm) -> Result<(), Error> {
     Ok(())
 }
 
+fn gateway_release_sequence(release_tag: &str) -> Option<u64> {
+    const COMPONENT_BASE: u64 = 1_000_000;
+    const MAJOR_BASE: u64 = COMPONENT_BASE * COMPONENT_BASE;
+    const MAX_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
+
+    let mut parts = release_tag.strip_prefix('v')?.split('.');
+    let parse = |part: &str| {
+        if part.is_empty()
+            || (part.len() > 1 && part.starts_with('0'))
+            || !part.bytes().all(|byte| byte.is_ascii_digit())
+        {
+            return None;
+        }
+        part.parse::<u64>().ok()
+    };
+    let major = parse(parts.next()?)?;
+    let minor = parse(parts.next()?)?;
+    let patch = parse(parts.next()?)?;
+    if parts.next().is_some() || minor >= COMPONENT_BASE || patch >= COMPONENT_BASE {
+        return None;
+    }
+    let sequence = major
+        .checked_mul(MAJOR_BASE)?
+        .checked_add(minor.checked_mul(COMPONENT_BASE)?)?
+        .checked_add(patch)?;
+    (sequence > 0 && sequence <= MAX_SAFE_INTEGER).then_some(sequence)
+}
+
 fn validate_node_shape(node: &Node) -> Result<(), Error> {
-    let report = &node.report_data;
     let checks = [
-        (report.schema == "stogas.node-report.v1", "report schema"),
         (is_lower_hex(&node.node_id, 32), "node id"),
         (is_lower_hex(&node.chip_id, 64), "chip id"),
         (is_lower_hex(&node.reported_tcb, 8), "reported TCB"),
@@ -2210,11 +2549,30 @@ fn validate_node_shape(node: &Node) -> Result<(), Error> {
             is_lower_hex(&node.report_data_sha512, 64),
             "report-data digest",
         ),
+        (!node.region.is_empty() && node.region.len() <= 64, "region"),
+    ];
+    if let Some((_, label)) = checks.into_iter().find(|(valid, _)| !valid) {
+        return Err(Error::InvalidBundle(format!(
+            "{} has an invalid {label}",
+            node.node_id
+        )));
+    }
+    validate_report_data_shape(&node.node_id, &node.report_data)
+}
+
+fn validate_bundle_node_shape(node: &BundleNode) -> Result<(), Error> {
+    if !is_lower_hex(&node.node_id, 32) {
+        return Err(Error::InvalidBundle(
+            "bundle node has an invalid node id".into(),
+        ));
+    }
+    validate_report_data_shape(&node.node_id, &node.report_data)
+}
+
+fn validate_report_data_shape(node_id: &str, report: &ReportData) -> Result<(), Error> {
+    let checks = [
+        (report.schema == "stogas.node-report.v1", "report schema"),
         (is_lower_hex(&report.tls_spki_sha256, 32), "TLS SPKI hash"),
-        (
-            is_lower_hex(&report.active_cert_sha256, 32),
-            "active certificate hash",
-        ),
         (
             report
                 .accepted_cert_sha256
@@ -2230,26 +2588,16 @@ fn validate_node_shape(node: &Node) -> Result<(), Error> {
             decode_b64url_len(&report.ed25519_public_key) == Some(32),
             "Ed25519 public key",
         ),
-        (
-            is_sha256_identity(&report.catalog.digest),
-            "catalog identity",
-        ),
-        (!node.region.is_empty() && node.region.len() <= 64, "region"),
     ];
     if let Some((_, label)) = checks.into_iter().find(|(valid, _)| !valid) {
         return Err(Error::InvalidBundle(format!(
-            "{} has an invalid {label}",
-            node.node_id
+            "{node_id} has an invalid {label}"
         )));
     }
     let certs: BTreeSet<_> = report.accepted_cert_sha256.iter().collect();
-    if !(1..=2).contains(&certs.len())
-        || certs.len() != report.accepted_cert_sha256.len()
-        || !certs.contains(&report.active_cert_sha256)
-    {
+    if certs.len() > 2 || certs.len() != report.accepted_cert_sha256.len() {
         return Err(Error::InvalidBundle(format!(
-            "{} has an invalid certificate rotation stack",
-            node.node_id
+            "{node_id} has an invalid certificate rotation stack"
         )));
     }
     Ok(())
@@ -2288,24 +2636,31 @@ fn verify_envelope(envelope: &BundleEnvelope, signed_body: &[u8]) -> Result<(), 
 
 fn verify_catalog(
     catalog: &AllowedCatalog,
-    environment: &Environment,
+    now_unix_ms: i64,
+) -> Result<VerifiedCatalogRelease, Error> {
+    let signed = &catalog.signed_release;
+    let key = stogas_release_key(&signed.key_id)
+        .ok_or_else(|| Error::Release("catalog signing key is not trusted".into()))?;
+    verify_catalog_with_key(catalog, key, now_unix_ms)
+}
+
+fn verify_catalog_with_key(
+    catalog: &AllowedCatalog,
+    key: &str,
     now_unix_ms: i64,
 ) -> Result<VerifiedCatalogRelease, Error> {
     validate_catalog_shape(catalog)?;
     let signed = &catalog.signed_release;
     let manifest = &signed.manifest;
-    let key = environment
-        .release_keys
-        .get(&signed.key_id)
-        .ok_or_else(|| Error::Release("catalog signing key is not trusted".into()))?;
     let manifest_value =
         serde_json::to_value(manifest).map_err(|error| Error::Release(error.to_string()))?;
     let canonical = canonical_json(&manifest_value)?;
-    let canonical = canonical
+    let signed_canonical = canonical
         .strip_suffix('\n')
         .ok_or_else(|| Error::Release("catalog canonical manifest is invalid".into()))?;
+    let manifest_digest = hex::encode(Sha256::digest(signed_canonical.as_bytes()));
     let mut payload = b"stogas catalog release v1\n".to_vec();
-    payload.extend_from_slice(canonical.as_bytes());
+    payload.extend_from_slice(signed_canonical.as_bytes());
     verify_ed25519(key, &payload, &signed.signature).map_err(Error::Release)?;
 
     let attestation = catalog
@@ -2314,37 +2669,13 @@ fn verify_catalog(
         .ok_or_else(|| Error::Release("catalog GitHub attestation is absent".into()))?;
     let attestation_bytes =
         serde_json::to_vec(attestation).map_err(|error| Error::Release(error.to_string()))?;
-    let runtime_digest = manifest
-        .runtime
-        .strip_prefix("sha256:")
-        .ok_or_else(|| Error::Release("catalog runtime digest is invalid".into()))?;
-    let public_digest = manifest
-        .public
-        .strip_prefix("sha256:")
-        .ok_or_else(|| Error::Release("catalog public digest is invalid".into()))?;
-    #[cfg(feature = "staging")]
-    let staging_development_provenance = environment.allow_staging_development_provenance
-        && is_staging_development_provenance(
-            &attestation_bytes,
-            &[
-                ("catalog.runtime.json", runtime_digest),
-                ("catalog.public.json", public_digest),
-            ],
-        )?;
-    #[cfg(not(feature = "staging"))]
-    let staging_development_provenance = false;
-    let (github_integrated_time_unix_ms, provenance) = verify_catalog_provenance(
-        &attestation_bytes,
-        manifest,
-        runtime_digest,
-        public_digest,
-        staging_development_provenance,
-        now_unix_ms,
-    )?;
+    let (github_integrated_time_unix_ms, provenance) =
+        verify_catalog_provenance(&attestation_bytes, manifest, &manifest_digest, now_unix_ms)?;
 
     Ok(VerifiedCatalogRelease {
         evidence: catalog.clone(),
         github_integrated_time_unix_ms,
+        minimum_gateway_sequence: manifest.minimum_gateway_sequence,
         provenance,
         public_digest: manifest.public.clone(),
         runtime_digest: manifest.runtime.clone(),
@@ -2360,13 +2691,15 @@ fn verify_catalog(
 fn verify_catalog_provenance(
     attestation_bytes: &[u8],
     manifest: &CatalogReleaseManifest,
-    runtime_digest: &str,
-    public_digest: &str,
-    staging_development_provenance: bool,
+    manifest_digest: &str,
     now_unix_ms: i64,
 ) -> Result<(Option<i64>, ReleaseProvenance), Error> {
-    if let Some(provenance) = staging_provenance(staging_development_provenance) {
-        return Ok(provenance);
+    #[cfg(feature = "staging")]
+    if is_staging_development_provenance(
+        attestation_bytes,
+        &[("catalog-release.json", manifest_digest)],
+    )? {
+        return Ok((None, ReleaseProvenance::Staging));
     }
 
     let workflow_identity = format!(
@@ -2375,16 +2708,10 @@ fn verify_catalog_provenance(
     );
     verify_github_provenance(
         attestation_bytes,
-        &[
-            Subject {
-                name: "catalog.runtime.json",
-                sha256: runtime_digest,
-            },
-            Subject {
-                name: "catalog.public.json",
-                sha256: public_digest,
-            },
-        ],
+        &[Subject {
+            name: "catalog-release.json",
+            sha256: manifest_digest,
+        }],
         &GithubPolicy {
             repository: manifest.source.repository.clone(),
             workflow_identity,
@@ -2398,30 +2725,34 @@ fn verify_catalog_provenance(
     )
 }
 
-fn verify_release(
+fn verify_release(release: &AllowedIgvm, now_unix_ms: i64) -> Result<VerifiedRelease, Error> {
+    let signature = &release.stogas_signature;
+    let key = stogas_release_key(&signature.key_id)
+        .ok_or_else(|| Error::Release("release signing key is not trusted".into()))?;
+    verify_release_with_key(release, key, now_unix_ms)
+}
+
+fn verify_release_with_key(
     release: &AllowedIgvm,
-    environment: &Environment,
+    key: &str,
     now_unix_ms: i64,
 ) -> Result<VerifiedRelease, Error> {
-    let policy = &release.launch_policy;
+    validate_release_shape(release)?;
+    let manifest = &release.release_manifest;
     let signature = &release.stogas_signature;
-    if policy.schema != "stogas.gateway.launch-policy.v1"
-        || signature.schema != "stogas.gateway.signature.v1"
+    if manifest.schema != "stogas.gateway.release.v1"
+        || signature.schema != "stogas.gateway.counterbuild-signature.v1"
         || signature.algorithm != "Ed25519"
-        || signature.signed != "gateway-launch-policy.json"
+        || signature.signed != "release-manifest.json"
     {
         return Err(Error::Release(
-            "unsupported launch policy or signature".into(),
+            "unsupported release manifest or counterbuild signature".into(),
         ));
     }
-    let key = environment
-        .release_keys
-        .get(&signature.key_id)
-        .ok_or_else(|| Error::Release("release signing key is not trusted".into()))?;
-    let policy_value =
-        serde_json::to_value(policy).map_err(|error| Error::Release(error.to_string()))?;
-    let canonical = canonical_json(&policy_value)?;
-    let mut payload = b"stogas gateway launch policy v1\n".to_vec();
+    let manifest_value =
+        serde_json::to_value(manifest).map_err(|error| Error::Release(error.to_string()))?;
+    let canonical = canonical_json(&manifest_value)?;
+    let mut payload = b"stogas gateway counterbuild v1\n".to_vec();
     payload.extend_from_slice(canonical.as_bytes());
     verify_ed25519(key, &payload, &signature.signature).map_err(Error::Release)?;
 
@@ -2431,98 +2762,63 @@ fn verify_release(
         .ok_or_else(|| Error::Release("GitHub attestation is absent".into()))?;
     let attestation_bytes =
         serde_json::to_vec(attestation_value).map_err(|error| Error::Release(error.to_string()))?;
-    let policy_digest = hex::encode(Sha256::digest(canonical.as_bytes()));
-    #[cfg(feature = "staging")]
-    let staging_development_provenance = environment.allow_staging_development_provenance
-        && is_staging_development_provenance(
-            &attestation_bytes,
-            &[
-                ("gateway.igvm", policy.igvm_sha256.as_str()),
-                ("gateway-launch-policy.json", policy_digest.as_str()),
-            ],
-        )?;
-    #[cfg(not(feature = "staging"))]
-    let staging_development_provenance = false;
-    let (github_integrated_time_unix_ms, provenance) = verify_release_provenance(
-        &attestation_bytes,
-        policy,
-        &policy_digest,
-        staging_development_provenance,
-        now_unix_ms,
-    )?;
+    let manifest_digest = hex::encode(Sha256::digest(canonical.as_bytes()));
+    let (github_integrated_time_unix_ms, provenance) =
+        verify_release_provenance(&attestation_bytes, manifest, &manifest_digest, now_unix_ms)?;
 
     Ok(VerifiedRelease {
         evidence: release.clone(),
         github_integrated_time_unix_ms,
-        igvm_sha256: policy.igvm_sha256.clone(),
-        launch: policy.launch.clone(),
-        launch_policy_sha256: policy_digest,
-        measurement: policy.measurement.clone(),
+        igvm_sha256: manifest.artifacts.gateway_igvm.sha256.clone(),
+        launch_policies: manifest.sev_snp.launch_policies.clone(),
+        measurement: manifest.sev_snp.launch_measurement.clone(),
         provenance,
-        release_tag: policy.release_tag.clone(),
-        sequence: policy.sequence,
-        source_commit: policy.source.commit.clone(),
-        source_repository: policy.source.repository.clone(),
-        source_tree: policy.source.tree.clone(),
+        release_manifest_sha256: manifest_digest,
+        release_tag: manifest.git.tag.clone(),
+        sequence: manifest.sequence,
+        source_commit: manifest.git.commit.clone(),
+        source_repository: manifest.git.repository.clone(),
+        source_tree: manifest.git.tree.clone(),
         stogas_signing_key_id: signature.key_id.clone(),
-        vcpu_count: policy.vcpu_count,
+        vcpu_count: manifest.sev_snp.vcpu_count,
     })
 }
 
 fn verify_release_provenance(
     attestation_bytes: &[u8],
-    policy: &LaunchPolicy,
-    policy_digest: &str,
-    staging_development_provenance: bool,
+    manifest: &GatewayReleaseManifest,
+    manifest_digest: &str,
     now_unix_ms: i64,
 ) -> Result<(Option<i64>, ReleaseProvenance), Error> {
-    if let Some(provenance) = staging_provenance(staging_development_provenance) {
-        return Ok(provenance);
+    #[cfg(feature = "staging")]
+    if is_staging_development_provenance(
+        attestation_bytes,
+        &[("release-manifest.json", manifest_digest)],
+    )? {
+        return Ok((None, ReleaseProvenance::Staging));
     }
 
     let workflow_identity = format!(
         "https://github.com/StogasAI/gateway/.github/workflows/gateway-igvm-release.yml@refs/tags/{}",
-        policy.release_tag
+        manifest.git.tag
     );
     verify_github_provenance(
         attestation_bytes,
-        &[
-            Subject {
-                name: "gateway.igvm",
-                sha256: &policy.igvm_sha256,
-            },
-            Subject {
-                name: "gateway-launch-policy.json",
-                sha256: policy_digest,
-            },
-        ],
+        &[Subject {
+            name: "release-manifest.json",
+            sha256: manifest_digest,
+        }],
         &GithubPolicy {
-            repository: policy.source.repository.clone(),
+            repository: manifest.git.repository.clone(),
             workflow_identity,
-            source_ref: format!("refs/tags/{}", policy.release_tag),
-            source_commit: policy.source.commit.clone(),
+            source_ref: manifest.git.git_ref.clone(),
+            source_commit: manifest.git.commit.clone(),
             predicate_type: "https://slsa.dev/provenance/v1".into(),
             require_github_hosted: true,
         },
         now_unix_ms,
         "gateway provenance",
     )
-}
-
-const fn staging_provenance(enabled: bool) -> Option<(Option<i64>, ReleaseProvenance)> {
-    #[cfg(feature = "staging")]
-    {
-        if enabled {
-            Some((None, ReleaseProvenance::Staging))
-        } else {
-            None
-        }
-    }
-    #[cfg(not(feature = "staging"))]
-    {
-        let _ = enabled;
-        None
-    }
 }
 
 fn verify_github_provenance(
@@ -2612,34 +2908,154 @@ impl NodeVerificationTime {
     }
 }
 
+struct AttestedNode<'a> {
+    chip_id: &'a str,
+    node_id: &'a str,
+    quote: &'a str,
+    release_measurement: &'a str,
+    report_data: &'a ReportData,
+    report_data_sha512: &'a str,
+    reported_tcb: &'a str,
+}
+
+struct BundleNodeEvidence<'a> {
+    identity: InspectedSnpQuote,
+    node: &'a BundleNode,
+    report_data_sha512: String,
+}
+
+fn inspect_bundle_node(node: &BundleNode) -> Result<BundleNodeEvidence<'_>, Error> {
+    validate_bundle_node_shape(node)?;
+    let identity = inspect_snp_quote(&node.quote)?;
+    let canonical_report = canonical_report_data(&node.report_data)?;
+    let report_data_sha512 = hex::encode(Sha512::digest(canonical_report.as_bytes()));
+    verify_node_id(
+        &node.node_id,
+        &identity.chip_id,
+        &node.report_data.tls_spki_sha256,
+    )?;
+    Ok(BundleNodeEvidence {
+        identity,
+        node,
+        report_data_sha512,
+    })
+}
+
+fn verify_node_id(node_id: &str, chip_id: &str, tls_spki_sha256: &str) -> Result<(), Error> {
+    if derive_node_id(chip_id, tls_spki_sha256) != node_id {
+        return Err(Error::Node(
+            "node ID differs from its attested chip and TLS key".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn normalize_admission_node_id(
+    supplied_node_id: &str,
+    chip_id: &str,
+    report_data: &ReportData,
+) -> Result<String, Error> {
+    let node_id = derive_node_id(chip_id, &report_data.tls_spki_sha256);
+    let candidate_preimage = format!(
+        "{{\"ed25519_public_key\":\"{}\",\"hpke_public_key\":\"{}\",\"tls_spki_sha256\":\"{}\"}}",
+        report_data.ed25519_public_key, report_data.hpke_public_key, report_data.tls_spki_sha256
+    );
+    let candidate_node_id = hex::encode(Sha256::digest(candidate_preimage.as_bytes()));
+    if supplied_node_id != node_id && supplied_node_id != candidate_node_id {
+        return Err(Error::Node(
+            "node ID differs from its attested generation identity".into(),
+        ));
+    }
+    Ok(node_id)
+}
+
+fn derive_node_id(chip_id: &str, tls_spki_sha256: &str) -> String {
+    let preimage =
+        format!("{{\"chip_id\":\"{chip_id}\",\"tls_spki_sha256\":\"{tls_spki_sha256}\"}}");
+    hex::encode(Sha256::digest(preimage.as_bytes()))
+}
+
+fn verify_bundle_node(
+    node: &BundleNodeEvidence<'_>,
+    verification_time: NodeVerificationTime,
+    release_manifests: &BTreeMap<&str, &GatewayReleaseManifest>,
+    amd_stacks: &BTreeMap<String, AmdCollateralStack>,
+    hardware_policy: &AmdSevSnpPolicy,
+) -> Result<VerifiedNode, Error> {
+    let evidence = AttestedNode {
+        chip_id: &node.identity.chip_id,
+        node_id: &node.node.node_id,
+        quote: &node.node.quote,
+        release_measurement: &node.identity.release_measurement,
+        report_data: &node.node.report_data,
+        report_data_sha512: &node.report_data_sha512,
+        reported_tcb: &node.identity.reported_tcb,
+    };
+    verify_attested_node(
+        &evidence,
+        verification_time.bundle_created_at,
+        verification_time,
+        release_manifests,
+        amd_stacks,
+        hardware_policy,
+    )
+}
+
 fn verify_node(
     node: &Node,
     verification_time: NodeVerificationTime,
-    launch_policies: &BTreeMap<&str, &LaunchPolicy>,
+    release_manifests: &BTreeMap<&str, &GatewayReleaseManifest>,
     amd_stacks: &BTreeMap<String, AmdCollateralStack>,
-    hardware_policy: &HardwarePolicy,
+    hardware_policy: &AmdSevSnpPolicy,
 ) -> Result<VerifiedNode, Error> {
-    if hardware_policy.chip_id != node.chip_id {
-        return Err(Error::Node(format!(
-            "{} chip id differs from its hardware policy",
-            node.node_id
-        )));
-    }
-    let launch_policy = launch_policies
-        .get(node.release_measurement.as_str())
-        .ok_or_else(|| {
-            Error::Node(format!(
-                "{} release measurement {} is absent from the verified release stack",
-                node.node_id, node.release_measurement
-            ))
-        })?;
     if parse_time(&node.cert_expires_at)? < verification_time.bundle_expires_at {
         return Err(Error::Node(format!(
             "bundle outlives {} certificate",
             node.node_id
         )));
     }
-    let canonical_report = canonical_report_data(&node.report_data)?;
+    let quote_verified_at = parse_time(&node.quote_verified_at)?;
+    let evidence = AttestedNode {
+        chip_id: &node.chip_id,
+        node_id: &node.node_id,
+        quote: &node.quote,
+        release_measurement: &node.release_measurement,
+        report_data: &node.report_data,
+        report_data_sha512: &node.report_data_sha512,
+        reported_tcb: &node.reported_tcb,
+    };
+    verify_node_id(
+        &node.node_id,
+        &node.chip_id,
+        &node.report_data.tls_spki_sha256,
+    )?;
+    verify_attested_node(
+        &evidence,
+        quote_verified_at,
+        verification_time,
+        release_manifests,
+        amd_stacks,
+        hardware_policy,
+    )
+}
+
+fn verify_attested_node(
+    node: &AttestedNode<'_>,
+    quote_verified_at: i64,
+    verification_time: NodeVerificationTime,
+    release_manifests: &BTreeMap<&str, &GatewayReleaseManifest>,
+    amd_stacks: &BTreeMap<String, AmdCollateralStack>,
+    hardware_policy: &AmdSevSnpPolicy,
+) -> Result<VerifiedNode, Error> {
+    let release_manifest = release_manifests
+        .get(node.release_measurement)
+        .ok_or_else(|| {
+            Error::Node(format!(
+                "{} release measurement {} is absent from the verified release stack",
+                node.node_id, node.release_measurement
+            ))
+        })?;
+    let canonical_report = canonical_report_data(node.report_data)?;
     if hex::encode(Sha512::digest(canonical_report.as_bytes())) != node.report_data_sha512 {
         return Err(Error::Node(format!(
             "{} report-data hash differs",
@@ -2654,7 +3070,6 @@ fn verify_node(
             node.node_id
         )));
     }
-    let quote_verified_at = parse_time(&node.quote_verified_at)?;
     if quote_verified_at > verification_time.bundle_created_at {
         return Err(Error::Node(format!(
             "{} quote verification time is later than bundle creation",
@@ -2662,40 +3077,40 @@ fn verify_node(
         )));
     }
     let drand_round_time_unix_ms = validate_node_evidence_time(
-        &node.node_id,
+        node.node_id,
         node.report_data.drand.round,
         quote_verified_at,
         verification_time.now_unix_ms,
     )?;
-    let round = node.report_data.drand.round;
     verify_quicknet(&node.report_data.drand)?;
     let amd_stack = amd_stacks
-        .get(&amd_platform_key(&node.chip_id, &node.reported_tcb))
+        .get(&amd_platform_key(node.chip_id, node.reported_tcb))
         .ok_or_else(|| Error::Node(format!("{} has no matching AMD evidence", node.node_id)))?;
+    let launch = compatible_launch_policy(&release_manifest.sev_snp.launch_policies, node.chip_id)?;
     verify_snp_node(
         node,
-        launch_policy,
+        release_manifest,
+        launch,
         verification_time.bundle_created_at,
         verification_time.bundle_expires_at,
         amd_stack,
         hardware_policy,
     )?;
     Ok(VerifiedNode {
-        chip_id: node.chip_id.clone(),
-        drand_round: round,
+        chip_id: node.chip_id.to_owned(),
+        drand_round: node.report_data.drand.round,
         drand_round_time_unix_ms,
         evidence_age_ms: verification_time
             .bundle_created_at
             .saturating_sub(drand_round_time_unix_ms)
             .max(0),
-        node_id: node.node_id.clone(),
-        quote: node.quote.clone(),
+        node_id: node.node_id.to_owned(),
+        quote: node.quote.to_owned(),
         quote_verified_at_unix_ms: quote_verified_at,
-        region: node.region.clone(),
         report_data: node.report_data.clone(),
-        report_data_sha512: node.report_data_sha512.clone(),
-        release_measurement: node.release_measurement.clone(),
-        reported_tcb: node.reported_tcb.clone(),
+        report_data_sha512: node.report_data_sha512.to_owned(),
+        release_measurement: node.release_measurement.to_owned(),
+        reported_tcb: node.reported_tcb.to_owned(),
     })
 }
 
@@ -2710,11 +3125,24 @@ struct AmdCollateralEntry {
 }
 
 #[derive(Clone, Debug)]
+#[cfg_attr(
+    not(feature = "snp"),
+    allow(
+        dead_code,
+        reason = "parsed AMD collateral is consumed only by the optional SNP verifier"
+    )
+)]
 struct AmdCollateralStack {
     ark: Vec<u8>,
     ask: Vec<u8>,
     crl: Vec<u8>,
     vek: Vec<u8>,
+}
+
+struct AmdNodeIdentity {
+    chip_id: String,
+    node_id: String,
+    reported_tcb: String,
 }
 
 #[derive(serde::Deserialize)]
@@ -2739,12 +3167,34 @@ struct AmdKdsPayload {
     tcb: Option<Value>,
 }
 
+fn expand_bundle_vendor_collateral(
+    rows: &[BTreeMap<String, Value>],
+) -> Result<Vec<VendorCollateral>, Error> {
+    rows.iter()
+        .map(|payload| {
+            let parsed: AmdKdsPayload =
+                serde_json::from_value(Value::Object(payload.clone().into_iter().collect()))
+                    .map_err(|error| {
+                        Error::InvalidBundle(format!("invalid AMD collateral: {error}"))
+                    })?;
+            Ok(VendorCollateral {
+                chip_id: parsed.chip_id,
+                collateral_type: parsed.collateral_type,
+                fetched_at: parsed.fetched_at,
+                payload: payload.clone(),
+                sha256: parsed.sha256,
+                source_url: parsed.source_url,
+            })
+        })
+        .collect()
+}
+
 type AmdCommonCollateral = BTreeMap<(String, String), AmdCollateralEntry>;
 type AmdVcekCollateral = BTreeMap<String, AmdCollateralEntry>;
 
 fn verified_amd_stacks(
     rows: &[VendorCollateral],
-    nodes: &[Node],
+    nodes: &[AmdNodeIdentity],
     bundle_created_at: i64,
     bundle_expires_at: i64,
 ) -> Result<BTreeMap<String, AmdCollateralStack>, Error> {
@@ -3035,37 +3485,45 @@ fn decode_snp_report(quote_value: &str, node_id: &str) -> Result<Vec<u8>, Error>
 
 #[cfg(feature = "snp")]
 fn verify_snp_node(
-    node: &Node,
-    policy: &LaunchPolicy,
+    node: &AttestedNode<'_>,
+    release_manifest: &GatewayReleaseManifest,
+    launch: &LaunchValues,
     bundle_created_at: i64,
     bundle_expires_at: i64,
     collateral: &AmdCollateralStack,
-    hardware_policy: &HardwarePolicy,
+    hardware_policy: &AmdSevSnpPolicy,
 ) -> Result<(), Error> {
-    let report_bytes = decode_snp_report(&node.quote, &node.node_id)?;
-    check_raw_report_bindings(node, policy, &report_bytes, Some(hardware_policy))?;
+    let report_bytes = decode_snp_report(node.quote, node.node_id)?;
+    check_raw_report_bindings(
+        node,
+        release_manifest,
+        launch,
+        &report_bytes,
+        Some(hardware_policy),
+    )?;
     verify_amd_collateral_stack(
         collateral,
-        &node.chip_id,
-        &node.reported_tcb,
+        node.chip_id,
+        node.reported_tcb,
         bundle_created_at,
         bundle_expires_at,
     )?;
     let product = validate_report_product_binding(&collateral.vek, &report_bytes)?;
-    let expected_policy = u64::from_str_radix(policy.launch.policy.trim_start_matches("0x"), 16)
+    let expected_policy = u64::from_str_radix(launch.policy.trim_start_matches("0x"), 16)
         .map_err(|_| Error::Node("invalid launch policy value".into()))?;
     validate_snp_launch_policy(expected_policy, Some(product))?;
-    verify_raw_snp_report_signature_with_vcek(&report_bytes, &collateral.vek, &node.node_id)
+    verify_raw_snp_report_signature_with_vcek(&report_bytes, &collateral.vek, node.node_id)
 }
 
 #[cfg(not(feature = "snp"))]
 fn verify_snp_node(
-    _node: &Node,
-    _policy: &LaunchPolicy,
+    _node: &AttestedNode<'_>,
+    _release_manifest: &GatewayReleaseManifest,
+    _launch: &LaunchValues,
     _bundle_created_at: i64,
     _bundle_expires_at: i64,
     _collateral: &AmdCollateralStack,
-    _hardware_policy: &HardwarePolicy,
+    _hardware_policy: &AmdSevSnpPolicy,
 ) -> Result<(), Error> {
     Err(Error::Node(
         "AMD SNP verification is unavailable in this build".into(),
@@ -3074,10 +3532,11 @@ fn verify_snp_node(
 
 #[cfg(feature = "snp")]
 fn check_raw_report_bindings(
-    node: &Node,
-    policy: &LaunchPolicy,
+    node: &AttestedNode<'_>,
+    release_manifest: &GatewayReleaseManifest,
+    launch: &LaunchValues,
     report: &[u8],
-    hardware_policy: Option<&HardwarePolicy>,
+    hardware_policy: Option<&AmdSevSnpPolicy>,
 ) -> Result<(), Error> {
     fn bytes<const N: usize>(value: &str, label: &str) -> Result<[u8; N], Error> {
         let decoded = hex::decode(value).map_err(|_| Error::Node(format!("invalid {label}")))?;
@@ -3091,7 +3550,7 @@ fn check_raw_report_bindings(
     let u64_at = |offset: usize| {
         u64::from_le_bytes(report[offset..offset + 8].try_into().unwrap_or_default())
     };
-    let expected_policy = u64::from_str_radix(policy.launch.policy.trim_start_matches("0x"), 16)
+    let expected_policy = u64::from_str_radix(launch.policy.trim_start_matches("0x"), 16)
         .map_err(|_| Error::Node("invalid launch policy value".into()))?;
     validate_snp_launch_policy(expected_policy, None)?;
     let report_version = u32_at(0x00);
@@ -3105,52 +3564,48 @@ fn check_raw_report_bindings(
     if let Some(product) = report_product {
         validate_snp_launch_policy(expected_policy, Some(product))?;
     }
-    validate_raw_snp_report_encoding(report, report_version, report_product, &node.node_id)?;
+    validate_raw_snp_report_encoding(report, report_version, report_product, node.node_id)?;
     let report_info = u32_at(0x48);
-    let author_key_present = policy
-        .launch
-        .author_key_digest
-        .bytes()
-        .any(|byte| byte != b'0');
+    let author_key_present = launch.author_key_digest.bytes().any(|byte| byte != b'0');
     let checks = [
         (
-            report[0x10..0x20] == bytes::<16>(&policy.launch.family_id, "family id")?,
+            report[0x10..0x20] == bytes::<16>(&launch.family_id, "family id")?,
             "family id",
         ),
         (
-            report[0x20..0x30] == bytes::<16>(&policy.launch.image_id, "image id")?,
+            report[0x20..0x30] == bytes::<16>(&launch.image_id, "image id")?,
             "image id",
         ),
         (
-            report[0x50..0x90] == bytes::<64>(&node.report_data_sha512, "report data")?,
+            report[0x50..0x90] == bytes::<64>(node.report_data_sha512, "report data")?,
             "report data",
         ),
         (
-            report[0x90..0xc0] == bytes::<48>(&policy.measurement, "measurement")?,
+            report[0x90..0xc0]
+                == bytes::<48>(&release_manifest.sev_snp.launch_measurement, "measurement")?,
             "measurement",
         ),
         (
-            report[0xc0..0xe0] == bytes::<32>(&policy.launch.host_data, "host data")?,
+            report[0xc0..0xe0] == bytes::<32>(&launch.host_data, "host data")?,
             "host data",
         ),
         (
-            report[0xe0..0x110] == bytes::<48>(&policy.launch.id_key_digest, "id key digest")?,
+            report[0xe0..0x110] == bytes::<48>(&launch.id_key_digest, "id key digest")?,
             "id key digest",
         ),
         (
-            report[0x110..0x140]
-                == bytes::<48>(&policy.launch.author_key_digest, "author key digest")?,
+            report[0x110..0x140] == bytes::<48>(&launch.author_key_digest, "author key digest")?,
             "author key digest",
         ),
         (
-            report[0x180..0x188] == bytes::<8>(&node.reported_tcb, "reported TCB")?,
+            report[0x180..0x188] == bytes::<8>(node.reported_tcb, "reported TCB")?,
             "reported TCB",
         ),
         (
-            report[0x1a0..0x1e0] == bytes::<64>(&node.chip_id, "chip id")?,
+            report[0x1a0..0x1e0] == bytes::<64>(node.chip_id, "chip id")?,
             "chip id",
         ),
-        (u32_at(0x30) == u32::from(policy.launch.vmpl), "VMPL"),
+        (u32_at(0x30) == u32::from(launch.vmpl), "VMPL"),
         (u64_at(0x08) == expected_policy, "guest policy"),
         (u32_at(0x34) == 1, "signature algorithm"),
         ((report_info & !1) == 0, "VCEK signing key information"),
@@ -3175,7 +3630,7 @@ fn check_raw_report_bindings(
             report_version,
             report_product,
             hardware_policy,
-            &node.node_id,
+            node.node_id,
         )?;
     }
     Ok(())
@@ -3238,7 +3693,7 @@ fn appraise_snp_report(
     report: &[u8],
     report_version: u32,
     product: Option<&AmdProductProfile>,
-    policy: &HardwarePolicy,
+    profile: &AmdSevSnpPolicy,
     node_id: &str,
 ) -> Result<(), Error> {
     if report_version != 5 {
@@ -3249,7 +3704,6 @@ fn appraise_snp_report(
     let family = report[0x188];
     let model = report[0x189];
     let stepping = report[0x18a];
-    let profile = &policy.amd_sev_snp;
     if profile.cpuid_family != family
         || profile.cpuid_model != model
         || profile.cpuid_stepping != stepping
@@ -3258,9 +3712,8 @@ fn appraise_snp_report(
             "{node_id} CPUID differs from hardware policy"
         )));
     }
-    if profile.report_version != report_version
-        || product.map(|product| product.product_name) != Some(profile.product.as_str())
-    {
+    let policy_product = amd_product_from_cpuid(profile.cpuid_family, profile.cpuid_model);
+    if policy_product != product {
         return Err(Error::Node(format!(
             "{node_id} SNP processor identity differs from hardware policy"
         )));
@@ -3339,6 +3792,36 @@ fn appraise_snp_report(
 }
 
 #[cfg(feature = "snp")]
+fn appraise_stored_node_hardware(
+    node: &BundleNodeEvidence<'_>,
+    policy: &AmdSevSnpPolicy,
+) -> Result<(), Error> {
+    let report = decode_snp_report(&node.node.quote, &node.node.node_id)?;
+    let expected_report_data = hex::decode(&node.report_data_sha512)
+        .map_err(|_| Error::Node("report-data digest is invalid".into()))?;
+    if report[0x50..0x90] != expected_report_data {
+        return Err(Error::Node(format!(
+            "{} SNP report data differs",
+            node.node.node_id
+        )));
+    }
+    let report_version = u32::from_le_bytes(report[0x00..0x04].try_into().unwrap_or_default());
+    let (_, _, _, product) = inspect_report_product(&report, report_version)?;
+    validate_raw_snp_report_encoding(&report, report_version, product, &node.node.node_id)?;
+    appraise_snp_report(&report, report_version, product, policy, &node.node.node_id)
+}
+
+#[cfg(not(feature = "snp"))]
+fn appraise_stored_node_hardware(
+    _node: &BundleNodeEvidence<'_>,
+    _policy: &AmdSevSnpPolicy,
+) -> Result<(), Error> {
+    Err(Error::Node(
+        "AMD SNP verification is unavailable in this build".into(),
+    ))
+}
+
+#[cfg(feature = "snp")]
 fn family19h_tcb(bytes: &[u8]) -> AmdTcb {
     AmdTcb {
         bootloader: bytes[0],
@@ -3401,28 +3884,39 @@ fn validate_amd_x509(
     if !crl_remaining.is_empty() {
         return Err(Error::Node("AMD CRL contains trailing data".into()));
     }
-    if crl.tbs_cert_list.this_update.timestamp() * 1000 > bundle_created_at + MAX_CLOCK_SKEW_MS
-        || crl
-            .tbs_cert_list
-            .next_update
-            .as_ref()
-            .is_none_or(|time| time.timestamp() * 1000 < bundle_expires_at)
-        || crl
-            .iter_revoked_certificates()
-            .any(|revoked| revoked.raw_serial() == vek.raw_serial())
-    {
-        return Err(Error::Node(
-            "AMD VEK is revoked or CRL expires before the bundle".into(),
-        ));
+    validate_amd_crl(&crl, &ark, &ask, bundle_created_at, bundle_expires_at)?;
+    Ok(())
+}
+
+#[cfg(feature = "snp")]
+fn validate_amd_crl(
+    crl: &x509_parser::revocation_list::CertificateRevocationList<'_>,
+    ark: &x509_parser::certificate::X509Certificate<'_>,
+    ask: &x509_parser::certificate::X509Certificate<'_>,
+    bundle_created_at: i64,
+    bundle_expires_at: i64,
+) -> Result<(), Error> {
+    if crl.tbs_cert_list.issuer != *ark.subject() {
+        return Err(Error::Node("AMD CRL issuer differs from the ARK".into()));
     }
-    let crl_signer = if crl.tbs_cert_list.issuer == *ask.subject() {
-        &ask
-    } else if crl.tbs_cert_list.issuer == *ark.subject() {
-        &ark
-    } else {
-        return Err(Error::Node("AMD CRL issuer differs".into()));
-    };
-    verify_amd_crl_signature(&crl, crl_signer)?;
+    verify_amd_crl_signature(crl, ark)?;
+    if crl.tbs_cert_list.this_update.timestamp() * 1000 > bundle_created_at + MAX_CLOCK_SKEW_MS {
+        return Err(Error::Node("AMD CRL is future-dated".into()));
+    }
+    if crl
+        .tbs_cert_list
+        .next_update
+        .as_ref()
+        .is_none_or(|time| time.timestamp() * 1000 < bundle_expires_at)
+    {
+        return Err(Error::Node("AMD CRL expires before the bundle".into()));
+    }
+    if crl
+        .iter_revoked_certificates()
+        .any(|revoked| revoked.raw_serial() == ask.raw_serial())
+    {
+        return Err(Error::Node("AMD ASK is revoked".into()));
+    }
     Ok(())
 }
 
@@ -3464,13 +3958,36 @@ fn verify_amd_crl_signature(
 ) -> Result<(), Error> {
     use rsa::{RsaPublicKey, pkcs8::DecodePublicKey as _, pss};
     use signature::Verifier as _;
+    use x509_parser::signature_algorithm::SignatureAlgorithm;
 
     const RSA_PSS_OID: &str = "1.2.840.113549.1.1.10";
-    if crl.signature_algorithm.algorithm.to_id_string() != RSA_PSS_OID
-        || crl.tbs_cert_list.signature.algorithm.to_id_string() != RSA_PSS_OID
+    const MGF1_OID: &str = "1.2.840.113549.1.1.8";
+    const SHA384_OID: &str = "2.16.840.1.101.3.4.2.2";
+    const SHA384_BYTES: u32 = 48;
+    if crl.signature_algorithm != crl.tbs_cert_list.signature
+        || crl.signature_algorithm.algorithm.to_id_string() != RSA_PSS_OID
     {
         return Err(Error::Node(
-            "AMD CRL must use RSA-PSS for both signature identifiers".into(),
+            "AMD CRL must use one matching RSA-PSS signature algorithm".into(),
+        ));
+    }
+    let SignatureAlgorithm::RSASSA_PSS(parameters) =
+        SignatureAlgorithm::try_from(&crl.signature_algorithm)
+            .map_err(|_| Error::Node("AMD CRL has invalid RSA-PSS signature parameters".into()))?
+    else {
+        return Err(Error::Node("AMD CRL must use RSA-PSS with SHA-384".into()));
+    };
+    let mask = parameters
+        .mask_gen_algorithm()
+        .map_err(|_| Error::Node("AMD CRL has invalid RSA-PSS mask parameters".into()))?;
+    if parameters.hash_algorithm_oid().to_id_string() != SHA384_OID
+        || mask.mgf.to_id_string() != MGF1_OID
+        || mask.hash.to_id_string() != SHA384_OID
+        || parameters.salt_length() != SHA384_BYTES
+        || parameters.trailer_field() != 1
+    {
+        return Err(Error::Node(
+            "AMD CRL must use RSA-PSS with SHA-384, MGF1-SHA-384, and a 48-byte salt".into(),
         ));
     }
     let public_key = RsaPublicKey::from_public_key_der(signer.public_key().raw)
@@ -3681,7 +4198,7 @@ fn parse_der_octet_string(value: &[u8]) -> Option<&[u8]> {
     }
 }
 
-fn validate_time(created: i64, expires: i64, ttl_ms: u64, now: i64) -> Result<(), Error> {
+fn validate_time(created: i64, expires: i64, now: i64) -> Result<(), Error> {
     if created > now + MAX_CLOCK_SKEW_MS {
         return Err(Error::InvalidBundle(
             "creation time is in the future".into(),
@@ -3698,12 +4215,6 @@ fn validate_time(created: i64, expires: i64, ttl_ms: u64, now: i64) -> Result<()
         ));
     }
     let interval = expires - created;
-    let declared_ttl = i64::try_from(ttl_ms).unwrap_or(i64::MAX);
-    if interval != declared_ttl {
-        return Err(Error::InvalidBundle(format!(
-            "bundle interval ({interval} ms) differs from ttl_ms ({declared_ttl} ms)"
-        )));
-    }
     if interval > MAX_BUNDLE_VALIDITY_MS {
         return Err(Error::InvalidBundle(format!(
             "bundle validity ({interval} ms) exceeds the {MAX_BUNDLE_VALIDITY_MS} ms policy"
@@ -3787,25 +4298,14 @@ fn canonical_report_data(report: &ReportData) -> Result<String, Error> {
     let mut certs = report.accepted_cert_sha256.clone();
     certs.sort();
     certs.dedup();
-    if certs.is_empty() || certs.len() > 2 || !certs.contains(&report.active_cert_sha256) {
+    if certs.len() > 2 {
         return Err(Error::Node("invalid certificate rotation stack".into()));
     }
     let mut value = serde_json::Map::new();
     value.insert("schema".into(), Value::String(report.schema.clone()));
     value.insert(
-        "catalog".into(),
-        serde_json::json!({
-            "digest": report.catalog.digest,
-            "sequence": report.catalog.sequence,
-        }),
-    );
-    value.insert(
         "tls_spki_sha256".into(),
         Value::String(report.tls_spki_sha256.clone()),
-    );
-    value.insert(
-        "active_cert_sha256".into(),
-        Value::String(report.active_cert_sha256.clone()),
     );
     value.insert(
         "accepted_cert_sha256".into(),
@@ -3838,57 +4338,155 @@ fn canonical_report_data(report: &ReportData) -> Result<String, Error> {
 mod tests {
     use super::*;
 
+    fn node_certificate_history_fixture() -> (NodeEvidence, NodeCertificateHistory, i64) {
+        let admitted_at = "2026-08-27T00:00:00.000Z";
+        let leaf_der = STANDARD
+            .decode(include_str!("../tests/fixtures/vcek-turin.der.base64").trim())
+            .unwrap();
+        let leaf_sha256 = hex::encode(Sha256::digest(&leaf_der));
+        let node_id = "11".repeat(32);
+        let evidence = serde_json::from_value(serde_json::json!({
+            "admitted_at": admitted_at,
+            "admission": {
+                "cert_expires_at": "2026-11-27T00:00:00.000Z",
+                "chip_id": "22".repeat(64),
+                "endorsements": [],
+                "quote": "AA",
+                "quote_verified_at": admitted_at,
+                "region": "us-east-va",
+                "report_data": {
+                    "accepted_cert_sha256": [leaf_sha256.clone()],
+                    "drand": {
+                        "chain_hash": DRAND_CHAIN_HASH,
+                        "network": "quicknet",
+                        "randomness": "33".repeat(32),
+                        "round": 1,
+                        "signature": URL_SAFE_NO_PAD.encode([4_u8; 96])
+                    },
+                    "ed25519_public_key": URL_SAFE_NO_PAD.encode([5_u8; 32]),
+                    "hpke_public_key": URL_SAFE_NO_PAD.encode([6_u8; 1_216]),
+                    "schema": "stogas.node-report.v1",
+                    "tls_spki_sha256": "77".repeat(32)
+                },
+                "report_data_sha512": "88".repeat(64),
+                "reported_tcb": "00".repeat(8)
+            },
+            "hardware_policy_sha256": "99".repeat(32),
+            "node_id": node_id.clone(),
+            "release_measurement": "aa".repeat(48),
+            "schema": "stogas.node-evidence.v1"
+        }))
+        .unwrap();
+        let history = NodeCertificateHistory {
+            certificates: vec![NodeCertificateHistoryEntry {
+                certificate_chain_pem: format!(
+                    "-----BEGIN CERTIFICATE-----\n{}\n-----END CERTIFICATE-----\n",
+                    STANDARD.encode(&leaf_der)
+                ),
+                first_observed_at: admitted_at.into(),
+                leaf_der: URL_SAFE_NO_PAD.encode(leaf_der),
+                sha256: leaf_sha256,
+            }],
+            node_id,
+            schema: "stogas.node-certificate-history.v1".into(),
+        };
+        (evidence, history, parse_time(admitted_at).unwrap())
+    }
+
     #[test]
-    fn verifies_the_stogas_policy_signature_and_accepts_an_explicit_local_replacement() {
+    fn validates_exact_node_certificate_history_bytes() {
+        let (evidence, history, admitted_at) = node_certificate_history_fixture();
+        validate_node_certificate_history(&evidence, &history, admitted_at).unwrap();
+
+        let mut wrong_hash = history.clone();
+        wrong_hash.certificates[0].sha256 = "00".repeat(32);
+        assert!(
+            validate_node_certificate_history(&evidence, &wrong_hash, admitted_at)
+                .unwrap_err()
+                .to_string()
+                .contains("leaf DER differs")
+        );
+
+        let mut wrong_node = history;
+        wrong_node.node_id = "ff".repeat(32);
+        assert!(
+            validate_node_certificate_history(&evidence, &wrong_node, admitted_at)
+                .unwrap_err()
+                .to_string()
+                .contains("unsupported or invalid")
+        );
+    }
+
+    #[test]
+    fn normalizes_only_the_quote_bound_boot_candidate_to_the_attested_node_id() {
+        let report_data = ReportData {
+            accepted_cert_sha256: Vec::new(),
+            drand: DrandBeacon {
+                chain_hash: DRAND_CHAIN_HASH.into(),
+                network: "quicknet".into(),
+                randomness: "3".repeat(64),
+                round: 1,
+                signature: "4".repeat(96),
+            },
+            ed25519_public_key: "ZWRrZXk".into(),
+            hpke_public_key: "aHBrZQ".into(),
+            schema: "stogas.node-report.v1".into(),
+            tls_spki_sha256: "2".repeat(64),
+        };
+        let chip_id = "1".repeat(128);
+        let candidate_node_id = "80278d7321aa5ea1320e9a566a0f8b5225f0143c4e3de27f6bb0b12ac14faf81";
+        let expected_node_id = "9f4ad58f8fadbe44f05918b391bacd633d90bf828069037537c4cf4811c2d291";
+
+        assert_eq!(
+            normalize_admission_node_id(candidate_node_id, &chip_id, &report_data).unwrap(),
+            expected_node_id
+        );
+        assert_eq!(
+            normalize_admission_node_id(expected_node_id, &chip_id, &report_data).unwrap(),
+            expected_node_id
+        );
+        assert!(normalize_admission_node_id(&"0".repeat(64), &chip_id, &report_data).is_err());
+
+        assert_eq!(
+            derive_node_id(&"f".repeat(128), &"c".repeat(64)),
+            "886be0b5fac4ee4d04ae33c441632ce67645706809e958fd31836d5f82e67871"
+        );
+    }
+
+    #[test]
+    fn groups_exact_chip_ids_under_shared_hardware_requirements() {
+        let policy: HardwarePolicy =
+            serde_json::from_str(include_str!("../tests/fixtures/milan-hardware-policy.json"))
+                .unwrap();
+        validate_hardware_policy(&policy).unwrap();
+        let chip_id = &policy.policies[0].chip_ids[0];
+        assert_eq!(
+            compatible_hardware(&policy, chip_id).unwrap().chip_ids,
+            vec![chip_id.clone()]
+        );
+        assert!(compatible_hardware(&policy, &"00".repeat(64)).is_err());
+    }
+
+    #[test]
+    fn rejects_hardware_policy_without_a_valid_transparency_proof() {
         let signed: SignedHardwarePolicy = serde_json::from_str(include_str!(
             "../tests/fixtures/milan-hardware-policy.signed.json"
         ))
         .unwrap();
-        let stogas =
-            select_hardware_policies(std::slice::from_ref(&signed), None, &Environment::stogas())
-                .unwrap();
-        assert!(matches!(
-            stogas[0].verified.source,
-            HardwarePolicySource::StogasBundle
-        ));
-        assert_eq!(stogas[0].verified.sequence, 3);
-        assert_eq!(
-            stogas[0].verified.stogas_signing_key_id.as_deref(),
-            Some(STOGAS_RELEASE_KEY_ID)
-        );
-
-        let mut local: HardwarePolicy =
-            serde_json::from_str(include_str!("../tests/fixtures/milan-hardware-policy.json"))
-                .unwrap();
-        local.sequence = 9;
-        local.amd_sev_snp.minimum_tcb.snp = 30;
-        let local = select_hardware_policies(
-            std::slice::from_ref(&signed),
-            Some(&serde_json::to_vec(&local).unwrap()),
-            &Environment::stogas(),
-        )
-        .unwrap();
-        assert!(matches!(
-            local[0].verified.source,
-            HardwarePolicySource::Local
-        ));
-        assert_eq!(local[0].verified.sequence, 9);
-        assert_eq!(local[0].policy.amd_sev_snp.minimum_tcb.snp, 30);
-        assert!(local[0].verified.stogas_signing_key_id.is_none());
+        assert!(verify_signed_hardware_policy(&signed, 1_784_246_400_000).is_err());
     }
 
     #[test]
-    fn rejects_tampered_stogas_hardware_policy() {
-        let mut signed: SignedHardwarePolicy = serde_json::from_str(include_str!(
-            "../tests/fixtures/milan-hardware-policy.signed.json"
-        ))
-        .unwrap();
-        signed.policy.amd_sev_snp.minimum_tcb.snp -= 1;
-        assert!(verify_signed_hardware_policy(&signed, &Environment::stogas()).is_err());
+    fn converts_rekor_seconds_to_the_documented_milliseconds() {
+        assert_eq!(
+            rekor_seconds_to_millis(1_788_000_000).unwrap(),
+            1_788_000_000_000
+        );
+        assert!(rekor_seconds_to_millis(i64::MAX).is_err());
     }
 
     #[cfg(feature = "snp")]
-    fn appraisable_milan_report() -> (Vec<u8>, HardwarePolicy, &'static AmdProductProfile) {
+    fn appraisable_milan_report() -> (Vec<u8>, AmdSevSnpPolicy, &'static AmdProductProfile) {
         let policy: HardwarePolicy =
             serde_json::from_str(include_str!("../tests/fixtures/milan-hardware-policy.json"))
                 .unwrap();
@@ -3903,7 +4501,7 @@ mod tests {
         report[0x188..0x18b].copy_from_slice(&[0x19, 0x01, 0x01]);
         report[0x1f8..0x200].copy_from_slice(&0x0b_u64.to_le_bytes());
         report[0x200..0x208].copy_from_slice(&0x0b_u64.to_le_bytes());
-        (report, policy, profile)
+        (report, policy.policies[0].clone(), profile)
     }
 
     #[cfg(feature = "snp")]
@@ -3960,7 +4558,7 @@ mod tests {
     #[test]
     fn report_v5_appraisal_rejects_tcb_and_firmware_downgrade_inconsistency() {
         let (mut report, mut policy, product) = appraisable_milan_report();
-        policy.amd_sev_snp.minimum_tcb = AmdTcb {
+        policy.minimum_tcb = AmdTcb {
             bootloader: 0,
             microcode: 0,
             snp: 0,
@@ -4106,22 +4704,90 @@ mod tests {
     }
 
     fn release_fixture() -> AllowedIgvm {
-        AllowedIgvm {
-            github_in_toto: vec![
-                serde_json::from_str(
-                    include_str!("../../../tests/fixtures/gateway-v0.0.1-attestation.jsonl").trim(),
-                )
-                .unwrap(),
-            ],
-            launch_policy: serde_json::from_str(include_str!(
-                "../../../tests/fixtures/gateway-v0.0.1-launch-policy.json"
-            ))
-            .unwrap(),
-            stogas_signature: serde_json::from_str(include_str!(
-                "../../../tests/fixtures/gateway-v0.0.1-signature.json"
-            ))
-            .unwrap(),
-        }
+        let launch = serde_json::json!({
+            "author_key_digest": "00".repeat(48),
+            "family_id": "00".repeat(16),
+            "host_data": "00".repeat(32),
+            "id_key_digest": "00".repeat(48),
+            "image_id": "00".repeat(16),
+            "policy": "0x000000000213013a",
+            "vmpl": 0
+        });
+        let launch_policies = serde_json::json!({
+            "policies": [{
+                "chip_ids": ["66".repeat(64)],
+                "launch": launch
+            }],
+            "schema": "stogas.snp-launch-policies.v1"
+        });
+        let launch_policies_bytes = canonical_json(&launch_policies).unwrap();
+        let launch_policies_sha256 = hex::encode(Sha256::digest(launch_policies_bytes.as_bytes()));
+        serde_json::from_value(serde_json::json!({
+            "github_in_toto": [{}],
+            "release_manifest": {
+                "artifacts": {
+                    "gateway.igvm": { "sha256": "11".repeat(32), "sizeBytes": 1 },
+                    "snp-launch-policies.json": {
+                        "sha256": launch_policies_sha256,
+                        "sizeBytes": launch_policies_bytes.len()
+                    }
+                },
+                "build": {
+                    "cmdlineSha256": "12".repeat(32),
+                    "coreGoModSha256": "13".repeat(32),
+                    "coreGoSumSha256": "14".repeat(32),
+                    "environment": { "lcAll": "C", "sourceDateEpoch": "1", "tz": "UTC", "umask": "022" },
+                    "goModSha256": "15".repeat(32),
+                    "goSumSha256": "16".repeat(32),
+                    "goVendorTreeSha256": "17".repeat(32),
+                    "goVersion": "go1.25.0",
+                    "guestCaBundlePath": "/etc/ssl/certs/ca-certificates.crt",
+                    "guestCaBundleSha256": "18".repeat(32),
+                    "guixChannelCommit": "19".repeat(20),
+                    "inputSha256": {
+                        "source": "20".repeat(32),
+                        "stogas/release/snp-launch-policies.json": launch_policies_sha256
+                    },
+                    "kernelConfigSha256": "21".repeat(32),
+                    "kernelVersion": "6.12.0",
+                    "linuxBzImageSha256": "22".repeat(32),
+                    "osReleaseSha256": "23".repeat(32),
+                    "ovmfSha256": "24".repeat(32),
+                    "pinsLockSha256": "25".repeat(32),
+                    "systemdStubSha256": "26".repeat(32),
+                    "ukiSha256": "27".repeat(32)
+                },
+                "git": {
+                    "commit": "33".repeat(20),
+                    "ref": "refs/tags/v0.0.1",
+                    "repository": "https://github.com/StogasAI/gateway",
+                    "tag": "v0.0.1",
+                    "tree": "44".repeat(20)
+                },
+                "schema": "stogas.gateway.release.v1",
+                "sequence": 1,
+                "sevSnp": {
+                    "checkKvm": true,
+                    "launchMeasurement": "55".repeat(48),
+                    "launchPolicies": launch_policies,
+                    "measurementCommand": "igvmmeasure --check-kvm gateway.igvm measure",
+                    "measurementTool": "igvmmeasure",
+                    "measurementToolSha256": "66".repeat(32),
+                    "measurementToolVersion": "0.3.1",
+                    "platform": "SEV_SNP",
+                    "vcpuCount": 4,
+                    "vmm": "qemu-kvm"
+                }
+            },
+            "stogas_signature": {
+                "algorithm": "Ed25519",
+                "key_id": STOGAS_RELEASE_KEY_ID,
+                "schema": "stogas.gateway.counterbuild-signature.v1",
+                "signature": URL_SAFE_NO_PAD.encode([0_u8; 64]),
+                "signed": "release-manifest.json"
+            }
+        }))
+        .unwrap()
     }
 
     fn catalog_fixture() -> AllowedCatalog {
@@ -4131,6 +4797,7 @@ mod tests {
                 "keyId": "test",
                 "manifest": {
                     "catalogSchema": 1,
+                    "minimumGatewaySequence": 1,
                     "public": format!("sha256:{}", "11".repeat(32)),
                     "runtime": format!("sha256:{}", "22".repeat(32)),
                     "schema": "stogas.catalog.release.v1",
@@ -4151,17 +4818,20 @@ mod tests {
 
     #[test]
     fn bundle_sequence_is_not_a_trust_input() {
+        let hardware_policy: SignedHardwarePolicy = serde_json::from_str(include_str!(
+            "../tests/fixtures/milan-hardware-policy.signed.json"
+        ))
+        .unwrap();
         let envelope = BundleEnvelope {
             body: BundleBody {
-                allowed_catalogs: Vec::new(),
+                catalogs: Vec::new(),
                 allowed_igvms: Vec::new(),
                 created_at: "2026-07-23T16:00:00.000Z".into(),
                 expires_at: "2026-07-23T16:15:00.000Z".into(),
-                hardware_policies: Vec::new(),
+                hardware_policy,
                 nodes: Vec::new(),
                 schema: "stogas.confidential-bundle.v1".into(),
                 sequence: 0,
-                ttl_ms: 900_000,
                 vendor_collateral: Vec::new(),
             },
             body_sha256: "00".repeat(32),
@@ -4171,73 +4841,127 @@ mod tests {
     }
 
     #[test]
-    fn bundle_shape_allows_catalog_preauthorization_but_rejects_orphan_hardware_policies() {
+    fn bundle_shape_allows_catalog_preauthorization_and_unused_hardware_policies() {
         let policy: SignedHardwarePolicy = serde_json::from_str(include_str!(
             "../tests/fixtures/milan-hardware-policy.signed.json"
         ))
         .unwrap();
         let mut envelope = BundleEnvelope {
             body: BundleBody {
-                allowed_catalogs: Vec::new(),
+                catalogs: Vec::new(),
                 allowed_igvms: Vec::new(),
                 created_at: "2026-07-23T16:00:00.000Z".into(),
                 expires_at: "2026-07-23T16:15:00.000Z".into(),
-                hardware_policies: vec![policy.clone()],
+                hardware_policy: policy.clone(),
                 nodes: Vec::new(),
                 schema: "stogas.confidential-bundle.v1".into(),
                 sequence: 1,
-                ttl_ms: 900_000,
                 vendor_collateral: Vec::new(),
             },
             body_sha256: "00".repeat(32),
         };
-        assert!(
-            validate_shape(&envelope)
-                .unwrap_err()
-                .to_string()
-                .contains("release and hardware authorizations must match its nodes")
-        );
-
-        envelope.body.hardware_policies.clear();
-        envelope.body.allowed_catalogs.push(catalog_fixture());
+        validate_shape(&envelope).unwrap();
+        envelope.body.catalogs.push(catalog_fixture());
         validate_shape(&envelope).unwrap();
 
-        envelope.body.hardware_policies.push(policy);
-        envelope
-            .body
-            .hardware_policies
-            .push(envelope.body.hardware_policies[0].clone());
+        let mut repeated_runtime = catalog_fixture();
+        repeated_runtime.signed_release.manifest.sequence = 2;
+        repeated_runtime.signed_release.manifest.source.tag = "catalog-v2".into();
+        envelope.body.catalogs.push(repeated_runtime);
+        validate_shape(&envelope).unwrap();
+
+        envelope.body.catalogs[1].signed_release.manifest.sequence = 1;
+        envelope.body.catalogs[1].signed_release.manifest.source.tag = "catalog-v1".into();
         assert!(
             validate_shape(&envelope)
                 .unwrap_err()
                 .to_string()
-                .contains("duplicate hardware policy chip id")
+                .contains("duplicate catalog sequence")
+        );
+        envelope.body.catalogs.pop();
+
+        envelope
+            .body
+            .hardware_policy
+            .policy
+            .policies
+            .push(policy.policy.policies[0].clone());
+        assert!(
+            validate_hardware_policy(&envelope.body.hardware_policy.policy)
+                .unwrap_err()
+                .to_string()
+                .contains("duplicate chip id")
         );
     }
 
     #[test]
-    fn node_catalog_must_match_one_verified_catalog_policy() {
-        let digest = format!("sha256:{}", "22".repeat(32));
-        let catalog = CatalogIdentity {
-            digest: digest.clone(),
-            sequence: 7,
+    fn rejects_duplicate_node_ids_and_response_signing_keys_in_bundle() {
+        let chip = [0x66; 64];
+        let chip_id = hex::encode(chip);
+        let measurement = [0x55; 48];
+        let node = |tls_byte: u8, signing_key_byte: u8| {
+            let tls_spki_sha256 = hex::encode([tls_byte; 32]);
+            BundleNode {
+                node_id: derive_node_id(&chip_id, &tls_spki_sha256),
+                quote: quote_with_identity(chip, measurement, [0x33; 8]),
+                report_data: ReportData {
+                    accepted_cert_sha256: vec!["cc".repeat(32)],
+                    drand: DrandBeacon {
+                        chain_hash: DRAND_CHAIN_HASH.into(),
+                        network: "quicknet".into(),
+                        randomness: "dd".repeat(32),
+                        round: 1,
+                        signature: URL_SAFE_NO_PAD.encode([0_u8; 96]),
+                    },
+                    ed25519_public_key: URL_SAFE_NO_PAD.encode([signing_key_byte; 32]),
+                    hpke_public_key: URL_SAFE_NO_PAD.encode([0xee; 1_216]),
+                    schema: "stogas.node-report.v1".into(),
+                    tls_spki_sha256,
+                },
+            }
         };
-        let policies = BTreeMap::from([(digest.as_str(), 7)]);
-
-        verify_node_catalog_policy("node-a", &catalog, &policies).unwrap();
-        let error = verify_node_catalog_policy(
-            "node-a",
-            &CatalogIdentity {
-                digest: digest.clone(),
-                sequence: 8,
+        let mut hardware_policy: SignedHardwarePolicy = serde_json::from_str(include_str!(
+            "../tests/fixtures/milan-hardware-policy.signed.json"
+        ))
+        .unwrap();
+        hardware_policy.policy.policies[0].chip_ids = vec![chip_id.clone()];
+        let mut envelope = BundleEnvelope {
+            body: BundleBody {
+                catalogs: Vec::new(),
+                allowed_igvms: vec![release_fixture()],
+                created_at: "2026-08-27T00:00:00.000Z".into(),
+                expires_at: "2026-08-27T00:15:00.000Z".into(),
+                hardware_policy,
+                nodes: vec![node(0xaa, 1), node(0xbb, 2)],
+                schema: "stogas.confidential-bundle.v1".into(),
+                sequence: 1,
+                vendor_collateral: Vec::new(),
             },
-            &policies,
-        )
-        .unwrap_err();
+            body_sha256: "00".repeat(32),
+        };
+        validate_shape(&envelope).unwrap();
+
+        let mut duplicate_node_id = envelope.clone();
+        duplicate_node_id.body.nodes[1].report_data.tls_spki_sha256 = duplicate_node_id.body.nodes
+            [0]
+        .report_data
+        .tls_spki_sha256
+        .clone();
+        duplicate_node_id.body.nodes[1].node_id = duplicate_node_id.body.nodes[0].node_id.clone();
+        let error = validate_shape(&duplicate_node_id).unwrap_err();
+        assert!(error.to_string().contains("duplicate node id"));
+
+        let duplicate_key = envelope.body.nodes[0]
+            .report_data
+            .ed25519_public_key
+            .clone();
+        envelope.body.nodes[1].report_data.ed25519_public_key = duplicate_key;
+
+        let error = validate_shape(&envelope).unwrap_err();
         assert!(
             error
                 .to_string()
-                .contains("catalog identity is absent from the verified catalog stack")
+                .contains("duplicate Ed25519 response signing key")
         );
     }
 
@@ -4299,6 +5023,157 @@ mod tests {
     }
 
     #[cfg(feature = "snp")]
+    fn with_amd_crl_test_vector(
+        crl_field: &str,
+        test: impl FnOnce(
+            &x509_parser::revocation_list::CertificateRevocationList<'_>,
+            &x509_parser::certificate::X509Certificate<'_>,
+            &x509_parser::certificate::X509Certificate<'_>,
+            i64,
+            i64,
+        ),
+    ) {
+        use x509_parser::{parse_x509_certificate, parse_x509_crl};
+
+        let fixture: Value =
+            serde_json::from_str(include_str!("../tests/fixtures/amd-crl-test-vectors.json"))
+                .unwrap();
+        assert_eq!(fixture["schema"], "stogas.amd-crl-test-vectors.v1");
+        let decode = |field: &str| STANDARD.decode(fixture[field].as_str().unwrap()).unwrap();
+        let root_der = decode("ark_der_base64");
+        let intermediate_der = decode("ask_der_base64");
+        let crl_der = decode(crl_field);
+        let (root_remaining, ark) = parse_x509_certificate(&root_der).unwrap();
+        let (intermediate_remaining, ask) = parse_x509_certificate(&intermediate_der).unwrap();
+        let (crl_remaining, crl) = parse_x509_crl(&crl_der).unwrap();
+        assert!(root_remaining.is_empty());
+        assert!(intermediate_remaining.is_empty());
+        assert!(crl_remaining.is_empty());
+        assert_eq!(
+            hex::encode(ask.raw_serial()),
+            fixture["ask_serial_hex"].as_str().unwrap()
+        );
+        test(
+            &crl,
+            &ark,
+            &ask,
+            fixture["this_update_unix_ms"].as_i64().unwrap(),
+            fixture["next_update_unix_ms"].as_i64().unwrap(),
+        );
+    }
+
+    #[cfg(feature = "snp")]
+    #[test]
+    fn accepts_an_ark_crl_that_does_not_revoke_the_ask() {
+        with_amd_crl_test_vector(
+            "clean_crl_der_base64",
+            |crl, ark, ask, this_update, next_update| {
+                assert!(
+                    crl.iter_revoked_certificates()
+                        .any(|revoked| revoked.raw_serial() == [0])
+                );
+                assert_ne!(ask.raw_serial(), [0]);
+                validate_amd_crl(crl, ark, ask, this_update, next_update).unwrap();
+            },
+        );
+    }
+
+    #[cfg(feature = "snp")]
+    #[test]
+    fn rejects_an_ark_crl_that_revokes_the_ask() {
+        with_amd_crl_test_vector(
+            "revoked_ask_crl_der_base64",
+            |crl, ark, ask, this_update, next_update| {
+                let error = validate_amd_crl(crl, ark, ask, this_update, next_update).unwrap_err();
+                assert_eq!(
+                    error.to_string(),
+                    "node verification failed: AMD ASK is revoked"
+                );
+            },
+        );
+    }
+
+    #[cfg(feature = "snp")]
+    #[test]
+    fn rejects_an_ask_signed_crl() {
+        with_amd_crl_test_vector(
+            "ask_signed_crl_der_base64",
+            |crl, ark, ask, this_update, next_update| {
+                assert_eq!(crl.issuer(), ask.subject());
+                let error = validate_amd_crl(crl, ark, ask, this_update, next_update).unwrap_err();
+                assert!(error.to_string().contains("issuer differs from the ARK"));
+            },
+        );
+    }
+
+    #[cfg(feature = "snp")]
+    #[test]
+    fn rejects_an_amd_crl_signed_by_an_untrusted_ark() {
+        with_amd_crl_test_vector(
+            "wrong_ark_signed_crl_der_base64",
+            |crl, ark, ask, this_update, next_update| {
+                assert_eq!(crl.issuer(), ark.subject());
+                let error = validate_amd_crl(crl, ark, ask, this_update, next_update).unwrap_err();
+                assert!(error.to_string().contains("AMD CRL signature"));
+            },
+        );
+    }
+
+    #[cfg(feature = "snp")]
+    #[test]
+    fn rejects_amd_crl_signature_algorithm_and_parameter_mismatches() {
+        with_amd_crl_test_vector(
+            "clean_crl_der_base64",
+            |crl, ark, ask, this_update, next_update| {
+                let mut mismatched_algorithm = crl.clone();
+                mismatched_algorithm.tbs_cert_list.signature.parameters = None;
+                let error =
+                    validate_amd_crl(&mismatched_algorithm, ark, ask, this_update, next_update)
+                        .unwrap_err();
+                assert!(error.to_string().contains("one matching RSA-PSS"));
+
+                let mut missing_parameters = crl.clone();
+                missing_parameters.signature_algorithm.parameters = None;
+                missing_parameters.tbs_cert_list.signature.parameters = None;
+                let error =
+                    validate_amd_crl(&missing_parameters, ark, ask, this_update, next_update)
+                        .unwrap_err();
+                assert!(error.to_string().contains("invalid RSA-PSS"));
+            },
+        );
+    }
+
+    #[cfg(feature = "snp")]
+    #[test]
+    fn requires_the_crl_for_the_complete_bundle_interval() {
+        with_amd_crl_test_vector(
+            "clean_crl_der_base64",
+            |crl, ark, ask, this_update, next_update| {
+                let future = validate_amd_crl(
+                    crl,
+                    ark,
+                    ask,
+                    this_update - MAX_CLOCK_SKEW_MS - 1,
+                    next_update,
+                )
+                .unwrap_err();
+                assert!(future.to_string().contains("future-dated"));
+
+                let expired =
+                    validate_amd_crl(crl, ark, ask, this_update, next_update + 1).unwrap_err();
+                assert!(expired.to_string().contains("expires before the bundle"));
+
+                let mut missing_next_update = crl.clone();
+                missing_next_update.tbs_cert_list.next_update = None;
+                let missing =
+                    validate_amd_crl(&missing_next_update, ark, ask, this_update, next_update)
+                        .unwrap_err();
+                assert!(missing.to_string().contains("expires before the bundle"));
+            },
+        );
+    }
+
+    #[cfg(feature = "snp")]
     #[test]
     fn validates_turin_vcek_structure_tcb_and_psn_extensions() {
         use x509_parser::parse_x509_certificate;
@@ -4343,15 +5218,10 @@ mod tests {
     fn local_admission_fixture(now_unix_ms: i64) -> serde_json::Value {
         use ed25519_dalek::{Signer as _, SigningKey};
 
-        let release = release_fixture().launch_policy;
+        let release_manifest = release_fixture().release_manifest;
         let heartbeat_signing_key = SigningKey::from_bytes(&[7_u8; 32]);
         let report_data = ReportData {
-            active_cert_sha256: "11".repeat(32),
             accepted_cert_sha256: vec!["11".repeat(32)],
-            catalog: CatalogIdentity {
-                digest: format!("sha256:{}", "22".repeat(32)),
-                sequence: 7,
-            },
             drand: DrandBeacon {
                 chain_hash: DRAND_CHAIN_HASH.into(),
                 network: "quicknet".into(),
@@ -4382,6 +5252,11 @@ mod tests {
         let mut request = serde_json::json!({
             "attester_mode": "mock",
             "heartbeat": {
+                "active_cert_sha256": "11".repeat(32),
+                "catalog": {
+                    "digest": format!("sha256:{}", "22".repeat(32)),
+                    "sequence": 7
+                },
                 "cert_expires_at": "2026-08-01T00:00:00.000Z",
                 "health": { "ready": true, "secret_versions": {} },
                 "node_id": "local-node",
@@ -4392,7 +5267,7 @@ mod tests {
                 "report_data_sha512": report_data_sha512,
                 "signature": ""
             },
-            "launch_policies": [release],
+            "release_manifests": [release_manifest],
             "region": "local",
             "trusted_chip_ids": ["66".repeat(64)]
         });
@@ -4412,7 +5287,8 @@ mod tests {
         let request = local_admission_fixture(now);
         let heartbeat: HeartbeatCandidate =
             serde_json::from_value(request["heartbeat"].clone()).unwrap();
-        let mut policy = release_fixture().launch_policy;
+        let mut manifest = release_fixture().release_manifest;
+        manifest.sev_snp.launch_policies.policies[0].launch.policy = "0x000000000013013a".into();
         let node = Node {
             cert_expires_at: heartbeat.cert_expires_at,
             chip_id: "00".repeat(64),
@@ -4421,22 +5297,45 @@ mod tests {
             quote: heartbeat.quote,
             quote_verified_at: heartbeat.observed_at,
             region: "test".into(),
-            release_measurement: policy.measurement.clone(),
+            release_measurement: manifest.sev_snp.launch_measurement.clone(),
             reported_tcb: "00".repeat(8),
             report_data: heartbeat.report_data,
             report_data_sha512: heartbeat.report_data_sha512,
         };
         let report = vec![0_u8; 0x4a0];
+        let evidence = AttestedNode {
+            chip_id: &node.chip_id,
+            node_id: &node.node_id,
+            quote: &node.quote,
+            release_measurement: &node.release_measurement,
+            report_data: &node.report_data,
+            report_data_sha512: &node.report_data_sha512,
+            reported_tcb: &node.reported_tcb,
+        };
 
-        let error = check_raw_report_bindings(&node, &policy, &report, None).unwrap_err();
+        let error = check_raw_report_bindings(
+            &evidence,
+            &manifest,
+            &manifest.sev_snp.launch_policies.policies[0].launch,
+            &report,
+            None,
+        )
+        .unwrap_err();
         assert!(
             error
                 .to_string()
                 .contains("required admitted platform protections")
         );
 
-        policy.launch.policy = "0x000000000213013a".into();
-        let error = check_raw_report_bindings(&node, &policy, &report, None).unwrap_err();
+        manifest.sev_snp.launch_policies.policies[0].launch.policy = "0x000000000213013a".into();
+        let error = check_raw_report_bindings(
+            &evidence,
+            &manifest,
+            &manifest.sev_snp.launch_policies.policies[0].launch,
+            &report,
+            None,
+        )
+        .unwrap_err();
         assert!(error.to_string().contains("SNP report version differs"));
     }
 
@@ -4516,6 +5415,60 @@ mod tests {
     }
 
     #[test]
+    fn heartbeat_signature_binds_the_mutable_catalog_identity() {
+        let now = 1_784_246_400_000;
+        let request = local_admission_fixture(now);
+        let heartbeat: HeartbeatCandidate =
+            serde_json::from_value(request["heartbeat"].clone()).unwrap();
+        let public_key = heartbeat.report_data.ed25519_public_key.clone();
+        verify_recognized_heartbeat_signature(
+            &serde_json::to_vec(&heartbeat).unwrap(),
+            &public_key,
+        )
+        .unwrap();
+
+        let mut changed_digest = heartbeat.clone();
+        changed_digest.catalog.digest = format!("sha256:{}", "23".repeat(32));
+        let error = verify_recognized_heartbeat_signature(
+            &serde_json::to_vec(&changed_digest).unwrap(),
+            &public_key,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("heartbeat signature is invalid"));
+
+        let mut changed_sequence = heartbeat;
+        changed_sequence.catalog.sequence += 1;
+        let error = verify_recognized_heartbeat_signature(
+            &serde_json::to_vec(&changed_sequence).unwrap(),
+            &public_key,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("heartbeat signature is invalid"));
+    }
+
+    #[test]
+    fn public_node_evidence_rejects_unattested_catalog_metadata() {
+        let request = local_admission_fixture(1_784_246_400_000);
+        let heartbeat: HeartbeatCandidate =
+            serde_json::from_value(request["heartbeat"].clone()).unwrap();
+        let catalog = serde_json::to_value(&heartbeat.catalog).unwrap();
+        let node = BundleNode {
+            node_id: heartbeat.node_id,
+            quote: heartbeat.quote,
+            report_data: heartbeat.report_data,
+        };
+
+        let mut node_value = serde_json::to_value(&node).unwrap();
+        node_value["catalog"] = catalog.clone();
+        assert!(serde_json::from_value::<BundleNode>(node_value).is_err());
+
+        let mut report_value = serde_json::to_value(&node.report_data).unwrap();
+        report_value["catalog"] = catalog;
+        assert!(serde_json::from_value::<ReportData>(report_value).is_err());
+    }
+
+    #[cfg(feature = "snp")]
+    #[test]
     fn local_software_snp_signature_path_rejects_report_and_reserved_byte_mutations() {
         use p384::{
             ecdsa::{SigningKey, signature::hazmat::PrehashSigner as _},
@@ -4549,6 +5502,17 @@ mod tests {
         assert!(verify_local_raw_report_signature(&reserved_mutation, Some(&public_key)).is_err());
     }
 
+    #[cfg(not(feature = "snp"))]
+    #[test]
+    fn local_software_snp_signature_path_is_unavailable_without_snp_support() {
+        let error = verify_local_raw_report_signature(&[0_u8; 0x4a0], None).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("local SNP signature verification is unavailable")
+        );
+    }
+
     #[test]
     fn pinned_quicknet_vector_rejects_round_randomness_and_signature_mutations() {
         let vector = DrandBeacon {
@@ -4572,35 +5536,27 @@ mod tests {
         assert!(verify_quicknet(&wrong_signature).is_err());
     }
 
-    fn resign_release(release: &mut AllowedIgvm) -> Environment {
+    fn resign_release(release: &mut AllowedIgvm) -> String {
         use ed25519_dalek::{Signer as _, SigningKey, pkcs8::EncodePublicKey as _};
 
         let signing_key = SigningKey::from_bytes(&[0x42; 32]);
         let canonical =
-            canonical_json(&serde_json::to_value(&release.launch_policy).unwrap()).unwrap();
-        let mut payload = b"stogas gateway launch policy v1\n".to_vec();
+            canonical_json(&serde_json::to_value(&release.release_manifest).unwrap()).unwrap();
+        let mut payload = b"stogas gateway counterbuild v1\n".to_vec();
         payload.extend_from_slice(canonical.as_bytes());
         release.stogas_signature.key_id = "test-release-key".into();
         release.stogas_signature.signature =
             URL_SAFE_NO_PAD.encode(signing_key.sign(&payload).to_bytes());
-        Environment {
-            release_keys: BTreeMap::from([(
-                "test-release-key".into(),
-                STANDARD.encode(
-                    signing_key
-                        .verifying_key()
-                        .to_public_key_der()
-                        .unwrap()
-                        .as_bytes(),
-                ),
-            )]),
-            #[cfg(feature = "staging")]
-            allow_staging_development_provenance: false,
-        }
+        STANDARD.encode(
+            signing_key
+                .verifying_key()
+                .to_public_key_der()
+                .unwrap()
+                .as_bytes(),
+        )
     }
 
-    #[cfg(feature = "staging")]
-    fn resign_catalog(catalog: &mut AllowedCatalog) -> Environment {
+    fn resign_catalog(catalog: &mut AllowedCatalog) -> String {
         use ed25519_dalek::{Signer as _, SigningKey, pkcs8::EncodePublicKey as _};
 
         let signing_key = SigningKey::from_bytes(&[0x42; 32]);
@@ -4613,20 +5569,13 @@ mod tests {
         catalog.signed_release.key_id = "test-release-key".into();
         catalog.signed_release.signature =
             URL_SAFE_NO_PAD.encode(signing_key.sign(&payload).to_bytes());
-        Environment {
-            release_keys: BTreeMap::from([(
-                "test-release-key".into(),
-                STANDARD.encode(
-                    signing_key
-                        .verifying_key()
-                        .to_public_key_der()
-                        .unwrap()
-                        .as_bytes(),
-                ),
-            )]),
-            #[cfg(feature = "staging")]
-            allow_staging_development_provenance: false,
-        }
+        STANDARD.encode(
+            signing_key
+                .verifying_key()
+                .to_public_key_der()
+                .unwrap()
+                .as_bytes(),
+        )
     }
 
     #[test]
@@ -4636,125 +5585,190 @@ mod tests {
     }
 
     #[test]
-    fn verifies_real_release_only_when_stogas_and_github_bind_the_same_policy() {
+    fn changing_a_release_manifest_requires_fresh_stogas_and_github_approval() {
         let release = release_fixture();
-        let verified = verify_release(&release, &Environment::stogas(), 1_784_246_400_000).unwrap();
-        assert_eq!(verified.igvm_sha256, release.launch_policy.igvm_sha256);
-        assert_eq!(verified.measurement, release.launch_policy.measurement);
+        let error = verify_release(&release, 1_784_246_400_000).unwrap_err();
+        assert!(error.to_string().contains("signature"));
     }
 
     #[test]
-    fn release_approval_boundary_is_strict_and_uses_the_complete_verifier() {
-        let release = serde_json::to_vec(&release_fixture()).unwrap();
-        let verified = verify_release_approval(&release, 1_784_246_400_000).unwrap();
-        assert_eq!(verified.release_tag, "v0.0.1");
+    fn release_manifest_rejects_nonzero_vmpl() {
+        let mut release = release_fixture();
+        release.release_manifest.sev_snp.launch_policies.policies[0]
+            .launch
+            .vmpl = 1;
+        let error = validate_release_shape(&release).unwrap_err();
+        assert!(error.to_string().contains("invalid gateway launch policy"));
+    }
 
+    #[test]
+    fn release_approval_boundary_rejects_duplicate_fields() {
         let duplicate = br#"{"github_in_toto":[],"github_in_toto":[]}"#;
         assert!(verify_release_approval(duplicate, 1_784_246_400_000).is_err());
     }
 
-    #[cfg(feature = "staging")]
     #[test]
-    fn staging_development_provenance_is_exact_and_never_accepted_by_production() {
+    fn staging_release_policy_is_fixed_by_the_compiled_artifact() {
         let mut release = release_fixture();
-        let mut environment = resign_release(&mut release);
-        environment.allow_staging_development_provenance = true;
+        let key = resign_release(&mut release);
         let canonical =
-            canonical_json(&serde_json::to_value(&release.launch_policy).unwrap()).unwrap();
-        let policy_digest = hex::encode(Sha256::digest(canonical.as_bytes()));
+            canonical_json(&serde_json::to_value(&release.release_manifest).unwrap()).unwrap();
+        let manifest_digest = hex::encode(Sha256::digest(canonical.as_bytes()));
         release.github_in_toto = vec![serde_json::json!({
             "_type": "https://in-toto.io/Statement/v1",
-            "predicateType": STAGING_PROVENANCE_TYPE,
+            "predicateType": "https://stogas.ai/attestations/staging-development/v1",
             "predicate": { "environment": "staging" },
             "subject": [
-                { "name": "gateway.igvm", "digest": { "sha256": release.launch_policy.igvm_sha256 } },
-                { "name": "gateway-launch-policy.json", "digest": { "sha256": policy_digest } }
+                { "name": "release-manifest.json", "digest": { "sha256": manifest_digest } }
             ]
         })];
 
-        let verified = verify_release(&release, &environment, 1_784_246_400_000).unwrap();
-        assert!(verified.github_integrated_time_unix_ms.is_none());
-        assert!(matches!(verified.provenance, ReleaseProvenance::Staging));
+        #[cfg(feature = "staging")]
+        {
+            let verified = verify_release_with_key(&release, &key, 1_784_246_400_000).unwrap();
+            assert!(verified.github_integrated_time_unix_ms.is_none());
+            assert!(matches!(verified.provenance, ReleaseProvenance::Staging));
 
-        environment.allow_staging_development_provenance = false;
-        assert!(verify_release(&release, &environment, 1_784_246_400_000).is_err());
+            release.github_in_toto[0]["subject"][0]["digest"]["sha256"] =
+                Value::String("00".repeat(32));
+            assert!(verify_release_with_key(&release, &key, 1_784_246_400_000).is_err());
+        }
+        #[cfg(not(feature = "staging"))]
+        assert!(verify_release_with_key(&release, &key, 1_784_246_400_000).is_err());
+    }
 
-        environment.allow_staging_development_provenance = true;
-        release.github_in_toto[0]["subject"][0]["digest"]["sha256"] =
-            Value::String("00".repeat(32));
-        assert!(verify_release(&release, &environment, 1_784_246_400_000).is_err());
+    #[test]
+    fn staging_catalog_policy_is_fixed_by_the_compiled_artifact() {
+        let mut catalog = catalog_fixture();
+        let key = resign_catalog(&mut catalog);
+        let canonical =
+            canonical_json(&serde_json::to_value(&catalog.signed_release.manifest).unwrap())
+                .unwrap();
+        let manifest_digest = hex::encode(Sha256::digest(
+            canonical.strip_suffix('\n').unwrap().as_bytes(),
+        ));
+        catalog.github_in_toto = vec![serde_json::json!({
+            "_type": "https://in-toto.io/Statement/v1",
+            "predicateType": "https://stogas.ai/attestations/staging-development/v1",
+            "predicate": { "environment": "staging" },
+            "subject": [
+                { "name": "catalog-release.json", "digest": { "sha256": manifest_digest } }
+            ]
+        })];
+
+        #[cfg(feature = "staging")]
+        {
+            let verified = verify_catalog_with_key(&catalog, &key, 1_784_246_400_000).unwrap();
+            assert!(verified.github_integrated_time_unix_ms.is_none());
+            assert!(matches!(verified.provenance, ReleaseProvenance::Staging));
+
+            catalog.github_in_toto[0]["subject"][0]["digest"]["sha256"] =
+                Value::String("00".repeat(32));
+            assert!(verify_catalog_with_key(&catalog, &key, 1_784_246_400_000).is_err());
+        }
+        #[cfg(not(feature = "staging"))]
+        assert!(verify_catalog_with_key(&catalog, &key, 1_784_246_400_000).is_err());
     }
 
     #[cfg(feature = "staging")]
     #[test]
-    fn staging_catalog_provenance_is_exact_and_never_accepted_by_production() {
+    fn changing_catalog_identity_requires_fresh_stogas_and_github_approval() {
+        let now = 1_784_246_400_000;
         let mut catalog = catalog_fixture();
-        let mut environment = resign_catalog(&mut catalog);
-        environment.allow_staging_development_provenance = true;
-        let runtime_digest = catalog
-            .signed_release
-            .manifest
-            .runtime
-            .strip_prefix("sha256:")
-            .unwrap()
-            .to_owned();
-        let public_digest = catalog
-            .signed_release
-            .manifest
-            .public
-            .strip_prefix("sha256:")
-            .unwrap()
-            .to_owned();
+        let key = resign_catalog(&mut catalog);
+        let canonical =
+            canonical_json(&serde_json::to_value(&catalog.signed_release.manifest).unwrap())
+                .unwrap();
+        let manifest_digest = hex::encode(Sha256::digest(
+            canonical.strip_suffix('\n').unwrap().as_bytes(),
+        ));
         catalog.github_in_toto = vec![serde_json::json!({
             "_type": "https://in-toto.io/Statement/v1",
-            "predicateType": STAGING_PROVENANCE_TYPE,
+            "predicateType": "https://stogas.ai/attestations/staging-development/v1",
             "predicate": { "environment": "staging" },
             "subject": [
-                { "name": "catalog.runtime.json", "digest": { "sha256": runtime_digest } },
-                { "name": "catalog.public.json", "digest": { "sha256": public_digest } }
+                { "name": "catalog-release.json", "digest": { "sha256": manifest_digest } }
             ]
         })];
+        verify_catalog_with_key(&catalog, &key, now).unwrap();
 
-        let verified = verify_catalog(&catalog, &environment, 1_784_246_400_000).unwrap();
-        assert!(verified.github_integrated_time_unix_ms.is_none());
-        assert!(matches!(verified.provenance, ReleaseProvenance::Staging));
+        catalog.signed_release.manifest.runtime = format!("sha256:{}", "99".repeat(32));
+        assert!(verify_catalog_with_key(&catalog, &key, now).is_err());
 
-        environment.allow_staging_development_provenance = false;
-        assert!(verify_catalog(&catalog, &environment, 1_784_246_400_000).is_err());
+        let key = resign_catalog(&mut catalog);
+        let error = verify_catalog_with_key(&catalog, &key, now).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("staging development provenance subjects differ")
+        );
 
-        environment.allow_staging_development_provenance = true;
-        catalog.github_in_toto[0]["subject"][1]["digest"]["sha256"] =
-            Value::String("00".repeat(32));
-        assert!(verify_catalog(&catalog, &environment, 1_784_246_400_000).is_err());
+        let canonical =
+            canonical_json(&serde_json::to_value(&catalog.signed_release.manifest).unwrap())
+                .unwrap();
+        let manifest_digest = hex::encode(Sha256::digest(
+            canonical.strip_suffix('\n').unwrap().as_bytes(),
+        ));
+        catalog.github_in_toto[0]["subject"][0]["digest"]["sha256"] =
+            Value::String(manifest_digest);
+        verify_catalog_with_key(&catalog, &key, now).unwrap();
+    }
+
+    #[test]
+    fn approval_cache_key_is_the_complete_approval_sha256() {
+        let release = release_fixture();
+        let encoded = serde_json::to_vec(&release).unwrap();
+        let original_key = approval_cache_key(&release).unwrap();
+        let expected: ApprovalCacheKey = Sha256::digest(encoded).into();
+        assert_eq!(original_key, expected);
+        let mut changed = release;
+        changed
+            .github_in_toto
+            .push(serde_json::json!({"different": true}));
+        assert_ne!(original_key, approval_cache_key(&changed).unwrap());
     }
 
     #[test]
     fn rejects_invalid_stogas_release_signature_before_accepting_github_evidence() {
         let mut release = release_fixture();
         release.stogas_signature.signature = URL_SAFE_NO_PAD.encode([0_u8; 64]);
-        let error =
-            verify_release(&release, &Environment::stogas(), 1_784_246_400_000).unwrap_err();
+        let error = verify_release(&release, 1_784_246_400_000).unwrap_err();
         assert!(error.to_string().contains("release verification failed"));
     }
 
     #[test]
-    fn rejects_resigned_policy_when_github_did_not_attest_exact_bytes_and_igvm() {
+    fn rejects_resigned_manifest_when_github_did_not_attest_exact_bytes() {
         let mutations: [fn(&mut AllowedIgvm); 3] = [
-            |release: &mut AllowedIgvm| release.launch_policy.measurement.replace_range(..2, "aa"),
-            |release: &mut AllowedIgvm| release.launch_policy.igvm_sha256.replace_range(..2, "aa"),
-            |release: &mut AllowedIgvm| release.launch_policy.source.tree.replace_range(..2, "aa"),
+            |release: &mut AllowedIgvm| {
+                release
+                    .release_manifest
+                    .sev_snp
+                    .launch_measurement
+                    .replace_range(..2, "aa");
+            },
+            |release: &mut AllowedIgvm| {
+                release
+                    .release_manifest
+                    .artifacts
+                    .gateway_igvm
+                    .sha256
+                    .replace_range(..2, "aa");
+            },
+            |release: &mut AllowedIgvm| {
+                release.release_manifest.git.tree.replace_range(..2, "aa");
+            },
         ];
         for mutate in mutations {
             let mut release = release_fixture();
             mutate(&mut release);
-            let environment = resign_release(&mut release);
-            let error = verify_release(&release, &environment, 1_784_246_400_000).unwrap_err();
+            let key = resign_release(&mut release);
+            let error = verify_release_with_key(&release, &key, 1_784_246_400_000).unwrap_err();
             assert!(error.to_string().contains("Sigstore"));
         }
     }
 
     #[test]
-    fn launch_policy_canonicalization_sorts_recursively_and_ends_with_newline() {
+    fn release_manifest_canonicalization_sorts_recursively_and_ends_with_newline() {
         let value = serde_json::json!({"z": [2, {"b": true, "a": null}], "a": "x"});
         assert_eq!(
             canonical_json(&value).unwrap(),

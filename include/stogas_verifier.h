@@ -62,8 +62,6 @@ char *stogas_verifier_verify_bundle_with_policy(
 );
 char *stogas_verifier_verify_response_proof(
     const StogasVerifier *verifier,
-    const uint8_t *proof,
-    size_t proof_len,
     const uint8_t *request_body,
     size_t request_body_len,
     const uint8_t *response_body,
@@ -74,8 +72,6 @@ char *stogas_verifier_verify_response_proof(
 );
 char *stogas_verifier_verify_historical_response_proof(
     const StogasVerifier *verifier,
-    const uint8_t *proof,
-    size_t proof_len,
     const uint8_t *request_body,
     size_t request_body_len,
     const uint8_t *response_body,

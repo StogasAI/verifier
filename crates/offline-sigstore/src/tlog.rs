@@ -42,6 +42,28 @@ pub fn verify(
     Ok(integrated_time)
 }
 
+pub fn verify_keyed(
+    entry: &TransparencyLogEntry,
+    envelope: &DsseEnvelope,
+    public_key_spki: &[u8],
+    now_seconds: i64,
+    root: &TrustedRoot,
+) -> Result<i64, String> {
+    if entry.kind_version.kind != "dsse" || entry.kind_version.version != "0.0.1" {
+        return Err("only Rekor DSSE v0.0.1 is supported for hardware policies".into());
+    }
+    let integrated_time = parse_i64(&entry.integrated_time, "integrated time")?;
+    if integrated_time <= 0 || integrated_time > now_seconds + 60 {
+        return Err("Rekor integrated time is invalid or in the future".into());
+    }
+    let log_id = decode_32(&entry.log_id.key_id, "Rekor log id")?;
+    let log_key = root.rekor_key_at(&log_id, integrated_time)?;
+    verify_set(entry, &log_id, &log_key.spki)?;
+    verify_inclusion(entry, &log_id, &log_key.spki)?;
+    verify_keyed_body_binding(entry, envelope, public_key_spki)?;
+    Ok(integrated_time)
+}
+
 #[derive(Serialize)]
 struct RekorSetPayload<'a> {
     body: &'a str,
@@ -306,6 +328,59 @@ fn verify_body_binding(
         .map_err(|error| format!("invalid Rekor verifier certificate: {error}"))?;
     if pem.tag() != "CERTIFICATE" || pem.contents() != certificate_der {
         return Err("Rekor verifier certificate differs from the bundle".into());
+    }
+    Ok(())
+}
+
+fn verify_keyed_body_binding(
+    entry: &TransparencyLogEntry,
+    envelope: &DsseEnvelope,
+    public_key_spki: &[u8],
+) -> Result<(), String> {
+    let canonical_body = STANDARD
+        .decode(&entry.canonicalized_body)
+        .map_err(|error| format!("invalid Rekor canonical body: {error}"))?;
+    let body: RekorDsseBody = serde_json::from_slice(&canonical_body)
+        .map_err(|error| format!("invalid Rekor DSSE body: {error}"))?;
+    if body.api_version != "0.0.1"
+        || body.kind != "dsse"
+        || body.spec.payload_hash.algorithm != "sha256"
+        || body.spec.envelope_hash.algorithm != "sha256"
+        || body.spec.payload_hash.value.len() != 64
+        || body.spec.envelope_hash.value.len() != 64
+        || body.spec.signatures.len() != 1
+        || envelope.signatures.len() != 1
+    {
+        return Err("unsupported or ambiguous Rekor DSSE body".into());
+    }
+    let payload = STANDARD
+        .decode(&envelope.payload)
+        .map_err(|error| format!("invalid DSSE payload: {error}"))?;
+    if hex::encode(Sha256::digest(payload)) != body.spec.payload_hash.value {
+        return Err("Rekor payload hash does not bind the DSSE payload".into());
+    }
+    let mut canonical_envelope = serde_json_canonicalizer::to_vec(envelope)
+        .map_err(|error| format!("could not canonicalize DSSE envelope: {error}"))?;
+    canonical_envelope.push(b'\n');
+    if hex::encode(Sha256::digest(canonical_envelope)) != body.spec.envelope_hash.value {
+        return Err("Rekor envelope hash does not bind the DSSE envelope".into());
+    }
+    let rekor_signature = STANDARD
+        .decode(&body.spec.signatures[0].signature)
+        .map_err(|error| format!("invalid Rekor DSSE signature encoding: {error}"))?;
+    let bundle_signature = STANDARD
+        .decode(&envelope.signatures[0].sig)
+        .map_err(|error| format!("invalid bundle DSSE signature encoding: {error}"))?;
+    if rekor_signature != bundle_signature {
+        return Err("Rekor DSSE signature differs from the bundle".into());
+    }
+    let verifier = STANDARD
+        .decode(&body.spec.signatures[0].verifier)
+        .map_err(|error| format!("invalid Rekor verifier encoding: {error}"))?;
+    let pem = pem::parse(verifier)
+        .map_err(|error| format!("invalid Rekor verifier public key: {error}"))?;
+    if pem.tag() != "PUBLIC KEY" || pem.contents() != public_key_spki {
+        return Err("Rekor verifier public key differs from the trusted Stogas key".into());
     }
     Ok(())
 }

@@ -220,7 +220,7 @@ test('rejects the legacy full staging bundle with networking disabled', async ({
 		},
 		{ fixture, now: STAGING_BUNDLE_NOW_UNIX_MS }
 	);
-	expect(error).toContain('catalog_hash');
+	expect(error).toContain('unsupported or invalid bundle');
 	expect(requests).toEqual([]);
 });
 
@@ -279,7 +279,7 @@ test('does not activate or seal from a legacy bundle', async ({ page }) => {
 		},
 		{ fixture, now: STAGING_BUNDLE_NOW_UNIX_MS }
 	);
-	expect(result.verifyError).toContain('catalog_hash');
+	expect(result.verifyError).toContain('unsupported or invalid bundle');
 	expect(result.sealError).toContain('bundle must be verified');
 	expect(requests).toEqual([]);
 });

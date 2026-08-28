@@ -6,8 +6,7 @@ use std::sync::OnceLock;
 use stogas_verifier::e2ee::{Recipient, Request, seal_request};
 
 const NOW_MS: i64 = 1_800_000_000_000;
-const BUNDLE_HASH: &str =
-    "1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef";
+const BUNDLE_HASH: &str = "1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef";
 
 fuzz_target!(|data: &[u8]| {
     static PUBLIC_KEY: OnceLock<Vec<u8>> = OnceLock::new();
@@ -25,8 +24,8 @@ fuzz_target!(|data: &[u8]| {
         recipients: std::slice::from_ref(&recipient),
         api_key: "sk-fuzz",
         accept: None,
-        extra_fields: false,
-        upstream_credential: None,
+        receipt: false,
+        upstream_credentials: None,
         body: b"{}",
     };
     if let Ok(mut sealed) = seal_request(&request) {

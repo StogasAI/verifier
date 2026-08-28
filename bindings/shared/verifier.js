@@ -16,7 +16,7 @@ export function createVerifierBindings(CoreVerifier) {
 		finish(proof, e2eeTranscriptSHA256) {
 			this.#assertOpen();
 			try {
-				return this.#core.finish(this.#verifier, proof, e2eeTranscriptSHA256);
+				return this.#core.finish(proof, e2eeTranscriptSHA256);
 			} finally {
 				this.free();
 			}
@@ -63,13 +63,8 @@ export function createVerifierBindings(CoreVerifier) {
 			return this.#core.verify_bundle_with_policy(bundle, policy);
 		}
 
-		verify_response_proof(proof, requestBody, responseBody, e2eeTranscriptSHA256) {
-			return this.#core.verify_response_proof(
-				proof,
-				requestBody,
-				responseBody,
-				e2eeTranscriptSHA256
-			);
+		verify_response_proof(requestBody, responseBody, e2eeTranscriptSHA256) {
+			return this.#core.verify_response_proof(requestBody, responseBody, e2eeTranscriptSHA256);
 		}
 
 		start_response_proof(requestBody) {
@@ -77,7 +72,6 @@ export function createVerifierBindings(CoreVerifier) {
 		}
 
 		verify_historical_response_proof(
-			proof,
 			requestBody,
 			responseBody,
 			ledger,
@@ -85,7 +79,6 @@ export function createVerifierBindings(CoreVerifier) {
 			e2eeTranscriptSHA256
 		) {
 			return this.#core.verify_historical_response_proof(
-				proof,
 				requestBody,
 				responseBody,
 				ledger,

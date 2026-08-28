@@ -3,25 +3,23 @@
   "now_unix_ms": 1800000000000,
   "node_private_key_hex": "0000000000000000000000000000000000000000000000000000000000000001",
   "request": {
-    "stogas_e2ee": {
-      "version": 1,
-      "request_id": "018f4f70-7c88-7b9a-baf8-31a93d2cf613",
-      "bundle_sha256": "1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef",
-      "expires_at_ms": 1800000060000,
-      "recipients": [
-        {
-          "key_id": "NQDH15MwuIabUOhsGU7Bh9Lvk5HoP5KrsA43U36dKW8",
-          "encapsulated_key": "NOW164ftIChvk7620eoDv8BK7iS4ODBEgM1spttFq1bEpFK9zU-c-hmuu5LJPs2UvmbBko_3ZWNnmFI4BJN5azmYmnZj-I45zekqbXzcS6XSoYkzaqbkgr3Eo90b13z0vLcgu5PDJ9v09f4ZV8RFotkSf1KVt2b5pqgRbyh69CV4D69uM7E5HQ1PiiiYNdv7x8jsjaH7qVrtP5b7NEKEa9JV25pYfaTQhpl0T2KwnUUohqgXHEnNcP-Oc5eM8YVFG6tmSIKCbziBBGMUn0CdvLPZavpnjIBqYiK7zrcOFiukXDPdKxMniGlTVgUM7opseT8txqMRjQNsDDSnlF3zGhR2OrFGVcyaqmv7CADyAAGrVZrEA7V6cWfm0pQJnjChVDPt_9X1QyHJAaM7O_KCpNZRAZhIuNoJF-B5EYdRcF0ul2xX25eitjZ77LHRsd8tGO1EcUdQuIWuL6cvKep20OUQw-qACST_RzNBnlUHH9Uu6-AEmRQcMQDkwkKoll967-KnduyO-956NKTPH-yZnENdHnHH_yOYH6xcClFBFOKP4Fj7_ykYl4qIpCLuVVO1bQW-PWVOGnEqQGdYyCKddC_9hM0vU2o4HtzRMdmtAnyrHfNHvZv8FIf5Pe6wmNQrEyOa9PhvzVLnpfBDwaBp2hziN24h0-_1CXwWYMXJsDPFZSuhGLD0EhOoa9HHc9RX1ctPrFeWu9qoUAPWZyOM756Sn1nmtc5vF0iYqu1Yow3-LMTOIGCW3haCJM3V79gdE1dk2coIHdnBS_3a7AZgpjnobfRYz4j2i_C02Z4xVLRPPV_23YXcTpujrH9gZx9MOVYylVXNmYvfZwarzIV0SbefdY3GFqHZj5b_1Vb0bMaGTEz3D4YhhJVSVHaeW-5bBxz5UE1JrmUV5lglk1ZUxxjzgBmMajMkDkrk-dIyDX9OhZsmgmTwi7V1VZBJNY7Vw_humI8dWmAwgQVdH9cLW1btOosfTOfadhZ1_Bs6bCE4EKsRxVmYXYguKTCNf8b5Lm8oh5gFYyyEWd9sqt-oApC3OjYimlOCWhF9tDSlsWOOtTCe9xRIo8f3LijEO7M56-N_ReQ7f9Pj-8JHp0r5KBaJp93MTKQOl1p0SDrGNkzrrRgMxeZZI0bc5pb-LYEMNBMdKNGqRc21vF-QorsddCXols-YE4lGyoWgPEtbpMZ5WJn5YDMLpeTslHGK_yamoF-3Hk-KSjzzUjHOrhBSuI6UX4_6PueOXCJ0I9JU1TYCYsXLjcyETy22-CFdSPP9q_PleWoHOadz2pAZ5aj7x7W-IL1ra57WzjG2f6Yn6_TAFgVUuhUscX5tkkhfKMo8x3WAVIq6XVCdrRAsm389B2CsuHXSykg7Ep0HLj4avU2MQhFHrzYbpKrDFGsGS9tiJvCNzJ45Bi5H3FdNL3fGg5AURyOFUO0R_ug07SDkBFH1Gp7aoQwG9FmIMaR0EZkqRRTF07hFne5Q_GxxvtbgWA",
-          "wrapped_key": "lLSAxCwC-0PGRAkKZH5stsflU4ZR8sdysx98I0U9VwGr33h8I94mFExkMmbikaA3"
-        }
-      ],
-      "ciphertext": "xgzGAlmOvdXM0nCfEpSrAx1kvpXptVqN6KU_TBD5aZdZGLkM2uRZ9Cp--w24yPlm5BLZ8VgOdOFi-821Bk-lgbjJfEeW7Q9IPdFUUbK6qqZgLiVjPR8Zt_zHlxmU_hjy1x2lLHDRyE71H0BqdtUELKb50ZHnOtZ3k7NV9_rjxJQkaHxBieg94RbN"
-    }
+    "version": 1,
+    "request_id": "018f4f70-7c88-7b9a-baf8-31a93d2cf613",
+    "bundle_sha256": "1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef",
+    "expires_at_ms": 1800000060000,
+    "recipients": [
+      {
+        "key_id": "NQDH15MwuIabUOhsGU7Bh9Lvk5HoP5KrsA43U36dKW8",
+        "encapsulated_key": "9QqD7rhiin83ZOnEpZJg7jt9saQiFkGUAuCF5fh7X0_Ylmq9WEqQhHo6QuH9t6T7tuiSMP5WYQgfhxF6zSVFJ27BWagP-1Nak8rvl4IDP5WkF7GKAhGL7VKX_MWgu18LyJB0PPzrJRLN3NH2StX8Xl6QCnsL1QoA9lfXPDrHRtVp7a8KEzSRmehCPTqhrpqKw5yHxHpm2z08iJAAJqvUf0fVMFUDBLZiA7i7uRPRrU-TNu0PknXcUs2dXV7qIXTSbrGL-QR1fM2j4W6-_RiGeix9wfNYB0twggodYR9TEdX43N4Zw9k_GSF-TYd6MILmSujnU8f695gvuWdWf6-voMP_zT53M1HYz86t-s1rztwveQCGuf_UvBcYQaDbMq96Ks9Jcb-qFHCafs2tH_Bgol3Zrs5J0JCOIwDOd8nB_LFdTiVJUp4X5ZQ-51D_YX348RO39Xp_VZVpFuGt8b-JLUbntxUdlBBlihuqOnF_dA1q4mgOF5r8xnUOI0bWMjVyZ0-10Qnzt0KgvNeE0o-UGFB_ag2IWnas6Y__sb2UZm2-g8LS6Lcz38UrJpPLiE81esHBIJ4a-WRaJAHwcdHoT66O24_xD0Qar-jbsBKzUlYyXGnHCNs6kjlFvVqj_GRVd6k7GYMiBHiB4pjZduxv0mYD_qIUW1q5aaHh2Ru6sbOXupBIi1-9Wizxthi_UNgwSDDJowsjk56Jmya4nZITOhm4UaZBG-Pq8XsrHConxu2gGxstLIlKtLHBenb67Km2tN-I0UI_LcIweFjsCj_HIW8_OpyccdeaH4_hp9u0vB1uvmiKgrqzDitse8iwNWMiZAwyS9Ev51Jox4lmIDSb5wpTclUArfq_CXwgk2sjxcR7Nmosaj6KBmjGfBiwvdwsX0f3fYy8IfMkb0JcgxcnomgiyeJmwKZhuuxdriMaoQZNH-9cSQkfe6xBLqeseZbU7GGIKGZlOWhrIY1_qWGWWE4y7UlFGRauMmZIxzHH4OG5pHcEN0HELEz0AxizyekKwETQJ8XUCxHHdexuFgg5Ni04n15T9LccnDaTCsfitwbt55TrfWjD9LcHaoCGBwA8yq33vSEkDit7EtgnORf-9J7ZrZUluHhz20-u4eAYbva6o69Yg1269w3pNmv03zzi4Gdr6b_3neFiO8Oxc0lnboD4RKN_ttWjhHIzgJX3DYagHZhyjCv6B3Vj0tiLtEfcioUPwmolaj1rbcN9Q-tLYaOVjt4HXx6Evbkj53mLkX3x-lmhtOKVAhqVUENSW1suJWg3kpmbDa1c1EkyJkXPlel5qaKigwnssXchMnhhBRFr4c80u_CuH4NDQh9rSuaJkyNsFmok8EntXuwwF47ig_ZDCTzkSke1DAMm2GYtXTAantIQnAf6NaComjY0cQV8jqtjN_K_zQNYGj0HZm8Q2pRNE8apPe6b7-C48OjkURIi2qfmSFLI0fYw6DeRiEg4fDS79KhGLKXbwW9-_AbyPQ",
+        "wrapped_key": "wldEGHBgvnHKpwfBXRWp0UQbRXcj7Khr_sqPdxnI1WSOWn7TtKAvWiL_9O1mQRaW"
+      }
+    ],
+    "ciphertext": "82z17IBrL0Dfe4oOKqANi2QD7wbLQRL8FKC6ZFV7AYliYdaESSFXq8-VQdoLrnMcIrDN9n_bBrDJacxWqcNQdZZRNvL1Tam111foZVhgI1RhxsK3fRa8Kjj5QoOEnWZ-fpFVfKoeIsXJz_ZnM-A3tF5n_jCusZENCItPIv4IYdjihnE1jA"
   },
   "expected_inner": {
     "api_key": "sk-stogas-interop",
     "accept": "application/json",
-    "extra_fields": true,
+    "receipt": "v1",
     "body": {
       "model": "gpt-5",
       "input": "interop"
@@ -35,5 +33,5 @@
     }
   },
   "response_body_base64": "eyJ2ZXJpZmllZCI6InJ1c3QtZ28ifQ",
-  "response_base64": "U1RHRQEAAAAAAAAAAAAAAAAAAABmXTBCKz6VQMVOMAQuN06lwVMdNppUB_DgVGVt6g1gHLyOnt2iBzthGaXjkDTq7P0hyt9mHugrzP3qnpJYBzjMnmRT886dlLKvwJIoPUj0050x3FsbAAYV5XpOldXUdM54_HlJTCOVAAAAJm6HJsSFoppcm0raVby4r7YdstMY6xGSoG_YEJodxzUkvWqW8XPoAAAAEL09nN38mweUHNRw4ABPSHo"
+  "response_base64": "U1RHRQEVEREp3wvDLAPFCYQAAABmTCjxKekLd8CtFAHkw7-5LohcuQLj5GauAbZedU8trRKC3F7oNigsgkR0bC8ExuxFmJjvl4xGADtzgNMK_I7QjfkfhG35m7rK9RWo5UnjuKa2WhJXmqjn9I23bXcZ4my9itoM0MZGAAAAJtpB66wXdoh6aLz7lsoeRtXKfGeYmkNMSvYaaKMGal-rWjrLPjzMAAAAEAgk_F0Y25gWleJuP2ZYdjg"
 }

@@ -1,5 +1,4 @@
 use anyhow::{Context, Result, bail};
-use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use clap::{Parser, Subcommand};
 use sha2::{Digest as _, Sha256};
 use std::{
@@ -9,32 +8,13 @@ use std::{
 };
 use stogas::SecurityMode;
 use stogas_verifier::{
-    MAX_INPUT_BYTES, VerificationOutput, Verifier, response_proof::MAX_PROOF_BYTES,
+    MAX_INPUT_BYTES, VerificationOutput, Verifier,
+    response_proof::{MAX_BODY_BYTES, MAX_PROOF_BYTES},
 };
 use tokio::io::AsyncReadExt as _;
 
 const PRODUCTION_BUNDLE_URL: &str = "https://evidence.stogas.ai/bundles/latest.json";
-const MAX_PROOF_INPUT_BYTES: usize = MAX_PROOF_BYTES * 2;
-
-#[cfg(feature = "staging")]
-#[derive(Clone, Copy, Debug, clap::ValueEnum)]
-enum InternalTrustTarget {
-    Production,
-    Staging,
-}
-
-#[cfg(feature = "staging")]
-fn verifier_environment(target: InternalTrustTarget) -> stogas_verifier::Environment {
-    match target {
-        InternalTrustTarget::Production => stogas_verifier::Environment::stogas(),
-        InternalTrustTarget::Staging => stogas_verifier::Environment::staging(),
-    }
-}
-
-#[cfg(not(feature = "staging"))]
-fn verifier_environment() -> stogas_verifier::Environment {
-    stogas_verifier::Environment::stogas()
-}
+const MAX_BUFFERED_RESPONSE_BYTES: usize = MAX_BODY_BYTES + MAX_PROOF_BYTES + 16;
 
 #[derive(Parser)]
 #[command(name = "stogas-verify", version, about)]
@@ -44,7 +24,7 @@ struct Cli {
 }
 
 struct ProofCommandInput {
-    proof: PathBuf,
+    proof: Option<PathBuf>,
     request: PathBuf,
     response: PathBuf,
     bundle: Option<PathBuf>,
@@ -61,14 +41,12 @@ struct VerifyCommandInput {
     policy: Option<PathBuf>,
     json: bool,
     now_unix_ms: Option<i64>,
-    environment: stogas_verifier::Environment,
 }
 
 struct ServeCommandInput {
     bundle_url: String,
     upstream: String,
     listen: String,
-    environment: stogas_verifier::Environment,
     bundle_refresh_seconds: u64,
     security: Option<SecurityMode>,
     browser_origin: Option<String>,
@@ -90,19 +68,16 @@ enum Command {
         /// Exact Unix time in milliseconds, for tests and auditing only.
         #[arg(long, hide = true)]
         now_unix_ms: Option<i64>,
-        /// Internal trust environment. Not compiled into public CLI releases.
-        #[cfg(feature = "staging")]
-        #[arg(long, hide = true, value_enum, default_value_t = InternalTrustTarget::Production)]
-        target: InternalTrustTarget,
     },
     /// Verify a compact post-facto response receipt.
     Proof {
-        /// Receipt JSON or an `X-Stogas-Proof` base64url value.
-        proof: PathBuf,
+        /// Raw receipt JSON for a stream. Omit for a buffered response.
+        #[arg(long)]
+        proof: Option<PathBuf>,
         /// Exact plaintext request body sent to the inference endpoint.
         #[arg(long)]
         request: PathBuf,
-        /// Exact response body, excluding the final `stogas` SSE comment itself.
+        /// Complete buffered JSON, or exact SSE bytes excluding the final `stogas` comment.
         #[arg(long)]
         response: PathBuf,
         /// Currently valid bundle used for the request.
@@ -111,7 +86,7 @@ enum Command {
         /// Caller-owned hardware appraisal policy for current-bundle verification.
         #[arg(long, conflicts_with = "ledger")]
         policy: Option<PathBuf>,
-        /// Immutable historical node-ledger record.
+        /// Historical node evidence returned by the transparency API.
         #[arg(long, required_unless_present = "bundle", conflicts_with = "bundle")]
         ledger: Option<PathBuf>,
         /// Immutable catalog approval selected by the signed catalog sequence.
@@ -147,10 +122,6 @@ enum Command {
         /// Caller-owned hardware appraisal policy.
         #[arg(long)]
         policy: Option<PathBuf>,
-        /// Internal trust environment. Not compiled into public CLI releases.
-        #[cfg(feature = "staging")]
-        #[arg(long, hide = true, value_enum, default_value_t = InternalTrustTarget::Production)]
-        target: InternalTrustTarget,
     },
 }
 
@@ -162,19 +133,12 @@ async fn main() -> Result<()> {
             policy,
             json,
             now_unix_ms,
-            #[cfg(feature = "staging")]
-            target,
         } => {
-            let environment = verifier_environment(
-                #[cfg(feature = "staging")]
-                target,
-            );
             run_verify(VerifyCommandInput {
                 bundle,
                 policy,
                 json,
                 now_unix_ms,
-                environment,
             })
             .await?;
         }
@@ -212,18 +176,11 @@ async fn main() -> Result<()> {
             security,
             browser_origin,
             policy,
-            #[cfg(feature = "staging")]
-            target,
         } => {
-            let environment = verifier_environment(
-                #[cfg(feature = "staging")]
-                target,
-            );
             run_serve(ServeCommandInput {
                 bundle_url,
                 upstream,
                 listen,
-                environment,
                 bundle_refresh_seconds,
                 security,
                 browser_origin,
@@ -255,10 +212,8 @@ async fn run_verify(input: VerifyCommandInput) -> Result<()> {
     let mut verifier = Verifier::default();
     let now = input.now_unix_ms.unwrap_or_else(wall_clock_ms);
     let output = match policy.as_deref() {
-        Some(policy) => {
-            verifier.verify_bundle_with_policy(&bytes, policy, now, &input.environment)?
-        }
-        None => verifier.verify_bundle(&bytes, now, &input.environment)?,
+        Some(policy) => verifier.verify_bundle_with_policy(&bytes, policy, now)?,
+        None => verifier.verify_bundle(&bytes, now)?,
     };
     print_output(&output, input.json)
 }
@@ -273,7 +228,6 @@ async fn run_serve(input: ServeCommandInput) -> Result<()> {
         bundle_url: input.bundle_url,
         upstream: input.upstream,
         listen: input.listen,
-        environment: input.environment,
         bundle_refresh_interval: Duration::from_secs(input.bundle_refresh_seconds),
         security,
         browser_origin: input.browser_origin,
@@ -283,9 +237,28 @@ async fn run_serve(input: ServeCommandInput) -> Result<()> {
 }
 
 async fn run_proof(input: ProofCommandInput) -> Result<()> {
-    let proof = read_proof(&input.proof).await?;
-    let request_sha256 = hash_file(&input.request, "request body").await?;
-    let response_sha256 = hash_file(&input.response, "response body").await?;
+    let streaming = if let Some(path) = input.proof.as_ref() {
+        Some((
+            read_proof(path).await?,
+            hash_file(&input.request, "request body").await?,
+            hash_file(&input.response, "response body").await?,
+        ))
+    } else {
+        None
+    };
+    let buffered = if streaming.is_none() {
+        Some((
+            read_bounded_file(&input.request, MAX_BODY_BYTES, "request body").await?,
+            read_bounded_file(
+                &input.response,
+                MAX_BUFFERED_RESPONSE_BYTES,
+                "buffered response",
+            )
+            .await?,
+        ))
+    } else {
+        None
+    };
     let now = input.now_unix_ms.unwrap_or_else(wall_clock_ms);
     let mut verifier = Verifier::default();
     let output = if let Some(bundle) = input.bundle {
@@ -293,24 +266,29 @@ async fn run_proof(input: ProofCommandInput) -> Result<()> {
         match input.policy {
             Some(policy) => {
                 let policy = read_bounded_file(&policy, MAX_INPUT_BYTES, "hardware policy").await?;
-                verifier.verify_bundle_with_policy(
-                    &bundle,
-                    &policy,
-                    now,
-                    &stogas_verifier::Environment::stogas(),
-                )?;
+                verifier.verify_bundle_with_policy(&bundle, &policy, now)?;
             }
             None => {
-                verifier.verify_bundle(&bundle, now, &stogas_verifier::Environment::stogas())?;
+                verifier.verify_bundle(&bundle, now)?;
             }
         }
-        verifier.verify_response_proof_hashes(
-            &proof,
-            &request_sha256,
-            &response_sha256,
-            input.e2ee_transcript_sha256.as_deref(),
-            now,
-        )?
+        match (streaming.as_ref(), buffered.as_ref()) {
+            (Some((proof, request_sha256, response_sha256)), None) => verifier
+                .verify_response_proof_hashes(
+                    proof,
+                    request_sha256,
+                    response_sha256,
+                    input.e2ee_transcript_sha256.as_deref(),
+                    now,
+                )?,
+            (None, Some((request, response))) => verifier.verify_response_proof(
+                request,
+                response,
+                input.e2ee_transcript_sha256.as_deref(),
+                now,
+            )?,
+            _ => unreachable!(),
+        }
     } else {
         let ledger = input
             .ledger
@@ -320,20 +298,40 @@ async fn run_proof(input: ProofCommandInput) -> Result<()> {
             .catalog
             .context("a historical catalog approval is required with a ledger")?;
         let catalog = read_bounded_file(&catalog, MAX_INPUT_BYTES, "catalog approval").await?;
-        verifier.verify_historical_response_proof_hashes(
-            &stogas_verifier::HistoricalResponseProofHashInput {
-                proof_bytes: &proof,
-                request_sha256: &request_sha256,
-                response_sha256: &response_sha256,
-                expected_e2ee_transcript_sha256: input.e2ee_transcript_sha256.as_deref(),
-                now_unix_ms: now,
-                ledger_bytes: &ledger,
-                catalog_approval_bytes: &catalog,
-                environment: &stogas_verifier::Environment::stogas(),
-            },
-        )?
+        match (streaming.as_ref(), buffered.as_ref()) {
+            (Some((proof, request_sha256, response_sha256)), None) => verifier
+                .verify_historical_response_proof_hashes(
+                    &stogas_verifier::HistoricalResponseProofHashInput {
+                        proof_bytes: proof,
+                        request_sha256,
+                        response_sha256,
+                        expected_e2ee_transcript_sha256: input.e2ee_transcript_sha256.as_deref(),
+                        now_unix_ms: now,
+                        ledger_bytes: &ledger,
+                        catalog_approval_bytes: &catalog,
+                    },
+                )?,
+            (None, Some((request, response))) => verifier.verify_historical_response_proof(
+                &stogas_verifier::HistoricalResponseProofInput {
+                    request_body: request,
+                    response_body: response,
+                    expected_e2ee_transcript_sha256: input.e2ee_transcript_sha256.as_deref(),
+                    now_unix_ms: now,
+                    ledger_bytes: &ledger,
+                    catalog_approval_bytes: &catalog,
+                },
+            )?,
+            _ => unreachable!(),
+        }
     };
-    if input.json {
+    print_proof_output(&output, input.json)
+}
+
+fn print_proof_output(
+    output: &stogas_verifier::response_proof::VerifiedResponseProof,
+    json: bool,
+) -> Result<()> {
+    if json {
         println!("{}", serde_json::to_string(&output)?);
     } else {
         println!("Verified response");
@@ -363,20 +361,14 @@ async fn hash_file(path: &PathBuf, label: &str) -> Result<String> {
 }
 
 async fn read_proof(path: &PathBuf) -> Result<Vec<u8>> {
-    let bytes = read_bounded_file(path, MAX_PROOF_INPUT_BYTES, "response proof").await?;
+    let bytes = read_bounded_file(path, MAX_PROOF_BYTES, "response proof").await?;
     let trimmed = std::str::from_utf8(&bytes)
-        .context("response proof must be UTF-8 JSON or base64url")?
+        .context("response proof must be UTF-8 JSON")?
         .trim();
-    if trimmed.starts_with('{') {
-        return Ok(trimmed.as_bytes().to_vec());
+    if !trimmed.starts_with('{') || !trimmed.ends_with('}') {
+        bail!("response proof must be a JSON object");
     }
-    let encoded = trimmed
-        .strip_prefix("X-Stogas-Proof:")
-        .unwrap_or(trimmed)
-        .trim();
-    URL_SAFE_NO_PAD
-        .decode(encoded)
-        .context("response proof is neither JSON nor canonical base64url")
+    Ok(trimmed.as_bytes().to_vec())
 }
 
 async fn read_bounded_file(path: &PathBuf, maximum: usize, label: &str) -> Result<Vec<u8>> {
@@ -487,17 +479,25 @@ mod tests {
     }
 
     #[test]
-    fn proof_requires_exact_bodies_and_one_trust_source() {
+    fn proof_accepts_buffered_or_stream_input_and_requires_one_trust_source() {
         let base = [
             "stogas-verify",
             "proof",
-            "proof.txt",
             "--request",
             "request.json",
             "--response",
             "response.json",
         ];
         assert!(Cli::try_parse_from(base.into_iter().chain(["--bundle", "bundle.json"])).is_ok());
+        assert!(
+            Cli::try_parse_from(base.into_iter().chain([
+                "--proof",
+                "proof.json",
+                "--bundle",
+                "bundle.json"
+            ]))
+            .is_ok()
+        );
         assert!(
             Cli::try_parse_from(base.into_iter().chain([
                 "--ledger",
@@ -521,23 +521,5 @@ mod tests {
             ]))
             .is_err()
         );
-    }
-
-    #[cfg(not(feature = "staging"))]
-    #[test]
-    fn public_build_has_no_staging_trust_target() {
-        assert!(
-            Cli::try_parse_from(["stogas-verify", "verify", "-", "--target", "staging",]).is_err()
-        );
-        assert!(Cli::try_parse_from(["stogas-verify", "serve", "--target", "staging",]).is_err());
-    }
-
-    #[cfg(feature = "staging")]
-    #[test]
-    fn internal_build_accepts_the_hidden_staging_trust_target() {
-        assert!(
-            Cli::try_parse_from(["stogas-verify", "verify", "-", "--target", "staging",]).is_ok()
-        );
-        assert!(Cli::try_parse_from(["stogas-verify", "serve", "--target", "staging",]).is_ok());
     }
 }

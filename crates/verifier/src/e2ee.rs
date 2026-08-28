@@ -24,14 +24,12 @@ use std::collections::{BTreeMap, BTreeSet};
 use thiserror::Error;
 use zeroize::{Zeroize as _, Zeroizing};
 
-/// JSON field which explicitly selects the encrypted path on an ordinary inference endpoint.
-pub const ENVELOPE_FIELD: &str = "stogas_e2ee";
-/// Outer media type returned by the gateway for an accepted encrypted request.
-pub const RESPONSE_CONTENT_TYPE: &str = "application/vnd.stogas.e2ee";
+/// Outer request and response media type for E2EE inference.
+pub const CONTENT_TYPE: &str = "application/vnd.stogas.e2ee";
 /// Current wire protocol version.
 pub const VERSION: u8 = 1;
-/// Maximum number of independently attested fleet recipients in one request.
-pub const MAX_RECIPIENTS: usize = 64;
+/// Maximum encoded E2EE request size accepted by the gateway.
+pub const MAX_REQUEST_WIRE_BYTES: usize = 128 * 1024 * 1024;
 /// Maximum encrypted inner request size.
 pub const MAX_CIPHERTEXT_BYTES: usize = 94 * 1024 * 1024;
 /// Maximum request acceptance interval allowed by a gateway.
@@ -46,6 +44,7 @@ pub const MAX_RESPONSE_WIRE_BYTES: usize = 66 * 1024 * 1024;
 const CONTENT_KEY_BYTES: usize = 32;
 const KEY_ID_BYTES: usize = 32;
 const RECIPIENT_PUBLIC_KEY_BYTES: usize = 1_216;
+const MAX_V1_RECIPIENTS: usize = u16::MAX as usize;
 const RESPONSE_TAG_BYTES: usize = 16;
 const RESPONSE_RECORD_HEADER_BYTES: usize = 4;
 const RESPONSE_NONCE_BYTES: usize = 12;
@@ -80,13 +79,18 @@ pub struct Recipient {
     pub public_key: Vec<u8>,
 }
 
-/// Optional provider credential carried only inside the encrypted request.
+/// Optional provider credentials carried only inside the encrypted request.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
-pub struct UpstreamCredential<'a> {
-    /// Canonical Stogas provider ID.
-    pub provider: &'a str,
-    /// Provider API key.
-    pub api_key: &'a str,
+pub struct UpstreamCredentials<'a> {
+    /// Anthropic API key.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub anthropic: Option<&'a str>,
+    /// Chutes API key.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub chutes: Option<&'a str>,
+    /// OpenAI API key.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub openai: Option<&'a str>,
 }
 
 /// Complete input to one encrypted inference request.
@@ -107,10 +111,10 @@ pub struct Request<'a> {
     pub api_key: &'a str,
     /// Optional desired response media type.
     pub accept: Option<&'a str>,
-    /// Include the compact signed Stogas response fields.
-    pub extra_fields: bool,
-    /// Optional pass-through provider credential.
-    pub upstream_credential: Option<UpstreamCredential<'a>>,
+    /// Request the v1 signed Stogas receipt.
+    pub receipt: bool,
+    /// Optional bounded pass-through provider credential pool.
+    pub upstream_credentials: Option<UpstreamCredentials<'a>>,
     /// Ordinary JSON body for the selected inference endpoint.
     pub body: &'a [u8],
 }
@@ -136,7 +140,7 @@ pub struct ResponseMetadata {
     pub status_code: u16,
     /// Inner response content type.
     pub content_type: String,
-    /// Bounded proof and response headers.
+    /// Bounded response headers.
     #[serde(default)]
     pub headers: BTreeMap<String, String>,
 }
@@ -150,13 +154,6 @@ pub enum ResponseEvent {
     Data(Vec<u8>),
     /// Authenticated empty record at the clean end of response.
     Final,
-}
-
-#[derive(Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-struct OuterEnvelope {
-    #[serde(rename = "stogas_e2ee")]
-    e2ee: Envelope,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -184,9 +181,9 @@ struct InnerRequest<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     accept: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    extra_fields: Option<bool>,
+    receipt: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    upstream_credential: Option<UpstreamCredential<'a>>,
+    upstream_credentials: Option<UpstreamCredentials<'a>>,
     body: &'a RawValue,
 }
 
@@ -268,8 +265,8 @@ pub fn seal_request(request: &Request<'_>) -> Result<SealedRequest, Error> {
         serde_json::to_vec(&InnerRequest {
             api_key: request.api_key,
             accept: request.accept,
-            extra_fields: request.extra_fields.then_some(true),
-            upstream_credential: request.upstream_credential,
+            receipt: request.receipt.then_some("v1"),
+            upstream_credentials: request.upstream_credentials,
             body: &raw_body,
         })
         .map_err(|_| Error::InvalidRequest("inner request could not be encoded".into()))?,
@@ -314,17 +311,16 @@ pub fn seal_request(request: &Request<'_>) -> Result<SealedRequest, Error> {
         });
     }
 
-    let body = serde_json::to_vec(&OuterEnvelope {
-        e2ee: Envelope {
-            version: VERSION,
-            request_id: request_id.clone(),
-            bundle_sha256: request.bundle_sha256.to_owned(),
-            expires_at_ms: request.expires_at_unix_ms,
-            recipients: wrapped_recipients,
-            ciphertext: URL_SAFE_NO_PAD.encode(ciphertext),
-        },
+    let body = serde_json::to_vec(&Envelope {
+        version: VERSION,
+        request_id: request_id.clone(),
+        bundle_sha256: request.bundle_sha256.to_owned(),
+        expires_at_ms: request.expires_at_unix_ms,
+        recipients: wrapped_recipients,
+        ciphertext: URL_SAFE_NO_PAD.encode(ciphertext),
     })
     .map_err(|_| Error::Crypto)?;
+    validate_request_wire_size(body.len())?;
     Ok(SealedRequest {
         body,
         request_id,
@@ -354,22 +350,28 @@ fn validate_request(request: &Request<'_>) -> Result<(), Error> {
             "api_key must contain 1 to 4096 visible ASCII bytes".into(),
         ));
     }
-    if let Some(credential) = request.upstream_credential {
-        if !matches!(credential.provider, "anthropic" | "chutes" | "openai") {
-            return Err(Error::InvalidRequest(
-                "upstream credential provider is invalid".into(),
-            ));
-        }
-        if credential.api_key.is_empty()
-            || credential.api_key.len() > 4 * 1024
-            || !credential
-                .api_key
-                .bytes()
-                .all(|byte| (0x21..=0x7e).contains(&byte))
+    if let Some(credentials) = request.upstream_credentials {
+        if credentials.anthropic.is_none()
+            && credentials.chutes.is_none()
+            && credentials.openai.is_none()
         {
             return Err(Error::InvalidRequest(
-                "upstream credential api_key is invalid".into(),
+                "upstream_credentials must not be empty".into(),
             ));
+        }
+        for credential in [
+            credentials.anthropic,
+            credentials.chutes,
+            credentials.openai,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if !valid_credential(credential) {
+                return Err(Error::InvalidRequest(
+                    "upstream credential is invalid".into(),
+                ));
+            }
         }
     }
     for (name, value, max) in [("accept", request.accept, 256)] {
@@ -424,11 +426,7 @@ fn valid_content_type(value: &str) -> bool {
 }
 
 fn prepare_recipients(recipients: &[Recipient]) -> Result<Vec<PreparedRecipient>, Error> {
-    if recipients.is_empty() || recipients.len() > MAX_RECIPIENTS {
-        return Err(Error::InvalidRequest(format!(
-            "recipient count must be between 1 and {MAX_RECIPIENTS}"
-        )));
-    }
+    validate_recipient_count(recipients.len())?;
     let mut prepared = recipients
         .iter()
         .map(|recipient| {
@@ -455,6 +453,28 @@ fn prepare_recipients(recipients: &[Recipient]) -> Result<Vec<PreparedRecipient>
     Ok(prepared)
 }
 
+fn validate_recipient_count(count: usize) -> Result<u16, Error> {
+    if count == 0 {
+        return Err(Error::InvalidRequest(
+            "at least one recipient is required".into(),
+        ));
+    }
+    u16::try_from(count).map_err(|_| {
+        Error::InvalidRequest(format!(
+            "recipient count exceeds the E2EE v1 wire limit of {MAX_V1_RECIPIENTS}"
+        ))
+    })
+}
+
+fn validate_request_wire_size(size: usize) -> Result<(), Error> {
+    if size > MAX_REQUEST_WIRE_BYTES {
+        return Err(Error::InvalidRequest(
+            "encoded E2EE envelope exceeds the protocol limit".into(),
+        ));
+    }
+    Ok(())
+}
+
 fn build_transcript(
     path: &str,
     request_id: [u8; 16],
@@ -462,6 +482,7 @@ fn build_transcript(
     expires_at_unix_ms: i64,
     key_ids: &[[u8; KEY_ID_BYTES]],
 ) -> Result<Vec<u8>, Error> {
+    let count = validate_recipient_count(key_ids.len())?;
     let mut output = Vec::with_capacity(128 + key_ids.len() * KEY_ID_BYTES);
     output.extend_from_slice(b"stogas.e2ee.request.v1");
     output.push(0);
@@ -470,8 +491,6 @@ fn build_transcript(
     output.extend_from_slice(&request_id);
     output.extend_from_slice(&bundle_hash);
     output.extend_from_slice(&expires_at_unix_ms.to_be_bytes());
-    let count = u16::try_from(key_ids.len())
-        .map_err(|_| Error::InvalidRequest("too many recipients".into()))?;
     output.extend_from_slice(&count.to_be_bytes());
     for key_id in key_ids {
         output.extend_from_slice(key_id);
@@ -665,21 +684,29 @@ impl ResponseDecoder {
         if self.state == ResponseDecoderState::Finished {
             return Ok(Vec::new());
         }
-        let wire_bytes = self
-            .wire_bytes
-            .checked_add(bytes.len())
-            .filter(|size| *size <= MAX_RESPONSE_WIRE_BYTES)
-            .ok_or_else(|| Error::InvalidResponse("encrypted response is too large".into()))?;
-        self.wire_bytes = wire_bytes;
-        self.buffer.extend_from_slice(bytes);
+        let remaining = MAX_RESPONSE_WIRE_BYTES.saturating_sub(self.wire_bytes);
+        let accepted = bytes.len().min(remaining);
+        self.wire_bytes += accepted;
+        self.buffer.extend_from_slice(&bytes[..accepted]);
+        let exceeded_wire_limit = accepted != bytes.len();
         let mut events = Vec::new();
         if !self.consume_preamble()? {
+            if exceeded_wire_limit {
+                return Err(Error::InvalidResponse(
+                    "encrypted response is too large".into(),
+                ));
+            }
             return Ok(events);
         }
         while let Some(event) = self.next_event()? {
             events.push(event);
         }
         self.compact();
+        if exceeded_wire_limit && self.state != ResponseDecoderState::Finished {
+            return Err(Error::InvalidResponse(
+                "encrypted response is too large".into(),
+            ));
+        }
         Ok(events)
     }
 
@@ -852,7 +879,7 @@ impl Drop for ResponseDecoder {
 }
 
 fn validate_response_metadata(metadata: &ResponseMetadata) -> Result<(), Error> {
-    if !(100..=599).contains(&metadata.status_code) {
+    if !(200..=599).contains(&metadata.status_code) {
         return Err(Error::InvalidResponse(
             "inner HTTP status is invalid".into(),
         ));
@@ -923,10 +950,11 @@ mod tests {
             recipients: &recipients,
             api_key: "sk-stogas-secret",
             accept: Some("text/event-stream"),
-            extra_fields: true,
-            upstream_credential: Some(UpstreamCredential {
-                provider: "openai",
-                api_key: "sk-provider-secret",
+            receipt: true,
+            upstream_credentials: Some(UpstreamCredentials {
+                anthropic: Some("sk-anthropic-secret"),
+                chutes: None,
+                openai: Some("sk-provider-secret"),
             }),
             body: br#"{"model":"gpt-5","input":"hello"}"#,
         })
@@ -940,7 +968,7 @@ mod tests {
                 .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
         );
         let value: Value = serde_json::from_slice(&sealed.body).unwrap();
-        let envelope = &value[ENVELOPE_FIELD];
+        let envelope = &value;
         assert_eq!(envelope["version"], VERSION);
         assert_eq!(envelope["request_id"], REQUEST_ID);
         assert_eq!(envelope["bundle_sha256"], BUNDLE_HASH);
@@ -970,8 +998,8 @@ mod tests {
             recipients: &recipients,
             api_key: "sk-stogas-secret",
             accept: None,
-            extra_fields: false,
-            upstream_credential: None,
+            receipt: false,
+            upstream_credentials: None,
             body: br#"{"model":"gpt-5","messages":[]}"#,
         })
         .unwrap();
@@ -1004,17 +1032,36 @@ mod tests {
     #[test]
     fn seal_request_rejects_invalid_recipient_sets() {
         let valid_recipient = recipient();
-        let too_many = vec![valid_recipient.clone(); MAX_RECIPIENTS + 1];
         let duplicate = [valid_recipient.clone(), valid_recipient.clone()];
         let mut request = valid_request(&valid_recipient);
         request.recipients = &[];
         assert_invalid_request(&request);
         request = valid_request(&valid_recipient);
-        request.recipients = &too_many;
-        assert_invalid_request(&request);
-        request = valid_request(&valid_recipient);
         request.recipients = &duplicate;
         assert_invalid_request(&request);
+    }
+
+    #[test]
+    fn seal_request_accepts_sixty_five_recipients() {
+        let recipients = (0..65).map(|_| recipient()).collect::<Vec<_>>();
+        let mut request = valid_request(&recipients[0]);
+        request.recipients = &recipients;
+        let sealed = seal_request(&request).unwrap();
+        let envelope: Envelope = serde_json::from_slice(&sealed.body).unwrap();
+        assert_eq!(envelope.recipients.len(), recipients.len());
+        assert!(sealed.body.len() <= MAX_REQUEST_WIRE_BYTES);
+    }
+
+    #[test]
+    fn recipient_count_cannot_overflow_the_v1_transcript() {
+        let key_ids = vec![[0_u8; KEY_ID_BYTES]; MAX_V1_RECIPIENTS + 1];
+        assert!(build_transcript("/v1/responses", [0; 16], [0; 32], NOW_MS, &key_ids).is_err());
+    }
+
+    #[test]
+    fn request_wire_size_accepts_the_boundary_and_rejects_larger_envelopes() {
+        assert!(validate_request_wire_size(MAX_REQUEST_WIRE_BYTES).is_ok());
+        assert!(validate_request_wire_size(MAX_REQUEST_WIRE_BYTES + 1).is_err());
     }
 
     #[test]
@@ -1036,9 +1083,10 @@ mod tests {
         request.accept = Some(" application/json");
         assert_invalid_request(&request);
         request = valid_request(&valid_recipient);
-        request.upstream_credential = Some(UpstreamCredential {
-            provider: "openai",
-            api_key: "provider key with spaces",
+        request.upstream_credentials = Some(UpstreamCredentials {
+            anthropic: None,
+            chutes: None,
+            openai: Some("provider key with spaces"),
         });
         assert_invalid_request(&request);
         request = valid_request(&valid_recipient);
@@ -1054,7 +1102,7 @@ mod tests {
             &ResponseMetadata {
                 status_code: 200,
                 content_type: "text/event-stream".into(),
-                headers: BTreeMap::from([("X-Stogas-Proof".into(), "proof".into())]),
+                headers: BTreeMap::from([("Cache-Control".into(), "no-cache".into())]),
             },
             &[b"data: one\n\n", b"data: two\n\n"],
         );
@@ -1069,7 +1117,7 @@ mod tests {
                 ResponseEvent::Metadata(ResponseMetadata {
                     status_code: 200,
                     content_type: "text/event-stream".into(),
-                    headers: BTreeMap::from([("X-Stogas-Proof".into(), "proof".into())]),
+                    headers: BTreeMap::from([("Cache-Control".into(), "no-cache".into())]),
                 }),
                 ResponseEvent::Data(b"data: one\n\n".to_vec()),
                 ResponseEvent::Data(b"data: two\n\n".to_vec()),
@@ -1107,6 +1155,22 @@ mod tests {
         );
         assert!(trailing.push(b"later network chunk").unwrap().is_empty());
         trailing.finish().unwrap();
+
+        let mut bounded_trailing = baseline_response_decoder();
+        let encoded = encode_response(&bounded_trailing, &metadata, &[br#"{"ok":true}"#]);
+        let final_record_bytes = RESPONSE_RECORD_HEADER_BYTES + RESPONSE_TAG_BYTES;
+        let final_record_start = encoded.len() - final_record_bytes;
+        bounded_trailing
+            .push(&encoded[..final_record_start])
+            .unwrap();
+        bounded_trailing.wire_bytes = MAX_RESPONSE_WIRE_BYTES - final_record_bytes;
+        let mut final_with_excess = encoded[final_record_start..].to_vec();
+        final_with_excess.push(0);
+        assert_eq!(
+            bounded_trailing.push(&final_with_excess).unwrap(),
+            vec![ResponseEvent::Final]
+        );
+        bounded_trailing.finish().unwrap();
 
         let mut early_final = baseline_response_decoder();
         let authenticated_trailing = encode_response(&early_final, &metadata, &[b"", b"later"]);
@@ -1178,7 +1242,7 @@ mod tests {
     fn response_decoder_rejects_invalid_authenticated_metadata() {
         for metadata in [
             ResponseMetadata {
-                status_code: 99,
+                status_code: 199,
                 content_type: "application/json".into(),
                 headers: BTreeMap::new(),
             },
@@ -1246,8 +1310,7 @@ mod tests {
             serde_json::from_slice(include_bytes!("../tests/fixtures/e2ee-rust-go-v1.json"))
                 .unwrap();
         assert_eq!(fixture.schema, "stogas.e2ee.interop.v1");
-        let outer: OuterEnvelope = serde_json::from_value(fixture.request).unwrap();
-        let envelope = outer.e2ee;
+        let envelope: Envelope = serde_json::from_value(fixture.request).unwrap();
         let private_key = <Kem as hpke::Kem>::PrivateKey::from_bytes(
             &hex::decode(fixture.node_private_key_hex).unwrap(),
         )
@@ -1345,8 +1408,8 @@ mod tests {
             recipients: &recipients,
             api_key: "sk-test",
             accept: None,
-            extra_fields: false,
-            upstream_credential: None,
+            receipt: false,
+            upstream_credentials: None,
             body: b"{}",
         })
         .unwrap()
@@ -1362,8 +1425,8 @@ mod tests {
             recipients: std::slice::from_ref(recipient),
             api_key: "sk-test",
             accept: None,
-            extra_fields: false,
-            upstream_credential: None,
+            receipt: false,
+            upstream_credentials: None,
             body: b"{}",
         }
     }

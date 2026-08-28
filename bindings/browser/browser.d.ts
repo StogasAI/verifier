@@ -17,14 +17,12 @@ export declare class Verifier {
 		policy: Uint8Array
 	): ReturnType<CoreVerifier['verify_bundle_with_policy']>;
 	verify_response_proof(
-		proof: Uint8Array,
 		requestBody: Uint8Array,
 		responseBody: Uint8Array,
 		e2eeTranscriptSHA256?: string
 	): ReturnType<CoreVerifier['verify_response_proof']>;
 	start_response_proof(requestBody: Uint8Array): ResponseProofStream;
 	verify_historical_response_proof(
-		proof: Uint8Array,
 		requestBody: Uint8Array,
 		responseBody: Uint8Array,
 		ledger: Uint8Array,
@@ -92,7 +90,6 @@ export declare class StogasTransport {
 	readonly fetch: typeof globalThis.fetch;
 	openAIOptions(apiKey: string): StogasOpenAIOptions;
 	verifyResponseProof(
-		proof: Uint8Array,
 		requestBody: Uint8Array,
 		responseBody: Uint8Array,
 		e2eeTranscriptSHA256?: string

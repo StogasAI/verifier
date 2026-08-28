@@ -12,54 +12,40 @@ pub struct BundleEnvelope {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct BundleBody {
-    pub allowed_catalogs: Vec<AllowedCatalog>,
+    pub catalogs: Vec<AllowedCatalog>,
     pub allowed_igvms: Vec<AllowedIgvm>,
     pub created_at: String,
     pub expires_at: String,
-    pub hardware_policies: Vec<SignedHardwarePolicy>,
-    pub nodes: Vec<Node>,
+    pub hardware_policy: SignedHardwarePolicy,
+    pub nodes: Vec<BundleNode>,
     pub schema: String,
     pub sequence: u64,
-    pub ttl_ms: u64,
-    pub vendor_collateral: Vec<VendorCollateral>,
+    pub vendor_collateral: Vec<BTreeMap<String, Value>>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct SignedHardwarePolicy {
     pub policy: HardwarePolicy,
-    pub stogas_signature: HardwarePolicySignature,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct HardwarePolicySignature {
-    pub algorithm: String,
-    pub key_id: String,
-    pub schema: String,
-    pub signature: String,
-    pub signed: String,
+    pub sigstore: Value,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct HardwarePolicy {
-    pub amd_sev_snp: AmdSevSnpPolicy,
-    pub chip_id: String,
+    pub policies: Vec<AmdSevSnpPolicy>,
     pub schema: String,
-    pub sequence: u64,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct AmdSevSnpPolicy {
+    pub chip_ids: Vec<String>,
     pub cpuid_family: u8,
     pub cpuid_model: u8,
     pub cpuid_stepping: u8,
     pub forbidden_platform_info_mask: String,
     pub minimum_tcb: AmdTcb,
-    pub product: String,
-    pub report_version: u32,
     pub required_current_mitigation_mask: String,
     pub required_launch_mitigation_mask: String,
     pub required_platform_info_mask: String,
@@ -96,6 +82,8 @@ pub struct SignedCatalogRelease {
 pub struct CatalogReleaseManifest {
     #[serde(rename = "catalogSchema")]
     pub catalog_schema: u16,
+    #[serde(rename = "minimumGatewaySequence")]
+    pub minimum_gateway_sequence: u64,
     pub public: String,
     pub runtime: String,
     pub schema: String,
@@ -116,22 +104,96 @@ pub struct CatalogSource {
 #[serde(deny_unknown_fields)]
 pub struct AllowedIgvm {
     pub github_in_toto: Vec<Value>,
-    pub launch_policy: LaunchPolicy,
-    pub stogas_signature: ReleaseSignature,
+    pub release_manifest: GatewayReleaseManifest,
+    pub stogas_signature: CounterbuildSignature,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-pub struct LaunchPolicy {
-    pub igvm_sha256: String,
-    pub launch: LaunchValues,
-    pub measurement: String,
-    pub name: String,
-    pub release_tag: String,
+pub struct GatewayReleaseManifest {
+    pub artifacts: GatewayReleaseArtifacts,
+    pub build: GatewayReleaseBuild,
+    pub git: GatewayReleaseGit,
     pub schema: String,
     pub sequence: u64,
-    pub source: Source,
+    #[serde(rename = "sevSnp")]
+    pub sev_snp: GatewayReleaseSevSnp,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct GatewayReleaseArtifacts {
+    #[serde(rename = "gateway.igvm")]
+    pub gateway_igvm: GatewayReleaseArtifact,
+    #[serde(rename = "snp-launch-policies.json")]
+    pub snp_launch_policies: GatewayReleaseArtifact,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct GatewayReleaseArtifact {
+    pub sha256: String,
+    pub size_bytes: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct GatewayReleaseBuild {
+    pub cmdline_sha256: String,
+    pub core_go_mod_sha256: String,
+    pub core_go_sum_sha256: String,
+    pub environment: GatewayReleaseBuildEnvironment,
+    pub go_mod_sha256: String,
+    pub go_sum_sha256: String,
+    pub go_vendor_tree_sha256: String,
+    pub go_version: String,
+    pub guest_ca_bundle_path: String,
+    pub guest_ca_bundle_sha256: String,
+    pub guix_channel_commit: String,
+    pub input_sha256: BTreeMap<String, String>,
+    pub kernel_config_sha256: String,
+    pub kernel_version: String,
+    pub linux_bz_image_sha256: String,
+    pub os_release_sha256: String,
+    pub ovmf_sha256: String,
+    pub pins_lock_sha256: String,
+    pub systemd_stub_sha256: String,
+    pub uki_sha256: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct GatewayReleaseBuildEnvironment {
+    pub lc_all: String,
+    pub source_date_epoch: String,
+    pub tz: String,
+    pub umask: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct GatewayReleaseGit {
+    pub commit: String,
+    #[serde(rename = "ref")]
+    pub git_ref: String,
+    pub repository: String,
+    pub tag: String,
+    pub tree: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct GatewayReleaseSevSnp {
+    pub check_kvm: bool,
+    pub launch_measurement: String,
+    pub launch_policies: LaunchPolicies,
+    pub measurement_command: String,
+    pub measurement_tool: String,
+    pub measurement_tool_sha256: String,
+    pub measurement_tool_version: String,
+    pub platform: String,
     pub vcpu_count: u16,
+    pub vmm: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -148,15 +210,21 @@ pub struct LaunchValues {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-pub struct Source {
-    pub commit: String,
-    pub repository: String,
-    pub tree: String,
+pub struct LaunchPolicies {
+    pub policies: Vec<AmdSevSnpLaunchPolicy>,
+    pub schema: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-pub struct ReleaseSignature {
+pub struct AmdSevSnpLaunchPolicy {
+    pub chip_ids: Vec<String>,
+    pub launch: LaunchValues,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CounterbuildSignature {
     pub algorithm: String,
     pub key_id: String,
     pub schema: String,
@@ -187,11 +255,21 @@ pub struct Node {
     pub report_data_sha512: String,
 }
 
+/// Minimal public node evidence. Hardware identity and the report-data digest are derived from
+/// the signed report during verification.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct BundleNode {
+    pub node_id: String,
+    pub quote: String,
+    pub report_data: ReportData,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct NodeHealth {
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub last_quote_error: Option<String>,
+    pub last_quote_failure_class: Option<String>,
     pub ready: bool,
     pub secret_versions: BTreeMap<String, String>,
 }
@@ -200,7 +278,9 @@ pub struct NodeHealth {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct HeartbeatCandidate {
+    pub active_cert_sha256: String,
     pub cert_expires_at: String,
+    pub catalog: CatalogIdentity,
     pub health: NodeHealth,
     pub node_id: String,
     pub observed_at: String,
@@ -217,7 +297,7 @@ pub struct HeartbeatCandidate {
 pub struct AdmissionRequest {
     pub hardware_policy: SignedHardwarePolicy,
     pub heartbeat: HeartbeatCandidate,
-    pub launch_policies: Vec<LaunchPolicy>,
+    pub release_manifests: Vec<GatewayReleaseManifest>,
     pub region: String,
     pub trusted_chip_ids: Vec<String>,
     pub vendor_collateral: Vec<VendorCollateral>,
@@ -234,7 +314,7 @@ pub struct LocalAdmissionRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub amd_report_signing_public_key: Option<String>,
     pub heartbeat: HeartbeatCandidate,
-    pub launch_policies: Vec<LaunchPolicy>,
+    pub release_manifests: Vec<GatewayReleaseManifest>,
     pub region: String,
     pub trusted_chip_ids: Vec<String>,
 }
@@ -266,9 +346,7 @@ pub struct VerifiedAdmission {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ReportData {
-    pub active_cert_sha256: String,
     pub accepted_cert_sha256: Vec<String>,
-    pub catalog: CatalogIdentity,
     pub drand: DrandBeacon,
     pub ed25519_public_key: String,
     pub hpke_public_key: String,
@@ -329,11 +407,11 @@ pub struct VerifiedRelease {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub github_integrated_time_unix_ms: Option<i64>,
     pub igvm_sha256: String,
-    pub launch: LaunchValues,
-    pub launch_policy_sha256: String,
+    pub launch_policies: LaunchPolicies,
     pub measurement: String,
     pub provenance: ReleaseProvenance,
     pub release_tag: String,
+    pub release_manifest_sha256: String,
     pub sequence: u64,
     pub source_commit: String,
     pub source_repository: String,
@@ -347,6 +425,7 @@ pub struct VerifiedCatalogRelease {
     pub evidence: AllowedCatalog,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub github_integrated_time_unix_ms: Option<i64>,
+    pub minimum_gateway_sequence: u64,
     pub provenance: ReleaseProvenance,
     pub public_digest: String,
     pub runtime_digest: String,
@@ -367,7 +446,6 @@ pub struct VerifiedNode {
     pub node_id: String,
     pub quote: String,
     pub quote_verified_at_unix_ms: i64,
-    pub region: String,
     pub report_data: ReportData,
     pub report_data_sha512: String,
     pub release_measurement: String,
@@ -390,7 +468,7 @@ pub struct VerifiedBundle {
     pub created_at_unix_ms: i64,
     pub expires_at_unix_ms: i64,
     pub excluded_nodes: Vec<ExcludedNode>,
-    pub hardware_policies: Vec<VerifiedHardwarePolicy>,
+    pub hardware_policy: VerifiedHardwarePolicy,
     pub releases: Vec<VerifiedRelease>,
     pub nodes: Vec<VerifiedNode>,
     pub original: BundleEnvelope,
@@ -405,11 +483,32 @@ pub enum HardwarePolicySource {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct VerifiedHardwarePolicy {
-    pub chip_id: String,
-    pub sequence: u64,
+    pub chip_ids: Vec<String>,
+    pub policy_count: usize,
+    pub rekor_integrated_time_unix_ms: Option<i64>,
     pub sha256: String,
     pub source: HardwarePolicySource,
     pub stogas_signing_key_id: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct HardwarePolicyFleetRequest {
+    pub hardware_policy: SignedHardwarePolicy,
+    pub nodes: Vec<BundleNode>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct VerifiedHardwarePolicyNode {
+    pub chip_id: String,
+    pub node_id: String,
+    pub reported_tcb: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct VerifiedHardwarePolicyFleet {
+    pub hardware_policy: VerifiedHardwarePolicy,
+    pub nodes: Vec<VerifiedHardwarePolicyNode>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -419,21 +518,38 @@ pub struct VerificationOutput {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-pub struct NodeLedgerRecord {
+pub struct NodeEvidence {
     pub admitted_at: String,
     pub admission: NodeLedgerAdmission,
-    pub certificate_history: Vec<NodeLedgerCertificate>,
-    pub hardware_policy: SignedHardwarePolicy,
+    pub hardware_policy_sha256: String,
     pub node_id: String,
-    pub release: AllowedIgvm,
     pub release_measurement: String,
     pub schema: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-pub struct NodeLedgerCertificate {
+pub struct HydratedNodeEvidence {
+    pub certificates: NodeCertificateHistory,
+    pub evidence: NodeEvidence,
+    pub hardware_policy: SignedHardwarePolicy,
+    pub release: AllowedIgvm,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct NodeCertificateHistory {
+    pub certificates: Vec<NodeCertificateHistoryEntry>,
+    pub node_id: String,
+    pub schema: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct NodeCertificateHistoryEntry {
+    pub certificate_chain_pem: String,
     pub first_observed_at: String,
+    pub leaf_der: String,
     pub sha256: String,
 }
 

@@ -27,7 +27,7 @@ struct Bundle {
     verification_material: VerificationMaterial,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, serde::Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct DsseEnvelope {
     pub payload: String,
@@ -35,11 +35,11 @@ pub struct DsseEnvelope {
     pub signatures: Vec<DsseSignature>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, serde::Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct DsseSignature {
     #[serde(default)]
-    keyid: String,
+    pub keyid: String,
     pub sig: String,
 }
 
@@ -51,6 +51,33 @@ struct VerificationMaterial {
     #[serde(default)]
     timestamp_verification_data: TimestampVerificationData,
 }
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct KeyedBundle {
+    media_type: String,
+    dsse_envelope: DsseEnvelope,
+    verification_material: KeyedVerificationMaterial,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct KeyedVerificationMaterial {
+    public_key: PublicKeyHint,
+    tlog_entries: Vec<TransparencyLogEntry>,
+    #[serde(rename = "timestampVerificationData")]
+    _timestamp_verification_data: EmptyVerificationData,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PublicKeyHint {
+    hint: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EmptyVerificationData {}
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -194,6 +221,44 @@ pub fn verify(
     Ok(verified_integrated_time)
 }
 
+pub fn verify_keyed_dsse(
+    value: &serde_json::Value,
+    expected_payload: &[u8],
+    expected_payload_type: &str,
+    expected_key_id: &str,
+    public_key_spki: &[u8],
+    now_unix_ms: i64,
+) -> Result<i64, String> {
+    let bundle: KeyedBundle = serde_json::from_value(value.clone())
+        .map_err(|error| format!("invalid keyed Sigstore v0.3 bundle: {error}"))?;
+    if bundle.media_type != "application/vnd.dev.sigstore.bundle.v0.3+json"
+        || bundle.dsse_envelope.payload_type != expected_payload_type
+        || bundle.dsse_envelope.signatures.len() != 1
+        || bundle.dsse_envelope.signatures[0].keyid != expected_key_id
+        || bundle.verification_material.public_key.hint != expected_key_id
+        || bundle.verification_material.tlog_entries.len() != 1
+    {
+        return Err("unsupported or ambiguous keyed Sigstore bundle".into());
+    }
+    let payload = STANDARD
+        .decode(&bundle.dsse_envelope.payload)
+        .map_err(|error| format!("invalid DSSE payload encoding: {error}"))?;
+    if payload != expected_payload {
+        return Err("DSSE payload differs from the expected hardware policy".into());
+    }
+    let entry = &bundle.verification_material.tlog_entries[0];
+    let root = TrustedRoot::production()?;
+    let integrated_time = tlog::verify_keyed(
+        entry,
+        &bundle.dsse_envelope,
+        public_key_spki,
+        now_unix_ms.div_euclid(1000),
+        &root,
+    )?;
+    verify_keyed_dsse_signature(&bundle.dsse_envelope, public_key_spki)?;
+    Ok(integrated_time)
+}
+
 fn parse_certificate(der: Vec<u8>) -> Result<CertificateInfo, String> {
     let certificate = Certificate::from_der(&der)
         .map_err(|error| format!("invalid Fulcio certificate: {error}"))?;
@@ -324,6 +389,18 @@ fn verify_dsse_signature(envelope: &DsseEnvelope, spki: &[u8]) -> Result<(), Str
         .map_err(|error| format!("invalid DSSE signature encoding: {error}"))?;
     let pae = pae(&envelope.payload_type, &payload);
     verify_spki(spki, Scheme::EcdsaP256Sha256, &pae, &signature)
+        .map_err(|error| format!("DSSE signature verification failed: {error}"))
+}
+
+fn verify_keyed_dsse_signature(envelope: &DsseEnvelope, spki: &[u8]) -> Result<(), String> {
+    let payload = STANDARD
+        .decode(&envelope.payload)
+        .map_err(|error| format!("invalid DSSE payload encoding: {error}"))?;
+    let signature = STANDARD
+        .decode(&envelope.signatures[0].sig)
+        .map_err(|error| format!("invalid DSSE signature encoding: {error}"))?;
+    let pae = pae(&envelope.payload_type, &payload);
+    verify_spki(spki, Scheme::Ed25519, &pae, &signature)
         .map_err(|error| format!("DSSE signature verification failed: {error}"))
 }
 

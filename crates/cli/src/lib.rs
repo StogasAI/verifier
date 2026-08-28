@@ -13,7 +13,7 @@ use std::{
 use tokio::sync::oneshot;
 
 pub use stogas_verifier::{
-    Environment, Error, VerificationOutput, VerifiedBundle, VerifiedNode, Verifier, verify_bundle,
+    Error, VerificationOutput, VerifiedBundle, VerifiedNode, Verifier, verify_bundle,
     verify_bundle_with_policy,
 };
 
@@ -60,8 +60,6 @@ pub struct ServeOptions {
     pub upstream: String,
     /// Loopback listener address.
     pub listen: String,
-    /// Verification trust environment.
-    pub environment: Environment,
     /// Scheduled bundle refresh target.
     pub bundle_refresh_interval: Duration,
     /// Connection protection.
@@ -120,7 +118,6 @@ impl Transport {
             bundle_url: &options.bundle_url,
             upstream: &options.base_url,
             listen: "127.0.0.1:0",
-            environment: Environment::stogas(),
             bundle_refresh_interval: options.bundle_refresh_interval,
             security: options.security,
             browser_origin: None,
@@ -348,7 +345,6 @@ pub async fn serve(options: ServeOptions) -> Result<()> {
         bundle_url: &options.bundle_url,
         upstream: &options.upstream,
         listen: &options.listen,
-        environment: options.environment,
         bundle_refresh_interval: options.bundle_refresh_interval,
         security: options.security,
         browser_origin: options.browser_origin.as_deref(),

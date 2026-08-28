@@ -22,7 +22,7 @@ func TestRejectsMalformedBundle(t *testing.T) {
 	}
 }
 
-func TestRejectsTheSharedPreV2StagingBundle(t *testing.T) {
+func TestRejectsTheSharedLegacyStagingBundle(t *testing.T) {
 	bundle, err := os.ReadFile("../crates/verifier/tests/fixtures/staging-bundle-sequence-1927.json")
 	if err != nil {
 		t.Fatal(err)
@@ -32,7 +32,7 @@ func TestRejectsTheSharedPreV2StagingBundle(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = verifier.Close() })
-	if _, err := verifier.verifyBundleAt(bundle, stagingBundleNowUnixMS); err == nil || !strings.Contains(err.Error(), "catalog_hash") {
+	if _, err := verifier.verifyBundleAt(bundle, stagingBundleNowUnixMS); err == nil || !strings.Contains(err.Error(), "launch_policy") {
 		t.Fatalf("unexpected verification error: %v", err)
 	}
 }

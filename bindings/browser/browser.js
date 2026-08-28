@@ -17,6 +17,7 @@ const STAGING_BUNDLE_FALLBACK_URL = 'https://evidence2-staging.stogas.ai/bundles
 const DEFAULT_REFRESH_SECONDS = 300;
 const MAX_BUNDLE_BYTES = 16 * 1024 * 1024;
 const MAX_E2EE_REQUEST_BYTES = 94 * 1024 * 1024;
+const MAX_BUFFERED_RECEIPT_RESPONSE_BYTES = 128 * 1024 * 1024 + 8 * 1024 + 16;
 const BUNDLE_ORIGIN_TIMEOUT_MS = 5_000;
 const EXPIRY_REFRESH_LEAD_MIN_MS = 40_000;
 const EXPIRY_REFRESH_LEAD_MAX_MS = 70_000;
@@ -110,9 +111,8 @@ export class StogasTransport {
 			throw new TypeError('hardwarePolicy must be a Uint8Array');
 		}
 		this.#hardwarePolicy = options.hardwarePolicy?.slice();
-		const staging = environment === 'staging' ? true : undefined;
-		this.#core = new CoreVerifier(staging);
-		this.#candidateCore = new CoreVerifier(staging);
+		this.#core = new CoreVerifier();
+		this.#candidateCore = new CoreVerifier();
 		this.fetch = this.fetch.bind(this);
 	}
 
@@ -154,9 +154,9 @@ export class StogasTransport {
 		};
 	}
 
-	verifyResponseProof(proof, requestBody, responseBody, e2eeTranscriptSHA256) {
+	verifyResponseProof(requestBody, responseBody, e2eeTranscriptSHA256) {
 		this.#assertOpen();
-		return this.#core.verify_response_proof(proof, requestBody, responseBody, e2eeTranscriptSHA256);
+		return this.#core.verify_response_proof(requestBody, responseBody, e2eeTranscriptSHA256);
 	}
 
 	createResponseProofStream(requestBody) {
@@ -205,17 +205,27 @@ export class StogasTransport {
 		await this.#ensureCurrentBundle();
 
 		const apiKey = bearerAPIKey(request.headers.get('authorization'));
-		const upstream = upstreamCredential(request.headers);
+		const upstream = upstreamCredentials(request.headers);
 		const body = await readBoundedBody(request, MAX_E2EE_REQUEST_BYTES, 'request');
-		const session = this.#core.seal_e2ee_request(
-			url.pathname,
-			apiKey,
-			body,
-			request.headers.get('accept') ?? undefined,
-			extraFieldsEnabled(request.headers),
-			upstream?.provider,
-			upstream?.apiKey
-		);
+		const receipt = receiptEnabled(request.headers);
+		let responseProof = receipt ? this.#core.start_response_proof(body) : undefined;
+		let session;
+		try {
+			session = this.#core.seal_e2ee_request(
+				url.pathname,
+				apiKey,
+				body,
+				request.headers.get('accept') ?? undefined,
+				receipt,
+				upstream?.anthropic,
+				upstream?.chutes,
+				upstream?.openai
+			);
+		} catch (error) {
+			responseProof?.free();
+			throw error;
+		}
+		const transcriptSHA256 = session.transcript_sha256;
 		let response;
 		try {
 			response = await this.#fetchImpl(request.url, {
@@ -223,7 +233,7 @@ export class StogasTransport {
 				credentials: 'omit',
 				headers: {
 					accept: E2EE_CONTENT_TYPE,
-					'content-type': 'application/json'
+					'content-type': E2EE_CONTENT_TYPE
 				},
 				method: 'POST',
 				redirect: 'error',
@@ -231,9 +241,20 @@ export class StogasTransport {
 			});
 		} catch (error) {
 			session.free();
+			responseProof?.free();
 			throw error;
 		}
-		return decryptResponse(response, session);
+		try {
+			const decrypted = await decryptResponse(response, session);
+			const ownedResponseProof = responseProof;
+			responseProof = undefined;
+			return ownedResponseProof
+				? await verifyReceiptResponse(decrypted, ownedResponseProof, transcriptSHA256)
+				: decrypted;
+		} catch (error) {
+			responseProof?.free();
+			throw error;
+		}
 	}
 
 	close() {
@@ -541,35 +562,31 @@ function bearerAPIKey(value) {
 	return match[1];
 }
 
-function extraFieldsEnabled(headers) {
-	const raw = headers.get('x-stogas-extra-fields');
+function receiptEnabled(headers) {
+	const raw = headers.get('stogas-receipt');
 	if (raw === null) return false;
-	const value = raw.trim().toLowerCase();
-	if (value === 'true') return true;
-	if (value === 'false') return false;
-	throw new TypeError('X-Stogas-Extra-Fields must be true or false');
+	if (raw.trim() === 'v1') return true;
+	throw new TypeError('Stogas-Receipt must be v1');
 }
 
-function upstreamCredential(headers) {
-	const apiKey = headers.get('x-stogas-upstream-api-key');
-	const provider = headers.get('x-stogas-upstream-provider');
-	if (apiKey === null) {
-		if (provider !== null) {
-			throw new TypeError('an upstream API key is required with credential metadata');
-		}
-		return undefined;
+function upstreamCredentials(headers) {
+	if (
+		headers.has('x-stogas-upstream-api-key') ||
+		headers.has('x-stogas-upstream-provider')
+	) {
+		throw new TypeError('generic upstream credential headers are unsupported');
 	}
-	if (apiKey.length === 0) throw new TypeError('the upstream API key must not be empty');
-	if (provider === null || provider.trim() === '') {
-		throw new TypeError('X-Stogas-Upstream-Provider is required with a pass-through credential');
-	}
-	if (provider === 'azure') {
-		throw new TypeError('Azure pass-through credentials are not supported');
-	}
-	return {
-		apiKey,
-		provider
+	const present = [
+		'x-stogas-upstream-anthropic-api-key',
+		'x-stogas-upstream-chutes-api-key',
+		'x-stogas-upstream-openai-api-key'
+	].some((header) => headers.has(header));
+	const credentials = {
+		anthropic: headers.get('x-stogas-upstream-anthropic-api-key') ?? undefined,
+		chutes: headers.get('x-stogas-upstream-chutes-api-key') ?? undefined,
+		openai: headers.get('x-stogas-upstream-openai-api-key') ?? undefined
 	};
+	return present ? credentials : undefined;
 }
 
 async function sha256Hex(bytes) {
@@ -620,7 +637,6 @@ async function decryptResponse(response, session) {
 	if (
 		response.status !== 200 ||
 		response.headers.get('content-type') !== E2EE_CONTENT_TYPE ||
-		response.headers.get('x-stogas-e2ee') !== '1' ||
 		!response.body
 	) {
 		await response.body?.cancel().catch(() => {});
@@ -702,5 +718,85 @@ async function decryptResponse(response, session) {
 	return new Response(body, {
 		headers,
 		status: metadata.status
+	});
+}
+
+async function verifyReceiptResponse(response, proof, transcriptSHA256) {
+	if (!response.ok) {
+		proof.free();
+		return response;
+	}
+	const contentType = response.headers.get('content-type')?.split(';', 1)[0]?.trim().toLowerCase();
+	if (contentType === 'text/event-stream') {
+		if (!response.body) {
+			proof.free();
+			throw new Error('signed streaming response body is unavailable');
+		}
+		const headers = new Headers(response.headers);
+		headers.delete('content-length');
+		return new Response(verifiedSSEBody(response.body, proof, transcriptSHA256), {
+			headers,
+			status: response.status
+		});
+	}
+	if (contentType !== 'application/json') {
+		await response.body?.cancel().catch(() => {});
+		proof.free();
+		throw new Error('signed response has an unsupported content type');
+	}
+	try {
+		const bytes = await readBoundedBody(
+			response,
+			MAX_BUFFERED_RECEIPT_RESPONSE_BYTES,
+			'signed response',
+			true
+		);
+		proof.finish_buffered(bytes, transcriptSHA256);
+		const headers = new Headers(response.headers);
+		headers.set('content-length', String(bytes.byteLength));
+		return new Response(bytes, { headers, status: response.status });
+	} finally {
+		proof.free();
+	}
+}
+
+function verifiedSSEBody(body, proof, transcriptSHA256) {
+	const reader = body.getReader();
+	const pending = [];
+	let finished = false;
+	const closeProof = () => {
+		if (proof) {
+			proof.free();
+			proof = undefined;
+		}
+	};
+	return new ReadableStream({
+		async pull(controller) {
+			try {
+				while (pending.length === 0) {
+					if (finished) {
+						closeProof();
+						controller.close();
+						return;
+					}
+					const next = await reader.read();
+					if (next.done) {
+						pending.push(...proof.finish_sse(transcriptSHA256));
+						finished = true;
+						continue;
+					}
+					pending.push(...proof.push_sse(next.value));
+				}
+				controller.enqueue(pending.shift());
+			} catch (error) {
+				closeProof();
+				await reader.cancel(error).catch(() => {});
+				controller.error(error);
+			}
+		},
+		async cancel(reason) {
+			closeProof();
+			await reader.cancel(reason).catch(() => {});
+		}
 	});
 }

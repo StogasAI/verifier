@@ -4,15 +4,13 @@ use pyo3::{exceptions::PyValueError, prelude::*, types::PyBytes};
 use std::time::{SystemTime, UNIX_EPOCH};
 use stogas_sdk::{SecurityMode, Transport as ManagedTransport, TransportOptions};
 use stogas_verifier::{
-    Environment, HistoricalResponseProofInput, Verifier as CoreVerifier,
-    verify_bundle as verify_core_bundle,
+    HistoricalResponseProofInput, Verifier as CoreVerifier, verify_bundle as verify_core_bundle,
     verify_bundle_with_policy as verify_core_bundle_with_policy,
 };
 
 #[pyclass(name = "Verifier")]
 struct PythonVerifier {
     core: CoreVerifier,
-    environment: Environment,
 }
 
 #[pyclass(name = "Transport")]
@@ -84,7 +82,6 @@ impl PythonVerifier {
     fn new() -> Self {
         Self {
             core: CoreVerifier::default(),
-            environment: Environment::stogas(),
         }
     }
 
@@ -104,16 +101,15 @@ impl PythonVerifier {
     ) -> PyResult<Bound<'py, PyBytes>> {
         let output = self
             .core
-            .verify_bundle_with_policy(bundle, policy, wall_clock_ms()?, &self.environment)
+            .verify_bundle_with_policy(bundle, policy, wall_clock_ms()?)
             .map_err(|error| PyValueError::new_err(error.to_string()))?;
         json_bytes(py, &output)
     }
 
-    #[pyo3(signature = (proof, request_body, response_body, e2ee_transcript_sha256=None))]
+    #[pyo3(signature = (request_body, response_body, e2ee_transcript_sha256=None))]
     fn verify_response_proof<'py>(
         &self,
         py: Python<'py>,
-        proof: &[u8],
         request_body: &[u8],
         response_body: &[u8],
         e2ee_transcript_sha256: Option<&str>,
@@ -121,7 +117,6 @@ impl PythonVerifier {
         let output = self
             .core
             .verify_response_proof(
-                proof,
                 request_body,
                 response_body,
                 e2ee_transcript_sha256,
@@ -131,12 +126,11 @@ impl PythonVerifier {
         json_bytes(py, &output)
     }
 
-    #[pyo3(signature = (proof, request_body, response_body, ledger, catalog, e2ee_transcript_sha256=None))]
+    #[pyo3(signature = (request_body, response_body, ledger, catalog, e2ee_transcript_sha256=None))]
     #[allow(clippy::too_many_arguments)]
     fn verify_historical_response_proof<'py>(
         &self,
         py: Python<'py>,
-        proof: &[u8],
         request_body: &[u8],
         response_body: &[u8],
         ledger: &[u8],
@@ -146,14 +140,12 @@ impl PythonVerifier {
         let output = self
             .core
             .verify_historical_response_proof(&HistoricalResponseProofInput {
-                proof_bytes: proof,
                 request_body,
                 response_body,
                 expected_e2ee_transcript_sha256: e2ee_transcript_sha256,
                 now_unix_ms: wall_clock_ms()?,
                 ledger_bytes: ledger,
                 catalog_approval_bytes: catalog,
-                environment: &self.environment,
             })
             .map_err(|error| PyValueError::new_err(error.to_string()))?;
         json_bytes(py, &output)
@@ -169,7 +161,7 @@ impl PythonVerifier {
     ) -> PyResult<Bound<'py, PyBytes>> {
         let output = self
             .core
-            .verify_bundle(bundle, now_unix_ms, &self.environment)
+            .verify_bundle(bundle, now_unix_ms)
             .map_err(|error| PyValueError::new_err(error.to_string()))?;
         json_bytes(py, &output)
     }
@@ -186,9 +178,8 @@ fn verify_bundle_with_policy<'py>(
     bundle: &[u8],
     policy: &[u8],
 ) -> PyResult<Bound<'py, PyBytes>> {
-    let output =
-        verify_core_bundle_with_policy(bundle, policy, wall_clock_ms()?, &Environment::stogas())
-            .map_err(|error| PyValueError::new_err(error.to_string()))?;
+    let output = verify_core_bundle_with_policy(bundle, policy, wall_clock_ms()?)
+        .map_err(|error| PyValueError::new_err(error.to_string()))?;
     json_bytes(py, &output)
 }
 
@@ -207,7 +198,7 @@ fn verify_bundle_with_time<'py>(
     bundle: &[u8],
     now_unix_ms: i64,
 ) -> PyResult<Bound<'py, PyBytes>> {
-    let output = verify_core_bundle(bundle, now_unix_ms, &Environment::stogas())
+    let output = verify_core_bundle(bundle, now_unix_ms)
         .map_err(|error| PyValueError::new_err(error.to_string()))?;
     json_bytes(py, &output)
 }

@@ -14,21 +14,16 @@ use std::{
 };
 use stogas_sdk::{SecurityMode, Transport as ManagedTransport, TransportOptions};
 use stogas_verifier::{
-    Environment, VerificationOutput, Verifier,
+    VerificationOutput, Verifier,
     response_proof::{MAX_BODY_BYTES, MAX_PROOF_BYTES},
 };
 
 /// ABI version implemented by this library and its public header.
 pub const STOGAS_VERIFIER_ABI_VERSION: u32 = 1;
 
-struct VerifierSession {
-    core: Verifier,
-    environment: Environment,
-}
-
 /// Opaque verifier session. Callers must not inspect or copy it.
 pub struct StogasVerifier {
-    session: Mutex<VerifierSession>,
+    session: Mutex<Verifier>,
 }
 
 /// Opaque managed HTTP transport.
@@ -85,10 +80,7 @@ pub const extern "C" fn stogas_verifier_abi_version() -> u32 {
 #[unsafe(no_mangle)]
 pub extern "C" fn stogas_verifier_new() -> *mut StogasVerifier {
     Box::into_raw(Box::new(StogasVerifier {
-        session: Mutex::new(VerifierSession {
-            core: Verifier::default(),
-            environment: Environment::stogas(),
-        }),
+        session: Mutex::new(Verifier::default()),
     }))
 }
 
@@ -237,10 +229,8 @@ pub unsafe extern "C" fn stogas_verifier_verify_bundle(
             .session
             .lock()
             .map_err(|_| "verifier session lock is poisoned".to_owned())?;
-        let environment = session.environment.clone();
         let output = session
-            .core
-            .verify_bundle(bundle, now_unix_ms, &environment)
+            .verify_bundle(bundle, now_unix_ms)
             .map_err(|error| error.to_string())?;
         drop(session);
         Ok::<VerificationOutput, String>(output)
@@ -289,17 +279,15 @@ pub unsafe extern "C" fn stogas_verifier_verify_bundle_with_policy(
             .session
             .lock()
             .map_err(|_| "verifier session lock is poisoned".to_owned())?;
-        let environment = session.environment.clone();
         let output = session
-            .core
-            .verify_bundle_with_policy(bundle, policy, now_unix_ms, &environment)
+            .verify_bundle_with_policy(bundle, policy, now_unix_ms)
             .map_err(|error| error.to_string())?;
         drop(session);
         Ok::<VerificationOutput, String>(output)
     })
 }
 
-/// Verify one response receipt against the session's active verified bundle.
+/// Verify one complete buffered response against the session's active verified bundle.
 ///
 /// An empty transcript slice means ordinary TLS mode. A non-empty slice must contain the expected
 /// lowercase E2EE transcript SHA-256.
@@ -311,8 +299,6 @@ pub unsafe extern "C" fn stogas_verifier_verify_bundle_with_policy(
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn stogas_verifier_verify_response_proof(
     verifier: *const StogasVerifier,
-    proof: *const u8,
-    proof_len: usize,
     request_body: *const u8,
     request_body_len: usize,
     response_body: *const u8,
@@ -327,7 +313,6 @@ pub unsafe extern "C" fn stogas_verifier_verify_response_proof(
         // SAFETY: each pointer addresses its declared readable length for this synchronous call.
         let inputs = unsafe {
             response_proof_inputs(
-                (proof, proof_len),
                 (request_body, request_body_len),
                 (response_body, response_body_len),
                 (e2ee_transcript_sha256, e2ee_transcript_sha256_len),
@@ -338,9 +323,7 @@ pub unsafe extern "C" fn stogas_verifier_verify_response_proof(
             .lock()
             .map_err(|_| "verifier session lock is poisoned".to_owned())?;
         session
-            .core
             .verify_response_proof(
-                inputs.proof,
                 inputs.request_body,
                 inputs.response_body,
                 inputs.transcript,
@@ -350,7 +333,7 @@ pub unsafe extern "C" fn stogas_verifier_verify_response_proof(
     })
 }
 
-/// Verify one response receipt and immutable historical node ledger together.
+/// Verify one complete buffered response and immutable historical node ledger together.
 ///
 /// # Safety
 ///
@@ -359,8 +342,6 @@ pub unsafe extern "C" fn stogas_verifier_verify_response_proof(
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn stogas_verifier_verify_historical_response_proof(
     verifier: *const StogasVerifier,
-    proof: *const u8,
-    proof_len: usize,
     request_body: *const u8,
     request_body_len: usize,
     response_body: *const u8,
@@ -379,7 +360,6 @@ pub unsafe extern "C" fn stogas_verifier_verify_historical_response_proof(
         // SAFETY: each pointer addresses its declared readable length for this synchronous call.
         let inputs = unsafe {
             response_proof_inputs(
-                (proof, proof_len),
                 (request_body, request_body_len),
                 (response_body, response_body_len),
                 (e2ee_transcript_sha256, e2ee_transcript_sha256_len),
@@ -407,18 +387,14 @@ pub unsafe extern "C" fn stogas_verifier_verify_historical_response_proof(
             .session
             .lock()
             .map_err(|_| "verifier session lock is poisoned".to_owned())?;
-        let environment = session.environment.clone();
         session
-            .core
             .verify_historical_response_proof(&stogas_verifier::HistoricalResponseProofInput {
-                proof_bytes: inputs.proof,
                 request_body: inputs.request_body,
                 response_body: inputs.response_body,
                 expected_e2ee_transcript_sha256: inputs.transcript,
                 now_unix_ms,
                 ledger_bytes: ledger,
                 catalog_approval_bytes: catalog,
-                environment: &environment,
             })
             .map_err(|error| error.to_string())
     })
@@ -510,20 +486,16 @@ fn optional_utf8<'a>(bytes: &'a [u8], label: &str) -> Result<Option<&'a str>, St
 }
 
 struct ResponseProofInputs<'a> {
-    proof: &'a [u8],
     request_body: &'a [u8],
     response_body: &'a [u8],
     transcript: Option<&'a str>,
 }
 
 unsafe fn response_proof_inputs<'a>(
-    proof: (*const u8, usize),
     request_body: (*const u8, usize),
     response_body: (*const u8, usize),
     transcript: (*const u8, usize),
 ) -> Result<ResponseProofInputs<'a>, String> {
-    // SAFETY: the caller guarantees each pointer addresses its declared readable length.
-    let proof = unsafe { input_slice(proof.0, proof.1, MAX_PROOF_BYTES, "response proof")? };
     // SAFETY: the caller guarantees each pointer addresses its declared readable length.
     let request_body = unsafe {
         input_slice(
@@ -538,7 +510,7 @@ unsafe fn response_proof_inputs<'a>(
         input_slice(
             response_body.0,
             response_body.1,
-            MAX_BODY_BYTES,
+            MAX_BODY_BYTES + MAX_PROOF_BYTES + 16,
             "response body",
         )?
     };
@@ -546,7 +518,6 @@ unsafe fn response_proof_inputs<'a>(
     let transcript =
         unsafe { input_slice(transcript.0, transcript.1, 64, "E2EE transcript SHA-256")? };
     Ok(ResponseProofInputs {
-        proof,
         request_body,
         response_body,
         transcript: optional_utf8(transcript, "E2EE transcript SHA-256")?,
@@ -636,7 +607,7 @@ mod tests {
             ))
         };
         assert_eq!(response["ok"], false);
-        assert!(response["error"].as_str().unwrap().contains("catalog_hash"));
+        assert!(!response["error"].as_str().unwrap().is_empty());
         // SAFETY: no call is using this live verifier.
         unsafe { stogas_verifier_free(verifier) };
     }

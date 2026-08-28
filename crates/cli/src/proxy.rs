@@ -7,7 +7,7 @@ use axum::{
     response::Response,
     routing::any,
 };
-use futures_util::StreamExt as _;
+use futures_util::{Stream, StreamExt as _, stream};
 use rand::Rng as _;
 use rustls::{
     CertificateError, ClientConfig, DigitallySignedStruct, Error as RustlsError, RootCertStore,
@@ -17,15 +17,17 @@ use rustls::{
 };
 use sha2::{Digest as _, Sha256};
 use std::{
-    collections::HashMap,
-    fmt,
+    collections::{HashMap, VecDeque},
+    fmt, io,
     net::SocketAddr,
+    pin::Pin,
     sync::{Arc, mpsc::SyncSender},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use stogas_verifier::{
-    Environment, VerificationOutput, VerifiedNode, Verifier,
-    e2ee::{Recipient, recipients_from_verified_bundle},
+    VerificationOutput, VerifiedNode, Verifier,
+    e2ee::{MAX_CIPHERTEXT_BYTES, Recipient, recipients_from_verified_bundle},
+    response_proof::{MAX_BODY_BYTES, MAX_PROOF_BYTES, ResponseProofSseStream},
 };
 use tokio::sync::{Mutex, RwLock, oneshot};
 use url::Url;
@@ -33,7 +35,6 @@ use url::Url;
 use crate::{SecurityMode, e2ee};
 
 const MAX_BUNDLE_BYTES: usize = 16 * 1024 * 1024;
-const MAX_REQUEST_BYTES: usize = 16 * 1024 * 1024;
 const BUNDLE_ORIGIN_TIMEOUT_SECONDS: u64 = 5;
 const MIN_REFRESH_RETRY_SECONDS: u64 = 4;
 const MAX_REFRESH_RETRY_SECONDS: u64 = 8;
@@ -46,6 +47,8 @@ const PRODUCTION_BUNDLE_FALLBACK_URL: &str = "https://evidence2.stogas.ai/bundle
 const STAGING_BUNDLE_URL: &str = "https://evidence-staging.stogas.ai/bundles/latest.json";
 const STAGING_BUNDLE_FALLBACK_URL: &str = "https://evidence2-staging.stogas.ai/bundles/latest.json";
 const VERIFIED_TLS_CONNECTION_ERROR: &str = "Verified TLS connection failed. TLS mode requires TLS 1.3 with X25519MLKEM768 and a certificate in the active verified bundle. Select E2EE mode if hybrid TLS is unavailable.";
+const RECEIPT_HEADER: &str = "stogas-receipt";
+const E2EE_TRANSCRIPT_HEADER: &str = "x-stogas-e2ee-transcript-sha256";
 
 pub struct ServeConfig {
     bundle_urls: Vec<Url>,
@@ -55,7 +58,6 @@ pub struct ServeConfig {
     listen: SocketAddr,
     expected_host: String,
     control_capability: String,
-    environment: Environment,
     bundle_refresh_interval: Duration,
     security: SecurityMode,
     browser: Option<BrowserAccess>,
@@ -67,7 +69,6 @@ pub struct ServeConfigInput<'a> {
     pub bundle_url: &'a str,
     pub upstream: &'a str,
     pub listen: &'a str,
-    pub environment: Environment,
     pub bundle_refresh_interval: Duration,
     pub security: SecurityMode,
     pub browser_origin: Option<&'a str>,
@@ -117,7 +118,6 @@ impl ServeConfig {
             listen,
             expected_host: listen.to_string(),
             control_capability: random_capability(),
-            environment: input.environment,
             bundle_refresh_interval: input.bundle_refresh_interval,
             security: input.security,
             browser,
@@ -732,10 +732,8 @@ fn activate_bundle(
     verifier: &mut Verifier,
 ) -> Result<ActiveBundle> {
     let output = match config.hardware_policy.as_deref() {
-        Some(policy) => {
-            verifier.verify_bundle_with_policy(bytes, policy, now_unix_ms, &config.environment)?
-        }
-        None => verifier.verify_bundle(bytes, now_unix_ms, &config.environment)?,
+        Some(policy) => verifier.verify_bundle_with_policy(bytes, policy, now_unix_ms)?,
+        None => verifier.verify_bundle(bytes, now_unix_ms)?,
     };
     let (client, recipients) = if output.bundle.nodes.is_empty() {
         (None, None)
@@ -844,23 +842,20 @@ async fn proxy_request_inner(
     if !upstream_path.starts_with("/v1/") {
         return Err((StatusCode::NOT_FOUND, "only /v1/* is available"));
     }
-    let active = state.active.read().await.clone();
-    let now_unix_ms = wall_clock_ms();
-    if now_unix_ms >= active.output.bundle.expires_at_unix_ms {
-        return Err((StatusCode::SERVICE_UNAVAILABLE, "verified bundle expired"));
-    }
-    if active.output.bundle.nodes.is_empty() {
-        return Err((
-            StatusCode::SERVICE_UNAVAILABLE,
-            "verified fleet is unavailable",
-        ));
-    }
+    current_request_bundle(state).await?;
 
     let (parts, body) = request.into_parts();
-    let body = to_bytes(body, MAX_REQUEST_BYTES)
+    let body = to_bytes(body, MAX_CIPHERTEXT_BYTES)
         .await
         .map_err(|_| (StatusCode::PAYLOAD_TOO_LARGE, "request body is too large"))?;
-    if state.config.security != SecurityMode::Tls && is_inference_path(&upstream_path) {
+    let (active, now_unix_ms) = current_request_bundle(state).await?;
+    let inference = is_inference_path(&upstream_path);
+    let receipt = if inference {
+        receipt_requested(&parts.headers)?
+    } else {
+        false
+    };
+    if state.config.security != SecurityMode::Tls && inference {
         let client = if state.config.security == SecurityMode::Both {
             active.client.as_ref().ok_or((
                 StatusCode::SERVICE_UNAVAILABLE,
@@ -873,17 +868,19 @@ async fn proxy_request_inner(
             StatusCode::SERVICE_UNAVAILABLE,
             "verified fleet is unavailable",
         ))?;
-        return e2ee::send(e2ee::RequestContext {
+        let response = e2ee::send(e2ee::RequestContext {
             client,
             upstream_origin: &state.config.upstream,
             path: &upstream_path,
             parts: &parts,
-            body,
+            body: body.clone(),
             bundle_sha256: &active.bundle_sha256,
             recipients,
             now_unix_ms,
+            receipt,
         })
-        .await;
+        .await?;
+        return verify_receipt_response(response, &body, active, receipt, now_unix_ms, true).await;
     }
 
     let client = if state.config.security == SecurityMode::E2ee {
@@ -895,15 +892,218 @@ async fn proxy_request_inner(
         ))?
     };
     if state.config.security == SecurityMode::E2ee {
-        return send_upstream(client, &state.config.upstream, &parts, &upstream_path, body)
-            .await
-            .map_err(|error| upstream_request_error(&error, false));
+        let response = send_upstream(
+            client,
+            &state.config.upstream,
+            &parts,
+            &upstream_path,
+            body.clone(),
+        )
+        .await
+        .map_err(|error| upstream_request_error(&error, false))?;
+        return verify_receipt_response(response, &body, active, receipt, now_unix_ms, false).await;
     }
-    send_upstream_with_pin_refresh(state, &active, &parts, &upstream_path, body).await
+    let (response, response_bundle, response_request_started_at_unix_ms) =
+        send_upstream_with_pin_refresh(
+            state,
+            &active,
+            &parts,
+            &upstream_path,
+            body.clone(),
+            now_unix_ms,
+        )
+        .await?;
+    verify_receipt_response(
+        response,
+        &body,
+        response_bundle,
+        receipt,
+        response_request_started_at_unix_ms,
+        false,
+    )
+    .await
 }
 
 fn is_inference_path(path: &str) -> bool {
     matches!(path, "/v1/chat/completions" | "/v1/responses")
+}
+
+async fn current_request_bundle(
+    state: &ProxyState,
+) -> Result<(Arc<ActiveBundle>, i64), (StatusCode, &'static str)> {
+    let active = state.active.read().await.clone();
+    let now_unix_ms = wall_clock_ms();
+    if now_unix_ms >= active.output.bundle.expires_at_unix_ms {
+        return Err((StatusCode::SERVICE_UNAVAILABLE, "verified bundle expired"));
+    }
+    if active.output.bundle.nodes.is_empty() {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "verified fleet is unavailable",
+        ));
+    }
+    Ok((active, now_unix_ms))
+}
+
+fn receipt_requested(headers: &axum::http::HeaderMap) -> Result<bool, (StatusCode, &'static str)> {
+    let values = headers.get_all(RECEIPT_HEADER);
+    if values.iter().count() > 1 {
+        return Err((StatusCode::BAD_REQUEST, "Stogas-Receipt must be v1"));
+    }
+    match values.iter().next() {
+        None => Ok(false),
+        Some(value) if value.to_str().is_ok_and(|value| value.trim() == "v1") => Ok(true),
+        Some(_) => Err((StatusCode::BAD_REQUEST, "Stogas-Receipt must be v1")),
+    }
+}
+
+async fn verify_receipt_response(
+    response: Response<Body>,
+    request_body: &[u8],
+    active: Arc<ActiveBundle>,
+    requested: bool,
+    request_started_at_unix_ms: i64,
+    encrypted: bool,
+) -> Result<Response<Body>, (StatusCode, &'static str)> {
+    if !requested || !response.status().is_success() {
+        return Ok(response);
+    }
+    let transcript = if encrypted {
+        Some(
+            response
+                .headers()
+                .get(E2EE_TRANSCRIPT_HEADER)
+                .and_then(|value| value.to_str().ok())
+                .ok_or((
+                    StatusCode::BAD_GATEWAY,
+                    "encrypted response receipt context is unavailable",
+                ))?
+                .to_owned(),
+        )
+    } else {
+        None
+    };
+    let content_type = response
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(';').next())
+        .map(str::trim);
+    if content_type.is_some_and(|value| value.eq_ignore_ascii_case("text/event-stream")) {
+        let (mut parts, body) = response.into_parts();
+        parts.headers.remove(header::CONTENT_LENGTH);
+        let state = ReceiptBodyState {
+            active,
+            finished: false,
+            pending: VecDeque::new(),
+            request_started_at_unix_ms,
+            transcript,
+            upstream: body.into_data_stream().boxed(),
+            verifier: Some(ResponseProofSseStream::new(request_body)),
+        };
+        return Ok(Response::from_parts(
+            parts,
+            Body::from_stream(verified_receipt_body(state)),
+        ));
+    }
+    if !content_type.is_some_and(|value| value.eq_ignore_ascii_case("application/json")) {
+        return Err((
+            StatusCode::BAD_GATEWAY,
+            "signed response has an unsupported content type",
+        ));
+    }
+    let (mut parts, body) = response.into_parts();
+    let limit = MAX_BODY_BYTES
+        .saturating_add(MAX_PROOF_BYTES)
+        .saturating_add(16);
+    let bytes = to_bytes(body, limit).await.map_err(|_| {
+        (
+            StatusCode::BAD_GATEWAY,
+            "signed buffered response is invalid or too large",
+        )
+    })?;
+    stogas_verifier::response_proof::verify_with_bundle(
+        request_body,
+        &bytes,
+        transcript.as_deref(),
+        request_started_at_unix_ms,
+        &active.output,
+    )
+    .map_err(|_| {
+        (
+            StatusCode::BAD_GATEWAY,
+            "response receipt verification failed",
+        )
+    })?;
+    parts.headers.insert(
+        header::CONTENT_LENGTH,
+        HeaderValue::from_str(&bytes.len().to_string()).map_err(|_| {
+            (
+                StatusCode::BAD_GATEWAY,
+                "signed buffered response is invalid or too large",
+            )
+        })?,
+    );
+    Ok(Response::from_parts(parts, Body::from(bytes)))
+}
+
+type ReceiptUpstream = Pin<Box<dyn Stream<Item = Result<Bytes, axum::Error>> + Send + 'static>>;
+
+struct ReceiptBodyState {
+    active: Arc<ActiveBundle>,
+    finished: bool,
+    pending: VecDeque<Bytes>,
+    request_started_at_unix_ms: i64,
+    transcript: Option<String>,
+    upstream: ReceiptUpstream,
+    verifier: Option<ResponseProofSseStream>,
+}
+
+fn verified_receipt_body(
+    state: ReceiptBodyState,
+) -> impl Stream<Item = Result<Bytes, io::Error>> + Send + 'static {
+    stream::try_unfold(state, |mut state| async move {
+        loop {
+            if let Some(bytes) = state.pending.pop_front() {
+                return Ok(Some((bytes, state)));
+            }
+            if state.finished {
+                return Ok(None);
+            }
+            match state.upstream.next().await {
+                Some(Ok(chunk)) => {
+                    let verifier = state.verifier.as_mut().ok_or_else(|| {
+                        io::Error::other("response receipt stream is already finished")
+                    })?;
+                    state.pending.extend(
+                        verifier
+                            .push(&chunk)
+                            .map_err(|error| io::Error::other(error.to_string()))?
+                            .into_iter()
+                            .map(Bytes::from),
+                    );
+                }
+                Some(Err(error)) => return Err(io::Error::other(error)),
+                None => {
+                    let verifier = state.verifier.take().ok_or_else(|| {
+                        io::Error::other("response receipt stream is already finished")
+                    })?;
+                    state.pending.extend(
+                        verifier
+                            .finish(
+                                state.transcript.as_deref(),
+                                state.request_started_at_unix_ms,
+                                &state.active.output,
+                            )
+                            .map_err(|error| io::Error::other(error.to_string()))?
+                            .into_iter()
+                            .map(Bytes::from),
+                    );
+                    state.finished = true;
+                }
+            }
+        }
+    })
 }
 
 fn routed_path<'a>(
@@ -1043,11 +1243,12 @@ async fn send_upstream(
 
 async fn send_upstream_with_pin_refresh(
     state: &ProxyState,
-    active: &ActiveBundle,
+    active: &Arc<ActiveBundle>,
     parts: &axum::http::request::Parts,
     upstream_path: &str,
     body: Bytes,
-) -> Result<Response<Body>, (StatusCode, &'static str)> {
+    request_started_at_unix_ms: i64,
+) -> Result<(Response<Body>, Arc<ActiveBundle>, i64), (StatusCode, &'static str)> {
     let client = active.client.as_ref().ok_or((
         StatusCode::SERVICE_UNAVAILABLE,
         "verified fleet is unavailable",
@@ -1061,7 +1262,9 @@ async fn send_upstream_with_pin_refresh(
     )
     .await;
     let error = match first {
-        Ok(response) => return Ok(response),
+        Ok(response) => {
+            return Ok((response, Arc::clone(active), request_started_at_unix_ms));
+        }
         Err(error) if attested_pin_mismatch(&error) => error,
         Err(error) => return Err(upstream_request_error(&error, true)),
     };
@@ -1090,9 +1293,10 @@ async fn send_upstream_with_pin_refresh(
         StatusCode::SERVICE_UNAVAILABLE,
         "verified fleet is unavailable",
     ))?;
-    send_upstream(client, &state.config.upstream, parts, upstream_path, body)
+    let response = send_upstream(client, &state.config.upstream, parts, upstream_path, body)
         .await
-        .map_err(|retry_error| upstream_request_error(&retry_error, true))
+        .map_err(|retry_error| upstream_request_error(&retry_error, true))?;
+    Ok((response, refreshed, now_unix_ms))
 }
 
 fn attested_pin_mismatch(error: &reqwest::Error) -> bool {
@@ -1344,7 +1548,8 @@ mod tests {
     use rcgen::{BasicConstraints, CertificateParams, CertifiedIssuer, IsCa, KeyPair};
     use rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
     use stogas_verifier::{
-        AllowedCatalog, DrandBeacon, ReleaseProvenance, ReportData, VerifiedCatalogRelease,
+        AllowedCatalog, AllowedIgvm, DrandBeacon, ReleaseProvenance, ReportData,
+        VerifiedCatalogRelease, VerifiedRelease,
     };
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
     use tokio::sync::oneshot;
@@ -1382,14 +1587,8 @@ mod tests {
                 node_id: "node".into(),
                 quote: "verified-quote".into(),
                 quote_verified_at_unix_ms: 0,
-                region: "test".into(),
                 report_data: ReportData {
-                    active_cert_sha256: cert_hash.clone(),
                     accepted_cert_sha256: vec![cert_hash],
-                    catalog: stogas_verifier::CatalogIdentity {
-                        digest: format!("sha256:{}", "22".repeat(32)),
-                        sequence: 1,
-                    },
                     drand: DrandBeacon {
                         chain_hash: String::new(),
                         network: String::new(),
@@ -1409,16 +1608,99 @@ mod tests {
         }
     }
 
-    fn test_output(expires_at_unix_ms: i64) -> VerificationOutput {
-        let mut node = test_certificate().node;
-        node.report_data.hpke_public_key =
-            URL_SAFE_NO_PAD.encode(XWing::gen_keypair().1.to_bytes());
-        let catalog_evidence: AllowedCatalog = serde_json::from_value(serde_json::json!({
+    fn test_release_evidence(measurement: &str) -> AllowedIgvm {
+        serde_json::from_value(serde_json::json!({
+            "github_in_toto": [{}],
+            "release_manifest": {
+                "artifacts": {
+                    "gateway.igvm": {"sha256": "bb".repeat(32), "sizeBytes": 1},
+                    "snp-launch-policies.json": {"sha256": "cc".repeat(32), "sizeBytes": 1}
+                },
+                "build": {
+                    "cmdlineSha256": "01".repeat(32),
+                    "coreGoModSha256": "02".repeat(32),
+                    "coreGoSumSha256": "03".repeat(32),
+                    "environment": {
+                        "lcAll": "C",
+                        "sourceDateEpoch": "1",
+                        "tz": "UTC",
+                        "umask": "022"
+                    },
+                    "goModSha256": "04".repeat(32),
+                    "goSumSha256": "05".repeat(32),
+                    "goVendorTreeSha256": "06".repeat(32),
+                    "goVersion": "go1.25.0",
+                    "guestCaBundlePath": "/etc/ssl/certs/ca-certificates.crt",
+                    "guestCaBundleSha256": "07".repeat(32),
+                    "guixChannelCommit": "08".repeat(20),
+                    "inputSha256": {
+                        "source": "09".repeat(32),
+                        "stogas/release/snp-launch-policies.json": "cc".repeat(32)
+                    },
+                    "kernelConfigSha256": "0a".repeat(32),
+                    "kernelVersion": "6.12.0",
+                    "linuxBzImageSha256": "0b".repeat(32),
+                    "osReleaseSha256": "0c".repeat(32),
+                    "ovmfSha256": "0d".repeat(32),
+                    "pinsLockSha256": "0e".repeat(32),
+                    "systemdStubSha256": "0f".repeat(32),
+                    "ukiSha256": "10".repeat(32)
+                },
+                "git": {
+                    "commit": "11".repeat(20),
+                    "ref": "refs/tags/v0.0.1",
+                    "repository": "https://github.com/StogasAI/gateway",
+                    "tag": "v0.0.1",
+                    "tree": "12".repeat(20)
+                },
+                "schema": "stogas.gateway.release.v1",
+                "sequence": 1,
+                "sevSnp": {
+                    "checkKvm": true,
+                    "launchMeasurement": measurement,
+                    "launchPolicies": {
+                        "policies": [{
+                            "chip_ids": ["22".repeat(64)],
+                            "launch": {
+                                "author_key_digest": "00".repeat(48),
+                                "family_id": "00".repeat(16),
+                                "host_data": "00".repeat(32),
+                                "id_key_digest": "00".repeat(48),
+                                "image_id": "00".repeat(16),
+                                "policy": "0x00030000",
+                                "vmpl": 0
+                            }
+                        }],
+                        "schema": "stogas.snp-launch-policies.v1"
+                    },
+                    "measurementCommand": "igvmmeasure gateway.igvm measure",
+                    "measurementTool": "igvmmeasure",
+                    "measurementToolSha256": "13".repeat(32),
+                    "measurementToolVersion": "0.3.1",
+                    "platform": "SEV_SNP",
+                    "vcpuCount": 4,
+                    "vmm": "qemu-kvm"
+                }
+            },
+            "stogas_signature": {
+                "algorithm": "Ed25519",
+                "key_id": "test-release",
+                "schema": "stogas.gateway.counterbuild-signature.v1",
+                "signature": "test",
+                "signed": "release-manifest.json"
+            }
+        }))
+        .unwrap()
+    }
+
+    fn test_catalog_evidence() -> AllowedCatalog {
+        serde_json::from_value(serde_json::json!({
             "github_in_toto": [{}],
             "signed_release": {
                 "keyId": "test",
                 "manifest": {
                     "catalogSchema": 1,
+                    "minimumGatewaySequence": 1,
                     "public": format!("sha256:{}", "11".repeat(32)),
                     "runtime": format!("sha256:{}", "22".repeat(32)),
                     "schema": "stogas.catalog.release.v1",
@@ -1434,43 +1716,61 @@ mod tests {
                 "signature": "test"
             }
         }))
-        .unwrap();
+        .unwrap()
+    }
+
+    fn test_output(expires_at_unix_ms: i64) -> VerificationOutput {
+        let mut node = test_certificate().node;
+        node.report_data.hpke_public_key =
+            URL_SAFE_NO_PAD.encode(XWing::gen_keypair().1.to_bytes());
+        let catalog_evidence = test_catalog_evidence();
+        let release_evidence = test_release_evidence(&node.release_measurement);
+        let verified_release = VerifiedRelease {
+            evidence: release_evidence.clone(),
+            github_integrated_time_unix_ms: Some(0),
+            igvm_sha256: "bb".repeat(32),
+            launch_policies: release_evidence
+                .release_manifest
+                .sev_snp
+                .launch_policies
+                .clone(),
+            measurement: node.release_measurement.clone(),
+            provenance: ReleaseProvenance::Github,
+            release_manifest_sha256: "dd".repeat(32),
+            release_tag: "v0.0.1".into(),
+            sequence: 1,
+            source_commit: "11".repeat(20),
+            source_repository: "https://github.com/StogasAI/gateway".into(),
+            source_tree: "12".repeat(20),
+            stogas_signing_key_id: "test-release".into(),
+            vcpu_count: 4,
+        };
         let original = serde_json::from_value(serde_json::json!({
             "body": {
-                "allowed_catalogs": [catalog_evidence],
-                "allowed_igvms": [],
+                "catalogs": [catalog_evidence],
+                "allowed_igvms": [release_evidence],
                 "created_at": "2026-07-23T16:00:00.000Z",
                 "expires_at": "2026-07-23T16:15:00.000Z",
-                "hardware_policies": [{
+                "hardware_policy": {
                     "policy": {
-                        "amd_sev_snp": {
+                        "policies": [{
+                            "chip_ids": ["22".repeat(64)],
                             "cpuid_family": 25,
                             "cpuid_model": 1,
                             "cpuid_stepping": 1,
                             "forbidden_platform_info_mask": "0x0000000000000001",
                             "minimum_tcb": {"bootloader": 4, "microcode": 222, "snp": 29, "tee": 0},
-                            "product": "Milan",
-                            "report_version": 5,
                             "required_current_mitigation_mask": "0x000000000000000b",
                             "required_launch_mitigation_mask": "0x000000000000000b",
                             "required_platform_info_mask": "0x0000000000000024"
-                        },
-                        "chip_id": "22".repeat(64),
-                        "schema": "stogas.hardware-policy.v1",
-                        "sequence": 2
+                        }],
+                        "schema": "stogas.hardware-policies.v1"
                     },
-                    "stogas_signature": {
-                        "algorithm": "Ed25519",
-                        "key_id": "test",
-                        "schema": "stogas.hardware-policy.signature.v1",
-                        "signature": "test",
-                        "signed": "hardware-policy.json"
-                    }
-                }],
+                    "sigstore": {}
+                },
                 "nodes": [],
                 "schema": "stogas.confidential-bundle.v1",
                 "sequence": 1,
-                "ttl_ms": 900_000,
                 "vendor_collateral": []
             },
             "body_sha256": "00".repeat(32)
@@ -1481,6 +1781,7 @@ mod tests {
                 catalogs: vec![VerifiedCatalogRelease {
                     evidence: catalog_evidence,
                     github_integrated_time_unix_ms: Some(0),
+                    minimum_gateway_sequence: 1,
                     provenance: ReleaseProvenance::Github,
                     public_digest: format!("sha256:{}", "11".repeat(32)),
                     runtime_digest: format!("sha256:{}", "22".repeat(32)),
@@ -1495,14 +1796,15 @@ mod tests {
                 created_at_unix_ms: 0,
                 expires_at_unix_ms,
                 excluded_nodes: Vec::new(),
-                hardware_policies: vec![stogas_verifier::VerifiedHardwarePolicy {
-                    chip_id: "22".repeat(64),
-                    sequence: 1,
+                hardware_policy: stogas_verifier::VerifiedHardwarePolicy {
+                    chip_ids: vec!["22".repeat(64)],
+                    policy_count: 1,
+                    rekor_integrated_time_unix_ms: None,
                     sha256: "00".repeat(32),
                     source: stogas_verifier::HardwarePolicySource::StogasBundle,
                     stogas_signing_key_id: Some("test".into()),
-                }],
-                releases: Vec::new(),
+                },
+                releases: vec![verified_release],
                 nodes: vec![node],
                 original,
             },
@@ -1664,7 +1966,6 @@ mod tests {
                     bundle_url,
                     upstream,
                     listen: "127.0.0.1:8787",
-                    environment: Environment::stogas(),
                     bundle_refresh_interval: Duration::from_mins(1),
                     security: SecurityMode::Tls,
                     browser_origin,
@@ -1676,6 +1977,150 @@ mod tests {
             refresh_lock: Mutex::new(()),
             verifier: Mutex::new(Verifier::default()),
         }
+    }
+
+    struct CompatibilityProxyInput {
+        upstream: Url,
+        hpke_public_key: String,
+        ed25519_public_key: String,
+        node_id: String,
+        catalog_digest: String,
+        catalog_sequence: u64,
+    }
+
+    fn compatibility_proxy_input() -> Result<Option<CompatibilityProxyInput>> {
+        let Ok(upstream) = std::env::var("STOGAS_E2EE_TEST_UPSTREAM") else {
+            return Ok(None);
+        };
+        let hpke_public_key = std::env::var("STOGAS_E2EE_TEST_HPKE_PUBLIC_KEY")
+            .context("missing local gateway HPKE public key")?;
+        let decoded_public_key = URL_SAFE_NO_PAD
+            .decode(&hpke_public_key)
+            .context("invalid local gateway HPKE public key")?;
+        if URL_SAFE_NO_PAD.encode(&decoded_public_key) != hpke_public_key {
+            bail!("local gateway HPKE public key is not canonical base64url");
+        }
+        let ed25519_public_key = std::env::var("STOGAS_E2EE_TEST_ED25519_PUBLIC_KEY")
+            .context("missing local gateway Ed25519 public key")?;
+        let decoded_ed25519 = URL_SAFE_NO_PAD
+            .decode(&ed25519_public_key)
+            .context("invalid local gateway Ed25519 public key")?;
+        if decoded_ed25519.len() != 32
+            || URL_SAFE_NO_PAD.encode(&decoded_ed25519) != ed25519_public_key
+        {
+            bail!("local gateway Ed25519 public key is not canonical base64url");
+        }
+        let node_id =
+            std::env::var("STOGAS_E2EE_TEST_NODE_ID").context("missing local gateway node ID")?;
+        if !is_test_lower_hex(&node_id, 64) {
+            bail!("local gateway node ID is invalid");
+        }
+        let catalog_digest = std::env::var("STOGAS_E2EE_TEST_CATALOG_DIGEST")
+            .context("missing local gateway catalog digest")?;
+        if catalog_digest
+            .strip_prefix("sha256:")
+            .is_none_or(|digest| !is_test_lower_hex(digest, 64))
+        {
+            bail!("local gateway catalog digest is invalid");
+        }
+        let catalog_sequence = std::env::var("STOGAS_E2EE_TEST_CATALOG_SEQUENCE")
+            .context("missing local gateway catalog sequence")?
+            .parse::<u64>()
+            .context("invalid local gateway catalog sequence")?;
+        let upstream = Url::parse(&upstream).context("invalid local gateway URL")?;
+        let is_loopback = upstream.host_str().is_some_and(|host| {
+            host.eq_ignore_ascii_case("localhost")
+                || host
+                    .parse::<std::net::IpAddr>()
+                    .is_ok_and(|address| address.is_loopback())
+        });
+        if upstream.scheme() != "http"
+            || !is_loopback
+            || !upstream.username().is_empty()
+            || upstream.password().is_some()
+            || upstream.query().is_some()
+            || upstream.fragment().is_some()
+            || !matches!(upstream.path(), "" | "/")
+        {
+            bail!("local E2EE compatibility upstream must be a clean HTTP loopback origin");
+        }
+        Ok(Some(CompatibilityProxyInput {
+            upstream,
+            hpke_public_key,
+            ed25519_public_key,
+            node_id,
+            catalog_digest,
+            catalog_sequence,
+        }))
+    }
+
+    fn is_test_lower_hex(value: &str, length: usize) -> bool {
+        value.len() == length
+            && value
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    }
+
+    #[tokio::test]
+    async fn open_source_client_compatibility_proxy() -> Result<()> {
+        let Some(input) = compatibility_proxy_input()? else {
+            return Ok(());
+        };
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let address = listener.local_addr()?;
+        let mut output = test_output(i64::MAX);
+        output.bundle.nodes[0].report_data.hpke_public_key = input.hpke_public_key;
+        output.bundle.nodes[0].report_data.ed25519_public_key = input.ed25519_public_key;
+        output.bundle.nodes[0].node_id = input.node_id;
+        output.bundle.catalogs[0].runtime_digest = input.catalog_digest;
+        output.bundle.catalogs[0].sequence = input.catalog_sequence;
+        let recipients = recipients_from_verified_bundle(&output)?;
+        let upstream_client = reqwest::Client::builder()
+            .use_preconfigured_tls(compatible_webpki_tls_config()?)
+            .redirect(reqwest::redirect::Policy::none())
+            .build()?;
+        let client_capability = random_capability();
+        let config = Arc::new(ServeConfig {
+            bundle_urls: vec![Url::parse("https://evidence.invalid/bundles/latest.json")?],
+            bundle_fetcher: upstream_client.clone(),
+            upstream_client,
+            upstream: input.upstream,
+            listen: address,
+            expected_host: address.to_string(),
+            control_capability: random_capability(),
+            bundle_refresh_interval: Duration::from_mins(5),
+            security: SecurityMode::E2ee,
+            browser: None,
+            client_capability: Some(client_capability),
+            hardware_policy: None,
+        });
+        let state = Arc::new(ProxyState {
+            active: RwLock::new(Arc::new(ActiveBundle {
+                output,
+                client: None,
+                recipients: Some(recipients),
+                bundle_sha256: bundle_sha256(b"local E2EE client compatibility"),
+            })),
+            origin_caches: Mutex::new(HashMap::new()),
+            config: Arc::clone(&config),
+            refresh_lock: Mutex::new(()),
+            verifier: Mutex::new(Verifier::default()),
+        });
+        let app = Router::new().fallback(any(proxy_request)).with_state(state);
+
+        println!("STOGAS_E2EE_TEST_BASE_URL={}", config.base_url());
+        std::io::Write::flush(&mut std::io::stdout())?;
+        let shutdown = tokio::task::spawn_blocking(|| {
+            let mut line = String::new();
+            let _ = std::io::stdin().read_line(&mut line);
+        });
+        axum::serve(listener, app)
+            .with_graceful_shutdown(async {
+                let _ = shutdown.await;
+            })
+            .await?;
+        Ok(())
     }
 
     #[tokio::test]
@@ -1977,6 +2422,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rechecks_bundle_after_reading_a_streamed_request_body() {
+        let state = Arc::new(proxy_state(
+            test_http_client(),
+            "https://api.example",
+            "https://evidence.example/bundles/latest.json",
+            i64::MAX,
+        ));
+        let (body_started_tx, body_started_rx) = oneshot::channel();
+        let (release_body_tx, release_body_rx) = oneshot::channel();
+        let body = Body::from_stream(stream::once(async move {
+            let _ = body_started_tx.send(());
+            let _ = release_body_rx.await;
+            Ok::<_, io::Error>(Bytes::from_static(br#"{"model":"gpt-5.5"}"#))
+        }));
+        let request = Request::builder()
+            .method(Method::POST)
+            .uri("/v1/chat/completions")
+            .header(header::HOST, "127.0.0.1:8787")
+            .body(body)
+            .unwrap();
+        let request_task = tokio::spawn({
+            let state = Arc::clone(&state);
+            async move { proxy_request_inner(&state, request).await }
+        });
+
+        body_started_rx.await.unwrap();
+        {
+            let mut active = state.active.write().await;
+            let mut output = active.output.clone();
+            output.bundle.expires_at_unix_ms = 0;
+            *active = Arc::new(ActiveBundle {
+                output,
+                client: active.client.clone(),
+                recipients: active.recipients.clone(),
+                bundle_sha256: active.bundle_sha256,
+            });
+        }
+        release_body_tx.send(()).unwrap();
+
+        assert_eq!(
+            request_task.await.unwrap().unwrap_err(),
+            (StatusCode::SERVICE_UNAVAILABLE, "verified bundle expired")
+        );
+    }
+
+    #[tokio::test]
     async fn verified_empty_fleet_rejects_requests() {
         let state = proxy_state(
             test_http_client(),
@@ -2093,6 +2584,19 @@ mod tests {
     }
 
     #[test]
+    fn accepts_either_certificate_hash_for_the_attested_spki() {
+        let mut certificate = test_certificate();
+        certificate
+            .node
+            .report_data
+            .accepted_cert_sha256
+            .push("33".repeat(32));
+        let pins = NodePins::try_from(&certificate.node).unwrap();
+
+        assert!(validate_leaf_pin(certificate.chain[0].as_ref(), &[pins]).is_ok());
+    }
+
+    #[test]
     fn rejects_cross_node_certificate_and_spki_mixing() {
         let certificate = test_certificate();
         let leaf = certificate.chain[0].as_ref();
@@ -2117,7 +2621,6 @@ mod tests {
                 bundle_url: "https://evidence.example",
                 upstream: "https://api.example",
                 listen: "0.0.0.0:8787",
-                environment: Environment::stogas(),
                 bundle_refresh_interval: Duration::from_mins(1),
                 security: SecurityMode::Tls,
                 browser_origin: None,
@@ -2158,7 +2661,6 @@ mod tests {
                 bundle_url: "https://evidence.example",
                 upstream: "https://api.example",
                 listen: "127.0.0.1:8787",
-                environment: Environment::stogas(),
                 bundle_refresh_interval: Duration::ZERO,
                 security: SecurityMode::Tls,
                 browser_origin: None,

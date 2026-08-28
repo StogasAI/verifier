@@ -70,6 +70,34 @@ pub struct VerifiedAttestation {
     pub subjects: Vec<(String, String)>,
 }
 
+/// Verify one public-key DSSE signature and its public Rekor v1 inclusion proof.
+///
+/// The public key is selected by the caller's local policy. Rekor proves publication time and
+/// inclusion; it does not select or authorize the Stogas signing key.
+///
+/// # Errors
+///
+/// Returns an error when the DSSE signature, key identity, Rekor entry, checkpoint, inclusion
+/// proof, or authenticated time is invalid.
+pub fn verify_keyed_dsse(
+    bundle: &Value,
+    expected_payload: &[u8],
+    expected_payload_type: &str,
+    expected_key_id: &str,
+    public_key_spki: &[u8],
+    now_unix_ms: i64,
+) -> Result<i64, Error> {
+    sigstore::verify_keyed_dsse(
+        bundle,
+        expected_payload,
+        expected_payload_type,
+        expected_key_id,
+        public_key_spki,
+        now_unix_ms,
+    )
+    .map_err(Error::Cryptographic)
+}
+
 /// Offline Sigstore verification failure.
 #[derive(Debug, Error)]
 pub enum Error {
@@ -586,10 +614,10 @@ mod tests {
     #[test]
     fn accepts_only_the_exact_github_subject_set() {
         const IGVM: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-        const POLICY: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        const MANIFEST: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
         let statement = statement(vec![
             subject("gateway.igvm", IGVM),
-            subject("gateway-launch-policy.json", POLICY),
+            subject("release-manifest.json", MANIFEST),
         ]);
         check_statement(
             &statement,
@@ -599,8 +627,8 @@ mod tests {
                     sha256: IGVM,
                 },
                 Subject {
-                    name: "gateway-launch-policy.json",
-                    sha256: POLICY,
+                    name: "release-manifest.json",
+                    sha256: MANIFEST,
                 },
             ],
             &policy(),

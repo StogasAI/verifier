@@ -63,12 +63,12 @@ func (*Verifier) VerifyBundleWithPolicy([]byte, []byte) (json.RawMessage, error)
 }
 
 // VerifyResponseProof reports that the packaged native verifier is unavailable.
-func (*Verifier) VerifyResponseProof([]byte, []byte, []byte, string) (json.RawMessage, error) {
+func (*Verifier) VerifyResponseProof([]byte, []byte, string) (json.RawMessage, error) {
 	return nil, ErrNativeLibraryUnavailable
 }
 
 // VerifyHistoricalResponseProof reports that the packaged native verifier is unavailable.
-func (*Verifier) VerifyHistoricalResponseProof([]byte, []byte, []byte, []byte, []byte, string) (json.RawMessage, error) {
+func (*Verifier) VerifyHistoricalResponseProof([]byte, []byte, []byte, []byte, string) (json.RawMessage, error) {
 	return nil, ErrNativeLibraryUnavailable
 }
 

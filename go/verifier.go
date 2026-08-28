@@ -18,8 +18,8 @@ StogasVerifier *stogas_verifier_new(void);
 void stogas_verifier_free(StogasVerifier *verifier);
 char *stogas_verifier_verify_bundle(const StogasVerifier *verifier, const uint8_t *bundle, size_t bundle_len, int64_t now_unix_ms);
 char *stogas_verifier_verify_bundle_with_policy(const StogasVerifier *verifier, const uint8_t *bundle, size_t bundle_len, const uint8_t *policy, size_t policy_len, int64_t now_unix_ms);
-char *stogas_verifier_verify_response_proof(const StogasVerifier *verifier, const uint8_t *proof, size_t proof_len, const uint8_t *request_body, size_t request_body_len, const uint8_t *response_body, size_t response_body_len, const uint8_t *e2ee_transcript_sha256, size_t e2ee_transcript_sha256_len, int64_t now_unix_ms);
-char *stogas_verifier_verify_historical_response_proof(const StogasVerifier *verifier, const uint8_t *proof, size_t proof_len, const uint8_t *request_body, size_t request_body_len, const uint8_t *response_body, size_t response_body_len, const uint8_t *ledger, size_t ledger_len, const uint8_t *catalog, size_t catalog_len, const uint8_t *e2ee_transcript_sha256, size_t e2ee_transcript_sha256_len, int64_t now_unix_ms);
+char *stogas_verifier_verify_response_proof(const StogasVerifier *verifier, const uint8_t *request_body, size_t request_body_len, const uint8_t *response_body, size_t response_body_len, const uint8_t *e2ee_transcript_sha256, size_t e2ee_transcript_sha256_len, int64_t now_unix_ms);
+char *stogas_verifier_verify_historical_response_proof(const StogasVerifier *verifier, const uint8_t *request_body, size_t request_body_len, const uint8_t *response_body, size_t response_body_len, const uint8_t *ledger, size_t ledger_len, const uint8_t *catalog, size_t catalog_len, const uint8_t *e2ee_transcript_sha256, size_t e2ee_transcript_sha256_len, int64_t now_unix_ms);
 void stogas_verifier_string_free(char *value);
 char *stogas_transport_start(const uint8_t *configuration, size_t configuration_len, StogasTransport **transport_out);
 char *stogas_transport_refresh(const StogasTransport *transport);
@@ -196,16 +196,15 @@ func (verifier *Verifier) verifyBundleAt(bundle []byte, nowUnixMS int64) (json.R
 	return output, nil
 }
 
-// VerifyResponseProof verifies exact request and response bytes against the active bundle.
+// VerifyResponseProof verifies exact request bytes and a complete buffered response with its
+// final Stogas receipt against the active bundle.
 // Pass an empty E2EE transcript hash for an ordinary TLS exchange.
 func (verifier *Verifier) VerifyResponseProof(
-	proof []byte,
 	requestBody []byte,
 	responseBody []byte,
 	e2eeTranscriptSHA256 string,
 ) (json.RawMessage, error) {
 	return verifier.verifyResponseProofAt(
-		proof,
 		requestBody,
 		responseBody,
 		e2eeTranscriptSHA256,
@@ -214,7 +213,6 @@ func (verifier *Verifier) VerifyResponseProof(
 }
 
 func (verifier *Verifier) verifyResponseProofAt(
-	proof []byte,
 	requestBody []byte,
 	responseBody []byte,
 	e2eeTranscriptSHA256 string,
@@ -228,8 +226,6 @@ func (verifier *Verifier) verifyResponseProofAt(
 	transcript := []byte(e2eeTranscriptSHA256)
 	response := C.stogas_verifier_verify_response_proof(
 		verifier.handle,
-		bytePointer(proof),
-		C.size_t(len(proof)),
 		bytePointer(requestBody),
 		C.size_t(len(requestBody)),
 		bytePointer(responseBody),
@@ -245,10 +241,9 @@ func (verifier *Verifier) verifyResponseProofAt(
 	return output, nil
 }
 
-// VerifyHistoricalResponseProof verifies a receipt and its immutable node ledger together.
+// VerifyHistoricalResponseProof verifies a buffered response and its immutable node ledger together.
 // Pass an empty E2EE transcript hash for an ordinary TLS exchange.
 func (verifier *Verifier) VerifyHistoricalResponseProof(
-	proof []byte,
 	requestBody []byte,
 	responseBody []byte,
 	ledger []byte,
@@ -263,8 +258,6 @@ func (verifier *Verifier) VerifyHistoricalResponseProof(
 	transcript := []byte(e2eeTranscriptSHA256)
 	response := C.stogas_verifier_verify_historical_response_proof(
 		verifier.handle,
-		bytePointer(proof),
-		C.size_t(len(proof)),
 		bytePointer(requestBody),
 		C.size_t(len(requestBody)),
 		bytePointer(responseBody),

@@ -43,7 +43,7 @@
 	},
 	"scripts": {
 		"test:browser": "playwright test --config tests/browser/playwright.config.ts",
-		"test:node": "node tests/node/verifier.test.mjs && node tests/node/offline-sigstore.test.mjs && node tests/node/browser-transport.test.mjs"
+		"test:node": "node --test tests/node/*.test.mjs"
 	},
 	"devDependencies": {
 		"@playwright/test": "1.62.1"

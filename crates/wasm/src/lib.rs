@@ -3,14 +3,10 @@
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
+use std::sync::Arc;
 use stogas_offline_sigstore::{GithubPolicy, Subject, verify_github_attestation};
-#[cfg(feature = "staging")]
-use stogas_verifier::verify_staging_catalog_approval as verify_staging_catalog;
-#[cfg(feature = "staging")]
-use stogas_verifier::verify_staging_release_approval as verify_staging_release;
 use stogas_verifier::{
-    Environment, HistoricalResponseProofHashInput, HistoricalResponseProofInput,
-    Verifier as CoreVerifier,
+    HistoricalResponseProofHashInput, HistoricalResponseProofInput, Verifier as CoreVerifier,
     e2ee::{
         Request as CoreE2eeRequest, ResponseDecoder, ResponseEvent, bundle_sha256,
         recipients_from_verified_bundle, seal_request,
@@ -20,6 +16,8 @@ use stogas_verifier::{
     verify_bundle_with_policy as verify_core_bundle_with_policy,
     verify_catalog_approval as verify_catalog,
     verify_certificate_csr_submission as verify_csr_submission,
+    verify_hardware_policy as verify_hardware,
+    verify_hardware_policy_fleet as verify_hardware_fleet,
     verify_heartbeat_admission as verify_admission,
     verify_local_heartbeat_admission as verify_local_admission,
     verify_node_ledger_record as verify_ledger_record,
@@ -56,9 +54,6 @@ struct WasmSealedSecret {
 #[wasm_bindgen(js_name = Verifier)]
 pub struct WasmVerifier {
     core: CoreVerifier,
-    environment: Environment,
-    #[cfg(feature = "staging")]
-    staging: bool,
     active_bundle: Option<ActiveBundle>,
 }
 
@@ -66,16 +61,13 @@ struct ActiveBundle {
     expires_at_unix_ms: i64,
     sha256: String,
     recipients: Option<Vec<stogas_verifier::e2ee::Recipient>>,
-    verification: stogas_verifier::VerificationOutput,
+    verification: Arc<stogas_verifier::VerificationOutput>,
 }
 
 impl Default for WasmVerifier {
     fn default() -> Self {
         Self {
             core: CoreVerifier::default(),
-            environment: Environment::stogas(),
-            #[cfg(feature = "staging")]
-            staging: false,
             active_bundle: None,
         }
     }
@@ -93,37 +85,29 @@ pub struct WasmE2eeRequest {
 /// Constant-memory response hash state for one signed streaming exchange.
 #[wasm_bindgen(js_name = ResponseProofStream)]
 pub struct WasmResponseProofStream {
-    request_sha256: String,
-    response_hasher: Option<Sha256>,
+    mode: Option<ResponseProofMode>,
+    verification: Arc<stogas_verifier::VerificationOutput>,
+    verification_time_unix_ms: i64,
+}
+
+enum ResponseProofMode {
+    Undecided {
+        request_sha256: String,
+    },
+    Raw {
+        request_sha256: String,
+        response_hasher: Sha256,
+    },
+    Sse(response_proof::ResponseProofSseStream),
 }
 
 #[wasm_bindgen(js_class = Verifier)]
 impl WasmVerifier {
-    /// Construct a verifier for public Stogas evidence.
-    ///
-    /// A staging-enabled build can select the private staging trust environment. Production
-    /// builds ignore this argument and contain no staging provenance parser or trust policy.
+    /// Construct a verifier. Its provenance policy is fixed by the compiled artifact.
     #[wasm_bindgen(constructor)]
     #[must_use]
-    pub fn new(staging: Option<bool>) -> Self {
-        #[cfg(not(feature = "staging"))]
-        let _ = staging;
-        #[cfg(not(feature = "staging"))]
-        return Self::default();
-
-        #[cfg(feature = "staging")]
-        let staging = staging.unwrap_or(false);
-        #[cfg(feature = "staging")]
-        Self {
-            core: CoreVerifier::default(),
-            environment: if staging {
-                Environment::staging()
-            } else {
-                Environment::stogas()
-            },
-            staging,
-            active_bundle: None,
-        }
+    pub fn new() -> Self {
+        Self::default()
     }
 
     /// Verify with one captured browser wall-clock value.
@@ -135,7 +119,7 @@ impl WasmVerifier {
         let now_unix_ms = wall_clock_ms()?;
         let output = self
             .core
-            .verify_bundle(bundle, now_unix_ms, &self.environment)
+            .verify_bundle(bundle, now_unix_ms)
             .map_err(|error| JsError::new(&error.to_string()))?;
         self.activate_bundle(bundle, output)
     }
@@ -155,7 +139,7 @@ impl WasmVerifier {
         let now_unix_ms = wall_clock_ms()?;
         let output = self
             .core
-            .verify_bundle_with_policy(bundle, policy, now_unix_ms, &self.environment)
+            .verify_bundle_with_policy(bundle, policy, now_unix_ms)
             .map_err(|error| JsError::new(&error.to_string()))?;
         self.activate_bundle(bundle, output)
     }
@@ -168,7 +152,6 @@ impl WasmVerifier {
     /// transcript mismatches.
     pub fn verify_response_proof(
         &self,
-        proof: &[u8],
         request_body: &[u8],
         response_body: &[u8],
         e2ee_transcript_sha256: Option<String>,
@@ -180,7 +163,6 @@ impl WasmVerifier {
             .as_ref()
             .ok_or_else(|| JsError::new("a bundle must be verified before a response proof"))?;
         let output = response_proof::verify_with_bundle(
-            proof,
             request_body,
             response_body,
             e2ee_transcript_sha256.as_deref(),
@@ -203,14 +185,16 @@ impl WasmVerifier {
         &self,
         request_body: &[u8],
     ) -> Result<WasmResponseProofStream, JsError> {
-        if self.active_bundle.is_none() {
-            return Err(JsError::new(
-                "a bundle must be verified before a response proof",
-            ));
-        }
+        let active = self
+            .active_bundle
+            .as_ref()
+            .ok_or_else(|| JsError::new("a bundle must be verified before a response proof"))?;
         Ok(WasmResponseProofStream {
-            request_sha256: hex::encode(Sha256::digest(request_body)),
-            response_hasher: Some(Sha256::new()),
+            mode: Some(ResponseProofMode::Undecided {
+                request_sha256: hex::encode(Sha256::digest(request_body)),
+            }),
+            verification: Arc::clone(&active.verification),
+            verification_time_unix_ms: wall_clock_ms()?,
         })
     }
 
@@ -221,7 +205,6 @@ impl WasmVerifier {
     /// Returns a JavaScript error if the historical admission chain or receipt is invalid.
     pub fn verify_historical_response_proof(
         &self,
-        proof: &[u8],
         request_body: &[u8],
         response_body: &[u8],
         ledger: &[u8],
@@ -233,32 +216,30 @@ impl WasmVerifier {
         let output = self
             .core
             .verify_historical_response_proof(&HistoricalResponseProofInput {
-                proof_bytes: proof,
                 request_body,
                 response_body,
                 expected_e2ee_transcript_sha256: e2ee_transcript_sha256.as_deref(),
                 now_unix_ms,
                 ledger_bytes: ledger,
                 catalog_approval_bytes: catalog,
-                environment: &self.environment,
             })
             .map_err(|error| JsError::new(&error.to_string()))?;
         to_js_value(&output)
     }
 
-    /// Verify one immutable historical node-admission ledger record.
+    /// Verify one historical node-admission evidence response.
     ///
     /// # Errors
     ///
     /// Returns a JavaScript error if release provenance, SNP evidence, drand, or the derived
     /// node identity is invalid.
     pub fn verify_node_ledger_record(&self, ledger: &[u8]) -> Result<JsValue, JsError> {
-        let output = verify_ledger_record(ledger, &self.environment)
-            .map_err(|error| JsError::new(&error.to_string()))?;
+        let output =
+            verify_ledger_record(ledger).map_err(|error| JsError::new(&error.to_string()))?;
         to_js_value(&output)
     }
 
-    /// Verify one historical gateway release approval with this verifier's environment.
+    /// Verify one historical gateway release approval with this artifact's policy.
     ///
     /// # Errors
     ///
@@ -266,13 +247,6 @@ impl WasmVerifier {
     /// signature is invalid.
     pub fn verify_release_approval(&self, release: &[u8]) -> Result<JsValue, JsError> {
         let now_unix_ms = wall_clock_ms()?;
-        #[cfg(feature = "staging")]
-        let output = if self.staging {
-            verify_staging_release(release, now_unix_ms)
-        } else {
-            verify_release(release, now_unix_ms)
-        };
-        #[cfg(not(feature = "staging"))]
         let output = verify_release(release, now_unix_ms);
         to_js_value(&output.map_err(|error| JsError::new(&error.to_string()))?)
     }
@@ -284,13 +258,6 @@ impl WasmVerifier {
     /// Returns a JavaScript error if either proof lane or their artifact hashes differ.
     pub fn verify_catalog_approval(&self, approval: &[u8]) -> Result<JsValue, JsError> {
         let now_unix_ms = wall_clock_ms()?;
-        #[cfg(feature = "staging")]
-        let output = if self.staging {
-            verify_staging_catalog(approval, now_unix_ms)
-        } else {
-            verify_catalog(approval, now_unix_ms)
-        };
-        #[cfg(not(feature = "staging"))]
         let output = verify_catalog(approval, now_unix_ms);
         to_js_value(&output.map_err(|error| JsError::new(&error.to_string()))?)
     }
@@ -308,13 +275,15 @@ impl WasmVerifier {
         api_key: &str,
         body: &[u8],
         accept: Option<String>,
-        extra_fields: bool,
-        upstream_provider: Option<String>,
-        upstream_api_key: Option<String>,
+        receipt: bool,
+        upstream_anthropic_api_key: Option<String>,
+        upstream_chutes_api_key: Option<String>,
+        upstream_openai_api_key: Option<String>,
     ) -> Result<WasmE2eeRequest, JsError> {
         let accept = accept.map(String::into_boxed_str);
-        let upstream_provider = upstream_provider.map(String::into_boxed_str);
-        let upstream_api_key = upstream_api_key.map(String::into_boxed_str);
+        let upstream_anthropic_api_key = upstream_anthropic_api_key.map(String::into_boxed_str);
+        let upstream_chutes_api_key = upstream_chutes_api_key.map(String::into_boxed_str);
+        let upstream_openai_api_key = upstream_openai_api_key.map(String::into_boxed_str);
         let now_unix_ms = wall_clock_ms()?;
         let active = self
             .active_bundle
@@ -327,20 +296,17 @@ impl WasmVerifier {
             .recipients
             .as_deref()
             .ok_or_else(|| JsError::new("the active verified bundle has no E2EE recipients"))?;
-        let upstream_credential = match (upstream_provider.as_deref(), upstream_api_key.as_deref())
+        let upstream_credentials = if upstream_anthropic_api_key.is_some()
+            || upstream_chutes_api_key.is_some()
+            || upstream_openai_api_key.is_some()
         {
-            (Some(provider), Some(provider_api_key)) => {
-                Some(stogas_verifier::e2ee::UpstreamCredential {
-                    provider,
-                    api_key: provider_api_key,
-                })
-            }
-            (None, None) => None,
-            _ => {
-                return Err(JsError::new(
-                    "an upstream provider and API key are required together",
-                ));
-            }
+            Some(stogas_verifier::e2ee::UpstreamCredentials {
+                anthropic: upstream_anthropic_api_key.as_deref(),
+                chutes: upstream_chutes_api_key.as_deref(),
+                openai: upstream_openai_api_key.as_deref(),
+            })
+        } else {
+            None
         };
         let sealed = seal_request(&CoreE2eeRequest {
             path,
@@ -351,8 +317,8 @@ impl WasmVerifier {
             recipients,
             api_key,
             accept: accept.as_deref(),
-            extra_fields,
-            upstream_credential,
+            receipt,
+            upstream_credentials,
             body,
         })
         .map_err(|error| JsError::new(&error.to_string()))?;
@@ -384,7 +350,7 @@ impl WasmVerifier {
             expires_at_unix_ms: output.bundle.expires_at_unix_ms,
             sha256: bundle_sha256(bundle),
             recipients,
-            verification: output,
+            verification: Arc::new(output),
         });
         Ok(result)
     }
@@ -398,39 +364,138 @@ impl WasmResponseProofStream {
     ///
     /// Returns a JavaScript error after the state was finished.
     pub fn write(&mut self, chunk: &[u8]) -> Result<(), JsError> {
-        let hasher = self
-            .response_hasher
-            .as_mut()
-            .ok_or_else(|| JsError::new("response proof stream is already finished"))?;
-        hasher.update(chunk);
+        let mode = self.take_mode()?;
+        self.mode = Some(match mode {
+            ResponseProofMode::Undecided { request_sha256 } => {
+                let mut response_hasher = Sha256::new();
+                response_hasher.update(chunk);
+                ResponseProofMode::Raw {
+                    request_sha256,
+                    response_hasher,
+                }
+            }
+            ResponseProofMode::Raw {
+                request_sha256,
+                mut response_hasher,
+            } => {
+                response_hasher.update(chunk);
+                ResponseProofMode::Raw {
+                    request_sha256,
+                    response_hasher,
+                }
+            }
+            ResponseProofMode::Sse(stream) => {
+                self.mode = Some(ResponseProofMode::Sse(stream));
+                return Err(JsError::new(
+                    "raw response bytes cannot be mixed with managed SSE verification",
+                ));
+            }
+        });
         Ok(())
     }
 
-    /// Finish verification against the verifier's current active bundle.
+    /// Finish raw streaming verification against the bundle captured at request start.
     ///
     /// # Errors
     ///
     /// Returns a JavaScript error for a reused state or any proof verification failure.
     pub fn finish(
         &mut self,
-        verifier: &WasmVerifier,
         proof: &[u8],
         e2ee_transcript_sha256: Option<String>,
     ) -> Result<JsValue, JsError> {
-        let response_sha256 = self.finish_response_sha256()?;
+        let (request_sha256, response_sha256) = self.finish_response_sha256()?;
         let e2ee_transcript_sha256 = e2ee_transcript_sha256.map(String::into_boxed_str);
-        let now_unix_ms = wall_clock_ms()?;
-        let output = verifier
-            .core
-            .verify_response_proof_hashes(
-                proof,
-                &self.request_sha256,
-                &response_sha256,
+        let output = response_proof::verify_with_bundle_hashes(
+            proof,
+            &request_sha256,
+            &response_sha256,
+            e2ee_transcript_sha256.as_deref(),
+            self.verification_time_unix_ms,
+            &self.verification,
+        )
+        .map_err(|error| JsError::new(&error.to_string()))?;
+        to_js_value(&output)
+    }
+
+    /// Verify one complete buffered JSON response against the request-start bundle.
+    ///
+    /// # Errors
+    ///
+    /// Returns a JavaScript error for mixed modes, reused state, or any proof failure.
+    pub fn finish_buffered(
+        &mut self,
+        response: &[u8],
+        e2ee_transcript_sha256: Option<String>,
+    ) -> Result<JsValue, JsError> {
+        let request_sha256 = match self.take_mode()? {
+            ResponseProofMode::Undecided { request_sha256 } => request_sha256,
+            mode => {
+                self.mode = Some(mode);
+                return Err(JsError::new(
+                    "buffered verification cannot follow streaming response bytes",
+                ));
+            }
+        };
+        let e2ee_transcript_sha256 = e2ee_transcript_sha256.map(String::into_boxed_str);
+        let output = response_proof::verify_buffered_with_bundle_request_hash(
+            &request_sha256,
+            response,
+            e2ee_transcript_sha256.as_deref(),
+            self.verification_time_unix_ms,
+            &self.verification,
+        )
+        .map_err(|error| JsError::new(&error.to_string()))?;
+        to_js_value(&output)
+    }
+
+    /// Filter arbitrary plaintext SSE bytes while hashing every non-receipt byte.
+    ///
+    /// # Errors
+    ///
+    /// Returns a JavaScript error for mixed modes, reused state, or malformed stream bytes.
+    pub fn push_sse(&mut self, chunk: &[u8]) -> Result<js_sys::Array, JsError> {
+        let mode = self.take_mode()?;
+        let mut stream = match mode {
+            ResponseProofMode::Undecided { request_sha256 } => {
+                response_proof::ResponseProofSseStream::from_request_sha256(request_sha256)
+            }
+            ResponseProofMode::Sse(stream) => stream,
+            mode @ ResponseProofMode::Raw { .. } => {
+                self.mode = Some(mode);
+                return Err(JsError::new(
+                    "managed SSE verification cannot follow raw response bytes",
+                ));
+            }
+        };
+        let output = stream
+            .push(chunk)
+            .map_err(|error| JsError::new(&error.to_string()))?;
+        self.mode = Some(ResponseProofMode::Sse(stream));
+        Ok(byte_chunks_to_js(output))
+    }
+
+    /// Verify the filtered SSE receipt and release its terminal delimiter.
+    ///
+    /// # Errors
+    ///
+    /// Returns a JavaScript error for reused state, truncation, or any proof failure.
+    pub fn finish_sse(
+        &mut self,
+        e2ee_transcript_sha256: Option<String>,
+    ) -> Result<js_sys::Array, JsError> {
+        let ResponseProofMode::Sse(stream) = self.take_mode()? else {
+            return Err(JsError::new("managed SSE verification was not started"));
+        };
+        let e2ee_transcript_sha256 = e2ee_transcript_sha256.map(String::into_boxed_str);
+        let output = stream
+            .finish(
                 e2ee_transcript_sha256.as_deref(),
-                now_unix_ms,
+                self.verification_time_unix_ms,
+                &self.verification,
             )
             .map_err(|error| JsError::new(&error.to_string()))?;
-        to_js_value(&output)
+        Ok(byte_chunks_to_js(output))
     }
 
     /// Finish verification against immutable historical node and catalog evidence.
@@ -446,20 +511,19 @@ impl WasmResponseProofStream {
         catalog: &[u8],
         e2ee_transcript_sha256: Option<String>,
     ) -> Result<JsValue, JsError> {
-        let response_sha256 = self.finish_response_sha256()?;
+        let (request_sha256, response_sha256) = self.finish_response_sha256()?;
         let e2ee_transcript_sha256 = e2ee_transcript_sha256.map(String::into_boxed_str);
         let now_unix_ms = wall_clock_ms()?;
         let output = verifier
             .core
             .verify_historical_response_proof_hashes(&HistoricalResponseProofHashInput {
                 proof_bytes: proof,
-                request_sha256: &self.request_sha256,
+                request_sha256: &request_sha256,
                 response_sha256: &response_sha256,
                 expected_e2ee_transcript_sha256: e2ee_transcript_sha256.as_deref(),
                 now_unix_ms,
                 ledger_bytes: ledger,
                 catalog_approval_bytes: catalog,
-                environment: &verifier.environment,
             })
             .map_err(|error| JsError::new(&error.to_string()))?;
         to_js_value(&output)
@@ -467,13 +531,37 @@ impl WasmResponseProofStream {
 }
 
 impl WasmResponseProofStream {
-    fn finish_response_sha256(&mut self) -> Result<String, JsError> {
-        let hasher = self
-            .response_hasher
+    fn take_mode(&mut self) -> Result<ResponseProofMode, JsError> {
+        self.mode
             .take()
-            .ok_or_else(|| JsError::new("response proof stream is already finished"))?;
-        Ok(hex::encode(hasher.finalize()))
+            .ok_or_else(|| JsError::new("response proof stream is already finished"))
     }
+
+    fn finish_response_sha256(&mut self) -> Result<(String, String), JsError> {
+        match self.take_mode()? {
+            ResponseProofMode::Undecided { request_sha256 } => {
+                Ok((request_sha256, hex::encode(Sha256::digest(b""))))
+            }
+            ResponseProofMode::Raw {
+                request_sha256,
+                response_hasher,
+            } => Ok((request_sha256, hex::encode(response_hasher.finalize()))),
+            ResponseProofMode::Sse(stream) => {
+                self.mode = Some(ResponseProofMode::Sse(stream));
+                Err(JsError::new(
+                    "raw verification cannot finish a managed SSE response",
+                ))
+            }
+        }
+    }
+}
+
+fn byte_chunks_to_js(chunks: Vec<Vec<u8>>) -> js_sys::Array {
+    let output = js_sys::Array::new();
+    for chunk in chunks {
+        output.push(&js_sys::Uint8Array::from(chunk.as_slice()));
+    }
+    output
 }
 
 #[wasm_bindgen(js_class = E2eeRequest)]
@@ -598,7 +686,7 @@ pub fn seal_secret_release(
 #[wasm_bindgen]
 pub fn verify_bundle(bundle: &[u8]) -> Result<JsValue, JsError> {
     let now_unix_ms = wall_clock_ms()?;
-    let output = verify_core_bundle(bundle, now_unix_ms, &Environment::stogas())
+    let output = verify_core_bundle(bundle, now_unix_ms)
         .map_err(|error| JsError::new(&error.to_string()))?;
     to_js_value(&output)
 }
@@ -611,9 +699,34 @@ pub fn verify_bundle(bundle: &[u8]) -> Result<JsValue, JsError> {
 #[wasm_bindgen]
 pub fn verify_bundle_with_policy(bundle: &[u8], policy: &[u8]) -> Result<JsValue, JsError> {
     let now_unix_ms = wall_clock_ms()?;
+    let output = verify_core_bundle_with_policy(bundle, policy, now_unix_ms)
+        .map_err(|error| JsError::new(&error.to_string()))?;
+    to_js_value(&output)
+}
+
+/// Verify a signed hardware policy and its Rekor inclusion proof.
+///
+/// # Errors
+///
+/// Returns a JavaScript error when the policy, Stogas signature, or transparency proof is invalid.
+#[wasm_bindgen]
+pub fn verify_hardware_policy(policy: &[u8], now_unix_ms: f64) -> Result<JsValue, JsError> {
+    let now_unix_ms = parse_unix_ms(now_unix_ms, "now_unix_ms")?;
     let output =
-        verify_core_bundle_with_policy(bundle, policy, now_unix_ms, &Environment::stogas())
-            .map_err(|error| JsError::new(&error.to_string()))?;
+        verify_hardware(policy, now_unix_ms).map_err(|error| JsError::new(&error.to_string()))?;
+    to_js_value(&output)
+}
+
+/// Reappraise all live, previously verified node reports before activating a hardware policy.
+///
+/// # Errors
+///
+/// Returns a JavaScript error when the policy proof or any node appraisal fails.
+#[wasm_bindgen]
+pub fn verify_hardware_policy_fleet(request: &[u8], now_unix_ms: f64) -> Result<JsValue, JsError> {
+    let now_unix_ms = parse_unix_ms(now_unix_ms, "now_unix_ms")?;
+    let output = verify_hardware_fleet(request, now_unix_ms)
+        .map_err(|error| JsError::new(&error.to_string()))?;
     to_js_value(&output)
 }
 
@@ -641,72 +754,6 @@ pub fn verify_catalog_approval(approval: &[u8], now_unix_ms: f64) -> Result<JsVa
     let output =
         verify_catalog(approval, now_unix_ms).map_err(|error| JsError::new(&error.to_string()))?;
     to_js_value(&output)
-}
-
-/// Verify one catalog approval with the private staging provenance policy.
-///
-/// # Errors
-///
-/// Returns a JavaScript error when the captured time or either authorization is invalid.
-#[cfg(feature = "staging")]
-#[wasm_bindgen]
-pub fn verify_staging_catalog_approval(
-    approval: &[u8],
-    now_unix_ms: f64,
-) -> Result<JsValue, JsError> {
-    let now_unix_ms = parse_unix_ms(now_unix_ms, "now_unix_ms")?;
-    let output = verify_staging_catalog(approval, now_unix_ms)
-        .map_err(|error| JsError::new(&error.to_string()))?;
-    to_js_value(&output)
-}
-
-/// Reject staging catalog verification from a production verifier build.
-///
-/// # Errors
-///
-/// Always returns a JavaScript error because this build excludes the staging policy.
-#[cfg(not(feature = "staging"))]
-#[wasm_bindgen]
-pub fn verify_staging_catalog_approval(
-    _approval: &[u8],
-    _now_unix_ms: f64,
-) -> Result<JsValue, JsError> {
-    Err(JsError::new(
-        "staging catalog verification is not available in this build",
-    ))
-}
-
-/// Verify one release approval with the private staging provenance policy.
-///
-/// # Errors
-///
-/// Returns a JavaScript error when the captured time or either authorization is invalid.
-#[cfg(feature = "staging")]
-#[wasm_bindgen]
-pub fn verify_staging_release_approval(
-    release: &[u8],
-    now_unix_ms: f64,
-) -> Result<JsValue, JsError> {
-    let now_unix_ms = parse_unix_ms(now_unix_ms, "now_unix_ms")?;
-    let output = verify_staging_release(release, now_unix_ms)
-        .map_err(|error| JsError::new(&error.to_string()))?;
-    to_js_value(&output)
-}
-
-/// Reject staging release verification from a production verifier build.
-///
-/// # Errors
-///
-/// Always returns a JavaScript error because this build excludes the staging policy.
-#[cfg(not(feature = "staging"))]
-#[wasm_bindgen]
-pub fn verify_staging_release_approval(
-    _release: &[u8],
-    _now_unix_ms: f64,
-) -> Result<JsValue, JsError> {
-    Err(JsError::new(
-        "staging release verification is not available in this build",
-    ))
 }
 
 /// Verify fetched AMD collateral before Control activates it.
