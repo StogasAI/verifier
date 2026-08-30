@@ -570,10 +570,7 @@ function receiptEnabled(headers) {
 }
 
 function upstreamCredentials(headers) {
-	if (
-		headers.has('x-stogas-upstream-api-key') ||
-		headers.has('x-stogas-upstream-provider')
-	) {
+	if (headers.has('x-stogas-upstream-api-key') || headers.has('x-stogas-upstream-provider')) {
 		throw new TypeError('generic upstream credential headers are unsupported');
 	}
 	const present = [
