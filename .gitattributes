@@ -1,0 +1,2 @@
+# Signed artifact bytes must survive Windows checkout unchanged.
+tests/fixtures/gateway-v0.0.1-launch-policy.json -text
