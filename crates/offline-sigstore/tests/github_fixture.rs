@@ -1,4 +1,5 @@
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use stogas_offline_sigstore::{GithubPolicy, Subject, verify_github_attestation};
 
 const IGVM_DIGEST: &str = "1b75d0ea7f94bc5f5a21080dd30e21370e14278a5b90eb19858c90dcc83a1bc6";
@@ -49,6 +50,9 @@ fn flip_string(value: &mut Value, pointer: &str) {
 
 #[test]
 fn verifies_real_gateway_release_attestation() {
+    // Preserve the exact historical artifact used by the independent CLI checks.
+    let artifact = include_bytes!("../../../tests/fixtures/gateway-v0.0.1-launch-policy.json");
+    assert_eq!(hex::encode(Sha256::digest(artifact)), POLICY_DIGEST);
     let bundle = include_bytes!("../../../tests/fixtures/gateway-v0.0.1-attestation.jsonl");
     let result = verify_github_attestation(bundle, &subjects(), &policy(), NOW_UNIX_MS).unwrap();
     assert_eq!(result.subjects.len(), 2);

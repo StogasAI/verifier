@@ -65,6 +65,7 @@ pub struct ServeConfig {
     hardware_policy: Option<Vec<u8>>,
 }
 
+#[derive(Clone, Copy)]
 pub struct ServeConfigInput<'a> {
     pub bundle_url: &'a str,
     pub upstream: &'a str,

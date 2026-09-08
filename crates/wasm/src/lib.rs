@@ -51,6 +51,7 @@ struct WasmSealedSecret {
 }
 
 /// Browser verifier which caches immutable release provenance in memory.
+#[derive(Default)]
 #[wasm_bindgen(js_name = Verifier)]
 pub struct WasmVerifier {
     core: CoreVerifier,
@@ -62,15 +63,6 @@ struct ActiveBundle {
     sha256: String,
     recipients: Option<Vec<stogas_verifier::e2ee::Recipient>>,
     verification: Arc<stogas_verifier::VerificationOutput>,
-}
-
-impl Default for WasmVerifier {
-    fn default() -> Self {
-        Self {
-            core: CoreVerifier::default(),
-            active_bundle: None,
-        }
-    }
 }
 
 /// One request encrypted by the Rust core and its stateful authenticated response decoder.

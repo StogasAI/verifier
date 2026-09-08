@@ -4364,7 +4364,7 @@ mod tests {
                 "quote_verified_at": admitted_at,
                 "region": "us-east-va",
                 "report_data": {
-                    "accepted_cert_sha256": [leaf_sha256.clone()],
+                    "accepted_cert_sha256": [leaf_sha256],
                     "drand": {
                         "chain_hash": DRAND_CHAIN_HASH,
                         "network": "quicknet",
@@ -4381,7 +4381,7 @@ mod tests {
                 "reported_tcb": "00".repeat(8)
             },
             "hardware_policy_sha256": "99".repeat(32),
-            "node_id": node_id.clone(),
+            "node_id": node_id,
             "release_measurement": "aa".repeat(48),
             "schema": "stogas.node-evidence.v1"
         }))

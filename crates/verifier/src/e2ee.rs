@@ -88,7 +88,7 @@ pub struct UpstreamCredentials<'a> {
     /// Chutes API key.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub chutes: Option<&'a str>,
-    /// OpenAI API key.
+    /// `OpenAI` API key.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub openai: Option<&'a str>,
 }
