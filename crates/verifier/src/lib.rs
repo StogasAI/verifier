@@ -62,6 +62,11 @@ const STOGAS_RELEASE_KEY_ID: &str = "stogas-ed25519-stamp-v1";
 const STOGAS_RELEASE_PUBLIC_KEY_DER_BASE64: &str =
     "MCowBQYDK2VwAyEAByVn3LvWVbf3YkokMZPvir70vcDu0nNflgXoM0Y8aQU=";
 #[cfg(feature = "staging")]
+const STOGAS_STAGING_RELEASE_KEY_ID: &str = "stogas-ed25519-staging-v1";
+#[cfg(feature = "staging")]
+const STOGAS_STAGING_RELEASE_PUBLIC_KEY_DER_BASE64: &str =
+    "MCowBQYDK2VwAyEA9ZZ3IIUsWJXrzkbuq4lpdKBa8hpyKl/762vnj4VUXkA=";
+#[cfg(feature = "staging")]
 const STAGING_PROVENANCE_TYPE: &str = "https://stogas.ai/attestations/staging-development/v1";
 const HEARTBEAT_SIGNATURE_DOMAIN: &[u8] = b"stogas.gateway-heartbeat.v1\0";
 const CSR_SIGNATURE_DOMAIN: &[u8] = b"stogas.gateway-csr-submission.v1\0";
@@ -69,6 +74,10 @@ const HARDWARE_POLICY_DSSE_PAYLOAD_TYPE: &str = "application/vnd.stogas.hardware
 const SNP_PLATFORM_INFO_KNOWN_MASK: u64 = 0xbf;
 
 fn stogas_release_key(key_id: &str) -> Option<&'static str> {
+    #[cfg(feature = "staging")]
+    if key_id == STOGAS_STAGING_RELEASE_KEY_ID {
+        return Some(STOGAS_STAGING_RELEASE_PUBLIC_KEY_DER_BASE64);
+    }
     (key_id == STOGAS_RELEASE_KEY_ID).then_some(STOGAS_RELEASE_PUBLIC_KEY_DER_BASE64)
 }
 
@@ -5635,6 +5644,41 @@ mod tests {
         }
         #[cfg(not(feature = "staging"))]
         assert!(verify_release_with_key(&release, &key, 1_784_246_400_000).is_err());
+    }
+
+    #[test]
+    fn staging_signing_key_is_fixed_by_the_compiled_artifact() {
+        assert_eq!(
+            stogas_release_key(STOGAS_RELEASE_KEY_ID),
+            Some(STOGAS_RELEASE_PUBLIC_KEY_DER_BASE64)
+        );
+        assert!(stogas_release_key("unknown-release-key").is_none());
+        let staging_key = stogas_release_key("stogas-ed25519-staging-v1");
+        #[cfg(feature = "staging")]
+        {
+            assert_eq!(
+                staging_key,
+                Some(STOGAS_STAGING_RELEASE_PUBLIC_KEY_DER_BASE64)
+            );
+            assert_ne!(staging_key, Some(STOGAS_RELEASE_PUBLIC_KEY_DER_BASE64));
+        }
+        #[cfg(not(feature = "staging"))]
+        assert!(staging_key.is_none());
+
+        // Relabeling a production signature never creates a valid staging signature.
+        let mut release = release_fixture();
+        release.stogas_signature.key_id = "stogas-ed25519-staging-v1".into();
+        let release_error = verify_release(&release, 1_784_246_400_000)
+            .unwrap_err()
+            .to_string();
+        let mut catalog = catalog_fixture();
+        catalog.signed_release.key_id = "stogas-ed25519-staging-v1".into();
+        let catalog_error = verify_catalog(&catalog, 1_784_246_400_000)
+            .unwrap_err()
+            .to_string();
+        for error in [release_error, catalog_error] {
+            assert_eq!(error.contains("not trusted"), !cfg!(feature = "staging"));
+        }
     }
 
     #[test]
