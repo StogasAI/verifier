@@ -959,26 +959,23 @@ mod tests {
 
     fn catalog_evidence() -> AllowedCatalog {
         serde_json::from_value(json!({
-            "github_in_toto": [{}],
-            "signed_release": {
-                "keyId": "test",
-                "manifest": {
-                    "catalogSchema": 1,
-                    "minimumGatewaySequence": 1,
-                    "public": format!("sha256:{}", "55".repeat(32)),
-                    "runtime": format!("sha256:{}", "44".repeat(32)),
-                    "schema": "stogas.catalog.release.v1",
-                    "sequence": 7,
-                    "source": {
-                        "commit": "11".repeat(20),
-                        "repository": "https://github.com/StogasAI/catalog",
-                        "tag": "catalog-v7",
-                        "tree": "22".repeat(20)
-                    }
-                },
-                "schema": "stogas.catalog.signed.v1",
-                "signature": "test"
-            }
+            "schema": "stogas.release-evidence.v1",
+            "attested_builds": [{}],
+            "manifest": {
+                "catalogSchema": 1,
+                "minimumGatewaySequence": 1,
+                "public": format!("sha256:{}", "55".repeat(32)),
+                "runtime": format!("sha256:{}", "44".repeat(32)),
+                "schema": "stogas.catalog.release.v1",
+                "sequence": 7,
+                "source": {
+                    "commit": "11".repeat(20),
+                    "repository": "https://github.com/StogasAI/catalog",
+                    "tag": "catalog-v7",
+                    "tree": "22".repeat(20)
+                }
+            },
+            "signature": { "key_id": "test", "signature": URL_SAFE_NO_PAD.encode([0_u8; 64]) }
         }))
         .unwrap()
     }
@@ -989,11 +986,11 @@ mod tests {
         minimum_gateway_sequence: u64,
     ) -> VerifiedCatalogRelease {
         let mut evidence = catalog_evidence();
-        evidence.signed_release.manifest.runtime = runtime_digest.into();
-        evidence.signed_release.manifest.sequence = sequence;
-        evidence.signed_release.manifest.minimum_gateway_sequence = minimum_gateway_sequence;
-        evidence.signed_release.manifest.source.tag = format!("catalog-v{sequence}");
-        let manifest = evidence.signed_release.manifest.clone();
+        evidence.manifest.runtime = runtime_digest.into();
+        evidence.manifest.sequence = sequence;
+        evidence.manifest.minimum_gateway_sequence = minimum_gateway_sequence;
+        evidence.manifest.source.tag = format!("catalog-v{sequence}");
+        let manifest = evidence.manifest.clone();
         VerifiedCatalogRelease {
             evidence,
             github_integrated_time_unix_ms: Some(NOW - 10_000),
@@ -1012,34 +1009,34 @@ mod tests {
 
     fn release_evidence() -> AllowedIgvm {
         serde_json::from_value(json!({
-            "github_in_toto": [{}],
-            "release_manifest": {
+            "schema": "stogas.release-evidence.v1",
+            "attested_builds": [{}],
+            "manifest": {
                 "artifacts": {
                     "gateway.igvm": {"sha256": "bb".repeat(32), "sizeBytes": 1},
-                    "snp-launch-policies.json": {"sha256": "cc".repeat(32), "sizeBytes": 1}
                 },
                 "build": {
-                    "cmdlineSha256": "01".repeat(32),
-                    "coreGoModSha256": "02".repeat(32),
-                    "coreGoSumSha256": "03".repeat(32),
                     "environment": {"lcAll": "C", "sourceDateEpoch": "1", "tz": "UTC", "umask": "022"},
-                    "goModSha256": "04".repeat(32),
-                    "goSumSha256": "05".repeat(32),
                     "goVendorTreeSha256": "06".repeat(32),
                     "goVersion": "go1.25.0",
                     "guestCaBundlePath": "/etc/ssl/certs/ca-certificates.crt",
-                    "guestCaBundleSha256": "07".repeat(32),
                     "guixChannelCommit": "08".repeat(20),
                     "inputSha256": {
+                        "stogas/release/guix/cmdline.txt": "01".repeat(32),
+                        "core/go.mod": "02".repeat(32),
+                        "core/go.sum": "03".repeat(32),
+                        "transports/go.mod": "04".repeat(32),
+                        "transports/go.sum": "05".repeat(32),
+                        "guix/nss-certs/ca-certificates.crt": "07".repeat(32),
+                        "stogas/release/guix/os-release": "0c".repeat(32),
+                        "stogas/release/pins.lock.json": "0e".repeat(32),
                         "source": "09".repeat(32),
                         "stogas/release/snp-launch-policies.json": "cc".repeat(32)
                     },
                     "kernelConfigSha256": "0a".repeat(32),
                     "kernelVersion": "6.12.0",
                     "linuxBzImageSha256": "0b".repeat(32),
-                    "osReleaseSha256": "0c".repeat(32),
                     "ovmfSha256": "0d".repeat(32),
-                    "pinsLockSha256": "0e".repeat(32),
                     "systemdStubSha256": "0f".repeat(32),
                     "ukiSha256": "10".repeat(32)
                 },
@@ -1079,12 +1076,9 @@ mod tests {
                     "vmm": "qemu-kvm"
                 }
             },
-            "stogas_signature": {
-                "algorithm": "Ed25519",
+            "signature": {
                 "key_id": "test-release",
-                "schema": "stogas.gateway.counterbuild-signature.v1",
                 "signature": "test",
-                "signed": "release-manifest.json"
             }
         }))
         .unwrap()
@@ -1097,11 +1091,7 @@ mod tests {
             evidence: release_evidence.clone(),
             github_integrated_time_unix_ms: Some(NOW - 10_000),
             igvm_sha256: "bb".repeat(32),
-            launch_policies: release_evidence
-                .release_manifest
-                .sev_snp
-                .launch_policies
-                .clone(),
+            launch_policies: release_evidence.manifest.sev_snp.launch_policies.clone(),
             measurement: "aa".repeat(48),
             provenance: ReleaseProvenance::Github,
             release_manifest_sha256: "dd".repeat(32),
@@ -1141,6 +1131,7 @@ mod tests {
                 "sequence": 1,
                 "vendor_collateral": []
             },
+            "schema": "stogas.confidential-bundle-envelope.v1",
             "body_sha256": "00".repeat(32)
         }))
         .unwrap();

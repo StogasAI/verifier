@@ -7,6 +7,7 @@ use std::collections::BTreeMap;
 pub struct BundleEnvelope {
     pub body: BundleBody,
     pub body_sha256: String,
+    pub schema: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -63,18 +64,10 @@ pub struct AmdTcb {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct AllowedCatalog {
-    pub github_in_toto: Vec<Value>,
-    pub signed_release: SignedCatalogRelease,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct SignedCatalogRelease {
-    #[serde(rename = "keyId")]
-    pub key_id: String,
+    pub attested_builds: Vec<Value>,
     pub manifest: CatalogReleaseManifest,
     pub schema: String,
-    pub signature: String,
+    pub signature: StogasSignature,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -103,9 +96,10 @@ pub struct CatalogSource {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct AllowedIgvm {
-    pub github_in_toto: Vec<Value>,
-    pub release_manifest: GatewayReleaseManifest,
-    pub stogas_signature: CounterbuildSignature,
+    pub attested_builds: Vec<Value>,
+    pub manifest: GatewayReleaseManifest,
+    pub schema: String,
+    pub signature: StogasSignature,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -125,8 +119,6 @@ pub struct GatewayReleaseManifest {
 pub struct GatewayReleaseArtifacts {
     #[serde(rename = "gateway.igvm")]
     pub gateway_igvm: GatewayReleaseArtifact,
-    #[serde(rename = "snp-launch-policies.json")]
-    pub snp_launch_policies: GatewayReleaseArtifact,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -139,24 +131,16 @@ pub struct GatewayReleaseArtifact {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct GatewayReleaseBuild {
-    pub cmdline_sha256: String,
-    pub core_go_mod_sha256: String,
-    pub core_go_sum_sha256: String,
     pub environment: GatewayReleaseBuildEnvironment,
-    pub go_mod_sha256: String,
-    pub go_sum_sha256: String,
     pub go_vendor_tree_sha256: String,
     pub go_version: String,
     pub guest_ca_bundle_path: String,
-    pub guest_ca_bundle_sha256: String,
     pub guix_channel_commit: String,
     pub input_sha256: BTreeMap<String, String>,
     pub kernel_config_sha256: String,
     pub kernel_version: String,
     pub linux_bz_image_sha256: String,
-    pub os_release_sha256: String,
     pub ovmf_sha256: String,
-    pub pins_lock_sha256: String,
     pub systemd_stub_sha256: String,
     pub uki_sha256: String,
 }
@@ -224,12 +208,9 @@ pub struct AmdSevSnpLaunchPolicy {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-pub struct CounterbuildSignature {
-    pub algorithm: String,
+pub struct StogasSignature {
     pub key_id: String,
-    pub schema: String,
     pub signature: String,
-    pub signed: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]

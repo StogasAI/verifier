@@ -58,6 +58,8 @@ stogas-verify verify bundle.json
 
 Use `-` to read from standard input. The command prints the verified release, trusted gateways, excluded stale gateways, and bundle expiry.
 
+Gateway and catalog releases contain `schema: "stogas.release-evidence.v1"`, `manifest`, `signature`, and `attested_builds`. The verifier requires the Stogas approval signature and one GitHub Actions proof covering the exact manifest plus its build artifacts. Gateway launch policies are embedded in the manifest. The Stogas signature proves approval, not an attested independent rebuild.
+
 Each bundle has one hardware policy document with a Stogas Ed25519 DSSE signature and Rekor v1 proof. Each policy group lists the exact processor IDs that share its expected CPUID, AMD SEV-SNP minimum TCB, required report-v5 mitigation bits, and required platform state. It has no launch-policy field or pointer. The verifier derives the AMD product from signed report and VCEK fields; it does not accept a hardware label. The proof shows that Stogas signed and published the complete document. It does not prove that the policy matches every customer's risk decision. The schema name versions the format; the document has no ordering counter.
 
 To own that decision, copy `body.hardware_policy.policy` from a bundle, review or tighten its requirements, and pass the bare policy file. The local file must keep every signed `chip_id`:
@@ -105,8 +107,8 @@ console.log(result.bundle.nodes);
 Use `verify_bundle_with_policy(bundleBytes, policyBytes)` to replace the mutable hardware requirements. Managed SDK transports accept the same bare policy as `hardwarePolicy` in JavaScript, `hardware_policy` in Rust and Python, and `HardwarePolicy` in Go. `result.bundle.hardware_policy` reports the processor IDs, policy count, hash, source, Stogas key ID, and verified Rekor time when the bundled default was used.
 
 `result.bundle.catalogs` contains up to two verified catalog approvals. Each approval requires one
-GitHub Actions attestation over the runtime and public hashes and one separate Stogas-signed
-manifest from an independent build with the same hashes. The node signs its active catalog in
+GitHub Actions attestation and a Stogas approval signature over the same canonical manifest,
+which binds the runtime and public hashes. The node signs its active catalog in
 heartbeats and signs the catalog used for each response receipt; catalog identity is not report data.
 
 Browser code imports `@stogas/verifier/browser` and calls its default WebAssembly initializer once. Its `StogasTransport` verifies bundles, encrypts requests to every accepted node, and supplies a custom `fetch` for the OpenAI JavaScript client. Browser `fetch` does not expose the peer certificate, so direct browser mode provides E2EE rather than attested TLS.
@@ -193,7 +195,7 @@ Java 22+ and other JVM languages can use the Foreign Function & Memory API, .NET
 A trusted result means that:
 
 - GitHub built and attested the IGVM and complete release manifest from the expected Stogas gateway repository and workflow;
-- the separate Stogas counterbuild approval authorizes that exact manifest, including the IGVM hash and launch values, after a matching rebuild;
+- the Stogas release signature authorizes that exact manifest, including the IGVM hash and launch values;
 - the hardware document has a valid Stogas Ed25519 DSSE signature and Rekor v1 inclusion proof;
 - each processor assignment selects exactly one compatible launch rule in that release;
 - each trusted gateway presents a valid AMD SEV-SNP report for an authorized launch measurement;
@@ -206,6 +208,10 @@ A trusted result means that:
 - the bundle was created no more than three minutes before or one minute after local verification, remains unexpired, and has a positive validity interval of no more than 15 minutes;
 - every trusted gateway certificate and required AMD validity deadline covers that complete interval;
 - each trusted gateway's drand evidence was no more than two minutes old when the bundle was created.
+
+Stogas rebuilds gateway and catalog artifacts before approving matching manifests. The signatures
+prove that approval, not that the rebuilds happened; the verifier does not authenticate the Stogas
+builder or establish that it did not copy GitHub's output.
 
 Older valid records are returned under `excluded_nodes`; they are never added to the trusted node set.
 

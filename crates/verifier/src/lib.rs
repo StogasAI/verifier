@@ -68,6 +68,9 @@ const STOGAS_STAGING_RELEASE_PUBLIC_KEY_DER_BASE64: &str =
     "MCowBQYDK2VwAyEA9ZZ3IIUsWJXrzkbuq4lpdKBa8hpyKl/762vnj4VUXkA=";
 #[cfg(feature = "staging")]
 const STAGING_PROVENANCE_TYPE: &str = "https://stogas.ai/attestations/staging-development/v1";
+const STOGAS_SIGNATURE_DOMAIN: &[u8] = b"stogas signed document v1\n";
+const RELEASE_EVIDENCE_SCHEMA: &str = "stogas.release-evidence.v1";
+const BUNDLE_ENVELOPE_SCHEMA: &str = "stogas.confidential-bundle-envelope.v1";
 const HEARTBEAT_SIGNATURE_DOMAIN: &[u8] = b"stogas.gateway-heartbeat.v1\0";
 const CSR_SIGNATURE_DOMAIN: &[u8] = b"stogas.gateway-csr-submission.v1\0";
 const HARDWARE_POLICY_DSSE_PAYLOAD_TYPE: &str = "application/vnd.stogas.hardware-policies.v1+json";
@@ -581,7 +584,7 @@ pub fn verify_node_ledger_record(record_bytes: &[u8]) -> Result<VerifiedNodeLedg
             "node ledger release measurement is invalid".into(),
         ));
     }
-    if record.release_measurement != hydrated.release.release_manifest.sev_snp.launch_measurement {
+    if record.release_measurement != hydrated.release.manifest.sev_snp.launch_measurement {
         return Err(Error::InvalidBundle(
             "node ledger release reference differs from its stapled provenance".into(),
         ));
@@ -610,7 +613,7 @@ pub fn verify_node_ledger_record(record_bytes: &[u8]) -> Result<VerifiedNodeLedg
     )?;
     let release_manifests = BTreeMap::from([(
         record.release_measurement.as_str(),
-        &hydrated.release.release_manifest,
+        &hydrated.release.manifest,
     )]);
     let amd_node_identities = [AmdNodeIdentity {
         chip_id: node.chip_id.clone(),
@@ -1273,7 +1276,7 @@ pub fn verify_local_heartbeat_admission(
     {
         return Err(Error::Node("unknown local chip id".into()));
     }
-    let release_manifest = request
+    let manifest = request
         .release_manifests
         .iter()
         .find(|manifest| {
@@ -1314,7 +1317,7 @@ pub fn verify_local_heartbeat_admission(
         if let Some(report) = identity.raw_report.as_deref() {
             verify_local_raw_snp_report(
                 &node,
-                release_manifest,
+                manifest,
                 report,
                 request.amd_report_signing_public_key.as_deref(),
             )?;
@@ -1648,12 +1651,11 @@ fn inspect_local_raw_quote(request: &LocalAdmissionRequest) -> Result<LocalQuote
 #[cfg(feature = "snp")]
 fn verify_local_raw_snp_report(
     node: &Node,
-    release_manifest: &GatewayReleaseManifest,
+    manifest: &GatewayReleaseManifest,
     report: &[u8],
     public_key: Option<&str>,
 ) -> Result<(), Error> {
-    let launch =
-        compatible_launch_policy(&release_manifest.sev_snp.launch_policies, &node.chip_id)?;
+    let launch = compatible_launch_policy(&manifest.sev_snp.launch_policies, &node.chip_id)?;
     let report_version = u32::from_le_bytes(report[0x00..0x04].try_into().unwrap_or_default());
     let product = inspect_report_product(report, report_version)?
         .3
@@ -1667,7 +1669,7 @@ fn verify_local_raw_snp_report(
         report_data_sha512: &node.report_data_sha512,
         reported_tcb: &node.reported_tcb,
     };
-    check_raw_report_bindings(&evidence, release_manifest, launch, report, None)?;
+    check_raw_report_bindings(&evidence, manifest, launch, report, None)?;
     let expected_policy = u64::from_str_radix(launch.policy.trim_start_matches("0x"), 16)
         .map_err(|_| Error::Node("invalid launch policy value".into()))?;
     validate_snp_launch_policy(expected_policy, Some(product))?;
@@ -2110,8 +2112,8 @@ fn verify_bundle_inner(
         .iter()
         .map(|release| {
             (
-                release.release_manifest.sev_snp.launch_measurement.as_str(),
-                &release.release_manifest,
+                release.manifest.sev_snp.launch_measurement.as_str(),
+                &release.manifest,
             )
         })
         .collect();
@@ -2217,6 +2219,11 @@ fn approval_cache_key(approval: &impl serde::Serialize) -> Result<ApprovalCacheK
 }
 
 fn validate_shape(envelope: &BundleEnvelope) -> Result<(), Error> {
+    if envelope.schema != BUNDLE_ENVELOPE_SCHEMA {
+        return Err(Error::InvalidBundle(
+            "unsupported bundle envelope schema".into(),
+        ));
+    }
     if envelope.body.schema != "stogas.confidential-bundle.v1" {
         return Err(Error::InvalidBundle("unsupported schema".into()));
     }
@@ -2234,14 +2241,14 @@ fn validate_shape(envelope: &BundleEnvelope) -> Result<(), Error> {
     let mut measurements = BTreeSet::new();
     for release in &envelope.body.allowed_igvms {
         validate_release_shape(release)?;
-        if !measurements.insert(release.release_manifest.sev_snp.launch_measurement.clone()) {
+        if !measurements.insert(release.manifest.sev_snp.launch_measurement.clone()) {
             return Err(Error::InvalidBundle("duplicate release measurement".into()));
         }
     }
     let mut catalog_sequences = BTreeSet::new();
     for catalog in &envelope.body.catalogs {
         validate_catalog_shape(catalog)?;
-        let manifest = &catalog.signed_release.manifest;
+        let manifest = &catalog.manifest;
         if !catalog_sequences.insert(manifest.sequence) {
             return Err(Error::InvalidBundle("duplicate catalog sequence".into()));
         }
@@ -2274,12 +2281,11 @@ fn validate_shape(envelope: &BundleEnvelope) -> Result<(), Error> {
             .allowed_igvms
             .iter()
             .find(|release| {
-                release.release_manifest.sev_snp.launch_measurement
-                    == evidence.identity.release_measurement
+                release.manifest.sev_snp.launch_measurement == evidence.identity.release_measurement
             })
             .ok_or_else(|| Error::InvalidBundle("node release evidence is absent".into()))?;
         compatible_launch_policy(
-            &release.release_manifest.sev_snp.launch_policies,
+            &release.manifest.sev_snp.launch_policies,
             &evidence.identity.chip_id,
         )?;
         referenced_chip_ids.insert(evidence.identity.chip_id.clone());
@@ -2297,10 +2303,10 @@ fn validate_shape(envelope: &BundleEnvelope) -> Result<(), Error> {
 fn validate_catalog_shape(catalog: &AllowedCatalog) -> Result<(), Error> {
     const MAX_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
 
-    let release = &catalog.signed_release;
+    let release = catalog;
     let manifest = &release.manifest;
-    if catalog.github_in_toto.len() != 1
-        || release.schema != "stogas.catalog.signed.v1"
+    if catalog.schema != RELEASE_EVIDENCE_SCHEMA
+        || catalog.attested_builds.len() != 1
         || manifest.schema != "stogas.catalog.release.v1"
         || manifest.catalog_schema != 1
         || manifest.minimum_gateway_sequence == 0
@@ -2313,8 +2319,8 @@ fn validate_catalog_shape(catalog: &AllowedCatalog) -> Result<(), Error> {
         || !is_lower_hex(&manifest.source.tree, 20)
         || !is_sha256_identity(&manifest.runtime)
         || !is_sha256_identity(&manifest.public)
-        || release.key_id.is_empty()
-        || release.key_id.len() > 200
+        || release.signature.key_id.is_empty()
+        || release.signature.key_id.len() > 200
     {
         return Err(Error::InvalidBundle("invalid catalog release shape".into()));
     }
@@ -2341,12 +2347,11 @@ fn validate_gateway_release_manifest(manifest: &GatewayReleaseManifest) -> Resul
         })?,
     )?;
     let launch_policies_sha256 = hex::encode(Sha256::digest(launch_policies.as_bytes()));
-    if launch_policies_sha256 != manifest.artifacts.snp_launch_policies.sha256
-        || manifest
-            .build
-            .input_sha256
-            .get("stogas/release/snp-launch-policies.json")
-            != Some(&launch_policies_sha256)
+    if manifest
+        .build
+        .input_sha256
+        .get("stogas/release/snp-launch-policies.json")
+        != Some(&launch_policies_sha256)
     {
         return Err(Error::InvalidBundle(
             "gateway launch policy artifact does not match the release manifest".into(),
@@ -2368,9 +2373,6 @@ fn gateway_release_manifest_shape_is_valid(manifest: &GatewayReleaseManifest) ->
         && is_lower_hex(&manifest.artifacts.gateway_igvm.sha256, 32)
         && manifest.artifacts.gateway_igvm.size_bytes > 0
         && manifest.artifacts.gateway_igvm.size_bytes <= 128 * 1024 * 1024
-        && is_lower_hex(&manifest.artifacts.snp_launch_policies.sha256, 32)
-        && manifest.artifacts.snp_launch_policies.size_bytes > 0
-        && manifest.artifacts.snp_launch_policies.size_bytes <= 16 * 1024 * 1024
         && sev_snp.check_kvm
         && sev_snp.platform == "SEV_SNP"
         && sev_snp.vmm == "qemu-kvm"
@@ -2397,19 +2399,28 @@ fn gateway_release_manifest_shape_is_valid(manifest: &GatewayReleaseManifest) ->
 }
 
 fn validate_gateway_release_build(build: &GatewayReleaseBuild) -> Result<(), Error> {
+    for path in [
+        "core/go.mod",
+        "core/go.sum",
+        "transports/go.mod",
+        "transports/go.sum",
+        "guix/nss-certs/ca-certificates.crt",
+        "stogas/release/guix/cmdline.txt",
+        "stogas/release/guix/os-release",
+        "stogas/release/pins.lock.json",
+    ] {
+        if !build.input_sha256.contains_key(path) {
+            return Err(Error::InvalidBundle(format!(
+                "gateway build input is absent: {path}"
+            )));
+        }
+    }
+
     for digest in [
-        &build.cmdline_sha256,
-        &build.core_go_mod_sha256,
-        &build.core_go_sum_sha256,
-        &build.go_mod_sha256,
-        &build.go_sum_sha256,
         &build.go_vendor_tree_sha256,
-        &build.guest_ca_bundle_sha256,
         &build.kernel_config_sha256,
         &build.linux_bz_image_sha256,
-        &build.os_release_sha256,
         &build.ovmf_sha256,
-        &build.pins_lock_sha256,
         &build.systemd_stub_sha256,
         &build.uki_sha256,
     ] {
@@ -2508,8 +2519,13 @@ fn compatible_launch_policy<'a>(
 }
 
 fn validate_release_shape(release: &AllowedIgvm) -> Result<(), Error> {
-    validate_gateway_release_manifest(&release.release_manifest)?;
-    if release.github_in_toto.len() != 1 {
+    if release.schema != RELEASE_EVIDENCE_SCHEMA {
+        return Err(Error::InvalidBundle(
+            "unsupported release evidence schema".into(),
+        ));
+    }
+    validate_gateway_release_manifest(&release.manifest)?;
+    if release.attested_builds.len() != 1 {
         return Err(Error::InvalidBundle(
             "a release must contain exactly one GitHub attestation".into(),
         ));
@@ -2647,8 +2663,8 @@ fn verify_catalog(
     catalog: &AllowedCatalog,
     now_unix_ms: i64,
 ) -> Result<VerifiedCatalogRelease, Error> {
-    let signed = &catalog.signed_release;
-    let key = stogas_release_key(&signed.key_id)
+    let signed = catalog;
+    let key = stogas_release_key(&signed.signature.key_id)
         .ok_or_else(|| Error::Release("catalog signing key is not trusted".into()))?;
     verify_catalog_with_key(catalog, key, now_unix_ms)
 }
@@ -2659,7 +2675,7 @@ fn verify_catalog_with_key(
     now_unix_ms: i64,
 ) -> Result<VerifiedCatalogRelease, Error> {
     validate_catalog_shape(catalog)?;
-    let signed = &catalog.signed_release;
+    let signed = catalog;
     let manifest = &signed.manifest;
     let manifest_value =
         serde_json::to_value(manifest).map_err(|error| Error::Release(error.to_string()))?;
@@ -2667,13 +2683,13 @@ fn verify_catalog_with_key(
     let signed_canonical = canonical
         .strip_suffix('\n')
         .ok_or_else(|| Error::Release("catalog canonical manifest is invalid".into()))?;
-    let manifest_digest = hex::encode(Sha256::digest(signed_canonical.as_bytes()));
-    let mut payload = b"stogas catalog release v1\n".to_vec();
+    let manifest_digest = hex::encode(Sha256::digest(canonical.as_bytes()));
+    let mut payload = STOGAS_SIGNATURE_DOMAIN.to_vec();
     payload.extend_from_slice(signed_canonical.as_bytes());
-    verify_ed25519(key, &payload, &signed.signature).map_err(Error::Release)?;
+    verify_ed25519(key, &payload, &signed.signature.signature).map_err(Error::Release)?;
 
     let attestation = catalog
-        .github_in_toto
+        .attested_builds
         .first()
         .ok_or_else(|| Error::Release("catalog GitHub attestation is absent".into()))?;
     let attestation_bytes =
@@ -2693,7 +2709,7 @@ fn verify_catalog_with_key(
         source_repository: manifest.source.repository.clone(),
         source_tag: manifest.source.tag.clone(),
         source_tree: manifest.source.tree.clone(),
-        stogas_signing_key_id: signed.key_id.clone(),
+        stogas_signing_key_id: signed.signature.key_id.clone(),
     })
 }
 
@@ -2706,7 +2722,11 @@ fn verify_catalog_provenance(
     #[cfg(feature = "staging")]
     if is_staging_development_provenance(
         attestation_bytes,
-        &[("catalog-release.json", manifest_digest)],
+        &[
+            ("catalog-release.json", manifest_digest),
+            ("catalog.runtime.json", &manifest.runtime[7..]),
+            ("catalog.public.json", &manifest.public[7..]),
+        ],
     )? {
         return Ok((None, ReleaseProvenance::Staging));
     }
@@ -2717,10 +2737,20 @@ fn verify_catalog_provenance(
     );
     verify_github_provenance(
         attestation_bytes,
-        &[Subject {
-            name: "catalog-release.json",
-            sha256: manifest_digest,
-        }],
+        &[
+            Subject {
+                name: "catalog-release.json",
+                sha256: manifest_digest,
+            },
+            Subject {
+                name: "catalog.runtime.json",
+                sha256: &manifest.runtime[7..],
+            },
+            Subject {
+                name: "catalog.public.json",
+                sha256: &manifest.public[7..],
+            },
+        ],
         &GithubPolicy {
             repository: manifest.source.repository.clone(),
             workflow_identity,
@@ -2735,7 +2765,7 @@ fn verify_catalog_provenance(
 }
 
 fn verify_release(release: &AllowedIgvm, now_unix_ms: i64) -> Result<VerifiedRelease, Error> {
-    let signature = &release.stogas_signature;
+    let signature = &release.signature;
     let key = stogas_release_key(&signature.key_id)
         .ok_or_else(|| Error::Release("release signing key is not trusted".into()))?;
     verify_release_with_key(release, key, now_unix_ms)
@@ -2747,26 +2777,17 @@ fn verify_release_with_key(
     now_unix_ms: i64,
 ) -> Result<VerifiedRelease, Error> {
     validate_release_shape(release)?;
-    let manifest = &release.release_manifest;
-    let signature = &release.stogas_signature;
-    if manifest.schema != "stogas.gateway.release.v1"
-        || signature.schema != "stogas.gateway.counterbuild-signature.v1"
-        || signature.algorithm != "Ed25519"
-        || signature.signed != "release-manifest.json"
-    {
-        return Err(Error::Release(
-            "unsupported release manifest or counterbuild signature".into(),
-        ));
-    }
+    let manifest = &release.manifest;
+    let signature = &release.signature;
     let manifest_value =
         serde_json::to_value(manifest).map_err(|error| Error::Release(error.to_string()))?;
     let canonical = canonical_json(&manifest_value)?;
-    let mut payload = b"stogas gateway counterbuild v1\n".to_vec();
-    payload.extend_from_slice(canonical.as_bytes());
+    let mut payload = STOGAS_SIGNATURE_DOMAIN.to_vec();
+    payload.extend_from_slice(canonical.trim_end_matches('\n').as_bytes());
     verify_ed25519(key, &payload, &signature.signature).map_err(Error::Release)?;
 
     let attestation_value = release
-        .github_in_toto
+        .attested_builds
         .first()
         .ok_or_else(|| Error::Release("GitHub attestation is absent".into()))?;
     let attestation_bytes =
@@ -2802,7 +2823,10 @@ fn verify_release_provenance(
     #[cfg(feature = "staging")]
     if is_staging_development_provenance(
         attestation_bytes,
-        &[("release-manifest.json", manifest_digest)],
+        &[
+            ("release-manifest.json", manifest_digest),
+            ("gateway.igvm", &manifest.artifacts.gateway_igvm.sha256),
+        ],
     )? {
         return Ok((None, ReleaseProvenance::Staging));
     }
@@ -2813,10 +2837,16 @@ fn verify_release_provenance(
     );
     verify_github_provenance(
         attestation_bytes,
-        &[Subject {
-            name: "release-manifest.json",
-            sha256: manifest_digest,
-        }],
+        &[
+            Subject {
+                name: "release-manifest.json",
+                sha256: manifest_digest,
+            },
+            Subject {
+                name: "gateway.igvm",
+                sha256: &manifest.artifacts.gateway_igvm.sha256,
+            },
+        ],
         &GithubPolicy {
             repository: manifest.git.repository.clone(),
             workflow_identity,
@@ -3056,7 +3086,7 @@ fn verify_attested_node(
     amd_stacks: &BTreeMap<String, AmdCollateralStack>,
     hardware_policy: &AmdSevSnpPolicy,
 ) -> Result<VerifiedNode, Error> {
-    let release_manifest = release_manifests
+    let manifest = release_manifests
         .get(node.release_measurement)
         .ok_or_else(|| {
             Error::Node(format!(
@@ -3095,10 +3125,10 @@ fn verify_attested_node(
     let amd_stack = amd_stacks
         .get(&amd_platform_key(node.chip_id, node.reported_tcb))
         .ok_or_else(|| Error::Node(format!("{} has no matching AMD evidence", node.node_id)))?;
-    let launch = compatible_launch_policy(&release_manifest.sev_snp.launch_policies, node.chip_id)?;
+    let launch = compatible_launch_policy(&manifest.sev_snp.launch_policies, node.chip_id)?;
     verify_snp_node(
         node,
-        release_manifest,
+        manifest,
         launch,
         verification_time.bundle_created_at,
         verification_time.bundle_expires_at,
@@ -3495,7 +3525,7 @@ fn decode_snp_report(quote_value: &str, node_id: &str) -> Result<Vec<u8>, Error>
 #[cfg(feature = "snp")]
 fn verify_snp_node(
     node: &AttestedNode<'_>,
-    release_manifest: &GatewayReleaseManifest,
+    manifest: &GatewayReleaseManifest,
     launch: &LaunchValues,
     bundle_created_at: i64,
     bundle_expires_at: i64,
@@ -3503,13 +3533,7 @@ fn verify_snp_node(
     hardware_policy: &AmdSevSnpPolicy,
 ) -> Result<(), Error> {
     let report_bytes = decode_snp_report(node.quote, node.node_id)?;
-    check_raw_report_bindings(
-        node,
-        release_manifest,
-        launch,
-        &report_bytes,
-        Some(hardware_policy),
-    )?;
+    check_raw_report_bindings(node, manifest, launch, &report_bytes, Some(hardware_policy))?;
     verify_amd_collateral_stack(
         collateral,
         node.chip_id,
@@ -3542,7 +3566,7 @@ fn verify_snp_node(
 #[cfg(feature = "snp")]
 fn check_raw_report_bindings(
     node: &AttestedNode<'_>,
-    release_manifest: &GatewayReleaseManifest,
+    manifest: &GatewayReleaseManifest,
     launch: &LaunchValues,
     report: &[u8],
     hardware_policy: Option<&AmdSevSnpPolicy>,
@@ -3590,8 +3614,7 @@ fn check_raw_report_bindings(
             "report data",
         ),
         (
-            report[0x90..0xc0]
-                == bytes::<48>(&release_manifest.sev_snp.launch_measurement, "measurement")?,
+            report[0x90..0xc0] == bytes::<48>(&manifest.sev_snp.launch_measurement, "measurement")?,
             "measurement",
         ),
         (
@@ -4732,37 +4755,34 @@ mod tests {
         let launch_policies_bytes = canonical_json(&launch_policies).unwrap();
         let launch_policies_sha256 = hex::encode(Sha256::digest(launch_policies_bytes.as_bytes()));
         serde_json::from_value(serde_json::json!({
-            "github_in_toto": [{}],
-            "release_manifest": {
+            "schema": "stogas.release-evidence.v1",
+            "attested_builds": [{}],
+            "manifest": {
                 "artifacts": {
                     "gateway.igvm": { "sha256": "11".repeat(32), "sizeBytes": 1 },
-                    "snp-launch-policies.json": {
-                        "sha256": launch_policies_sha256,
-                        "sizeBytes": launch_policies_bytes.len()
-                    }
                 },
                 "build": {
-                    "cmdlineSha256": "12".repeat(32),
-                    "coreGoModSha256": "13".repeat(32),
-                    "coreGoSumSha256": "14".repeat(32),
                     "environment": { "lcAll": "C", "sourceDateEpoch": "1", "tz": "UTC", "umask": "022" },
-                    "goModSha256": "15".repeat(32),
-                    "goSumSha256": "16".repeat(32),
                     "goVendorTreeSha256": "17".repeat(32),
                     "goVersion": "go1.25.0",
                     "guestCaBundlePath": "/etc/ssl/certs/ca-certificates.crt",
-                    "guestCaBundleSha256": "18".repeat(32),
                     "guixChannelCommit": "19".repeat(20),
                     "inputSha256": {
+                        "stogas/release/guix/cmdline.txt": "12".repeat(32),
+                        "core/go.mod": "13".repeat(32),
+                        "core/go.sum": "14".repeat(32),
+                        "transports/go.mod": "15".repeat(32),
+                        "transports/go.sum": "16".repeat(32),
+                        "guix/nss-certs/ca-certificates.crt": "18".repeat(32),
+                        "stogas/release/guix/os-release": "23".repeat(32),
+                        "stogas/release/pins.lock.json": "25".repeat(32),
                         "source": "20".repeat(32),
                         "stogas/release/snp-launch-policies.json": launch_policies_sha256
                     },
                     "kernelConfigSha256": "21".repeat(32),
                     "kernelVersion": "6.12.0",
                     "linuxBzImageSha256": "22".repeat(32),
-                    "osReleaseSha256": "23".repeat(32),
                     "ovmfSha256": "24".repeat(32),
-                    "pinsLockSha256": "25".repeat(32),
                     "systemdStubSha256": "26".repeat(32),
                     "ukiSha256": "27".repeat(32)
                 },
@@ -4788,12 +4808,9 @@ mod tests {
                     "vmm": "qemu-kvm"
                 }
             },
-            "stogas_signature": {
-                "algorithm": "Ed25519",
+            "signature": {
                 "key_id": STOGAS_RELEASE_KEY_ID,
-                "schema": "stogas.gateway.counterbuild-signature.v1",
                 "signature": URL_SAFE_NO_PAD.encode([0_u8; 64]),
-                "signed": "release-manifest.json"
             }
         }))
         .unwrap()
@@ -4801,32 +4818,29 @@ mod tests {
 
     fn catalog_fixture() -> AllowedCatalog {
         serde_json::from_value(serde_json::json!({
-            "github_in_toto": [{}],
-            "signed_release": {
-                "keyId": "test",
-                "manifest": {
-                    "catalogSchema": 1,
-                    "minimumGatewaySequence": 1,
-                    "public": format!("sha256:{}", "11".repeat(32)),
-                    "runtime": format!("sha256:{}", "22".repeat(32)),
-                    "schema": "stogas.catalog.release.v1",
-                    "sequence": 1,
-                    "source": {
-                        "commit": "33".repeat(20),
-                        "repository": "https://github.com/StogasAI/catalog",
-                        "tag": "catalog-v1",
-                        "tree": "44".repeat(20)
-                    }
-                },
-                "schema": "stogas.catalog.signed.v1",
-                "signature": "test"
-            }
+            "schema": "stogas.release-evidence.v1",
+            "attested_builds": [{}],
+            "manifest": {
+                "catalogSchema": 1,
+                "minimumGatewaySequence": 1,
+                "public": format!("sha256:{}", "11".repeat(32)),
+                "runtime": format!("sha256:{}", "22".repeat(32)),
+                "schema": "stogas.catalog.release.v1",
+                "sequence": 1,
+                "source": {
+                    "commit": "33".repeat(20),
+                    "repository": "https://github.com/StogasAI/catalog",
+                    "tag": "catalog-v1",
+                    "tree": "44".repeat(20)
+                }
+            },
+            "signature": { "key_id": "test", "signature": URL_SAFE_NO_PAD.encode([0_u8; 64]) }
         }))
         .unwrap()
     }
 
     #[test]
-    fn bundle_sequence_is_not_a_trust_input() {
+    fn bundle_envelope_requires_supported_schema_without_trusting_sequence() {
         let hardware_policy: SignedHardwarePolicy = serde_json::from_str(include_str!(
             "../tests/fixtures/milan-hardware-policy.signed.json"
         ))
@@ -4843,10 +4857,28 @@ mod tests {
                 sequence: 0,
                 vendor_collateral: Vec::new(),
             },
+            schema: BUNDLE_ENVELOPE_SCHEMA.into(),
             body_sha256: "00".repeat(32),
         };
 
         validate_shape(&envelope).unwrap();
+        for schema in [
+            None,
+            Some(Value::Null),
+            Some(1.into()),
+            Some("stogas.confidential-bundle-envelope.v2".into()),
+        ] {
+            let mut value = serde_json::to_value(&envelope).unwrap();
+            if let Some(schema) = schema {
+                value["schema"] = schema;
+            } else {
+                value.as_object_mut().unwrap().remove("schema");
+            }
+            assert!(
+                !serde_json::from_value::<BundleEnvelope>(value)
+                    .is_ok_and(|changed| validate_shape(&changed).is_ok())
+            );
+        }
     }
 
     #[test]
@@ -4867,6 +4899,7 @@ mod tests {
                 sequence: 1,
                 vendor_collateral: Vec::new(),
             },
+            schema: BUNDLE_ENVELOPE_SCHEMA.into(),
             body_sha256: "00".repeat(32),
         };
         validate_shape(&envelope).unwrap();
@@ -4874,13 +4907,13 @@ mod tests {
         validate_shape(&envelope).unwrap();
 
         let mut repeated_runtime = catalog_fixture();
-        repeated_runtime.signed_release.manifest.sequence = 2;
-        repeated_runtime.signed_release.manifest.source.tag = "catalog-v2".into();
+        repeated_runtime.manifest.sequence = 2;
+        repeated_runtime.manifest.source.tag = "catalog-v2".into();
         envelope.body.catalogs.push(repeated_runtime);
         validate_shape(&envelope).unwrap();
 
-        envelope.body.catalogs[1].signed_release.manifest.sequence = 1;
-        envelope.body.catalogs[1].signed_release.manifest.source.tag = "catalog-v1".into();
+        envelope.body.catalogs[1].manifest.sequence = 1;
+        envelope.body.catalogs[1].manifest.source.tag = "catalog-v1".into();
         assert!(
             validate_shape(&envelope)
                 .unwrap_err()
@@ -4946,6 +4979,7 @@ mod tests {
                 sequence: 1,
                 vendor_collateral: Vec::new(),
             },
+            schema: BUNDLE_ENVELOPE_SCHEMA.into(),
             body_sha256: "00".repeat(32),
         };
         validate_shape(&envelope).unwrap();
@@ -5227,7 +5261,7 @@ mod tests {
     fn local_admission_fixture(now_unix_ms: i64) -> serde_json::Value {
         use ed25519_dalek::{Signer as _, SigningKey};
 
-        let release_manifest = release_fixture().release_manifest;
+        let manifest = release_fixture().manifest;
         let heartbeat_signing_key = SigningKey::from_bytes(&[7_u8; 32]);
         let report_data = ReportData {
             accepted_cert_sha256: vec!["11".repeat(32)],
@@ -5276,7 +5310,7 @@ mod tests {
                 "report_data_sha512": report_data_sha512,
                 "signature": ""
             },
-            "release_manifests": [release_manifest],
+            "release_manifests": [manifest],
             "region": "local",
             "trusted_chip_ids": ["66".repeat(64)]
         });
@@ -5296,7 +5330,7 @@ mod tests {
         let request = local_admission_fixture(now);
         let heartbeat: HeartbeatCandidate =
             serde_json::from_value(request["heartbeat"].clone()).unwrap();
-        let mut manifest = release_fixture().release_manifest;
+        let mut manifest = release_fixture().manifest;
         manifest.sev_snp.launch_policies.policies[0].launch.policy = "0x000000000013013a".into();
         let node = Node {
             cert_expires_at: heartbeat.cert_expires_at,
@@ -5549,13 +5583,11 @@ mod tests {
         use ed25519_dalek::{Signer as _, SigningKey, pkcs8::EncodePublicKey as _};
 
         let signing_key = SigningKey::from_bytes(&[0x42; 32]);
-        let canonical =
-            canonical_json(&serde_json::to_value(&release.release_manifest).unwrap()).unwrap();
-        let mut payload = b"stogas gateway counterbuild v1\n".to_vec();
-        payload.extend_from_slice(canonical.as_bytes());
-        release.stogas_signature.key_id = "test-release-key".into();
-        release.stogas_signature.signature =
-            URL_SAFE_NO_PAD.encode(signing_key.sign(&payload).to_bytes());
+        let canonical = canonical_json(&serde_json::to_value(&release.manifest).unwrap()).unwrap();
+        let mut payload = STOGAS_SIGNATURE_DOMAIN.to_vec();
+        payload.extend_from_slice(canonical.trim_end_matches('\n').as_bytes());
+        release.signature.key_id = "test-release-key".into();
+        release.signature.signature = URL_SAFE_NO_PAD.encode(signing_key.sign(&payload).to_bytes());
         STANDARD.encode(
             signing_key
                 .verifying_key()
@@ -5569,15 +5601,12 @@ mod tests {
         use ed25519_dalek::{Signer as _, SigningKey, pkcs8::EncodePublicKey as _};
 
         let signing_key = SigningKey::from_bytes(&[0x42; 32]);
-        let canonical =
-            canonical_json(&serde_json::to_value(&catalog.signed_release.manifest).unwrap())
-                .unwrap();
+        let canonical = canonical_json(&serde_json::to_value(&catalog.manifest).unwrap()).unwrap();
         let canonical = canonical.strip_suffix('\n').unwrap();
-        let mut payload = b"stogas catalog release v1\n".to_vec();
-        payload.extend_from_slice(canonical.as_bytes());
-        catalog.signed_release.key_id = "test-release-key".into();
-        catalog.signed_release.signature =
-            URL_SAFE_NO_PAD.encode(signing_key.sign(&payload).to_bytes());
+        let mut payload = STOGAS_SIGNATURE_DOMAIN.to_vec();
+        payload.extend_from_slice(canonical.trim_end_matches('\n').as_bytes());
+        catalog.signature.key_id = "test-release-key".into();
+        catalog.signature.signature = URL_SAFE_NO_PAD.encode(signing_key.sign(&payload).to_bytes());
         STANDARD.encode(
             signing_key
                 .verifying_key()
@@ -5603,7 +5632,7 @@ mod tests {
     #[test]
     fn release_manifest_rejects_nonzero_vmpl() {
         let mut release = release_fixture();
-        release.release_manifest.sev_snp.launch_policies.policies[0]
+        release.manifest.sev_snp.launch_policies.policies[0]
             .launch
             .vmpl = 1;
         let error = validate_release_shape(&release).unwrap_err();
@@ -5612,23 +5641,57 @@ mod tests {
 
     #[test]
     fn release_approval_boundary_rejects_duplicate_fields() {
-        let duplicate = br#"{"github_in_toto":[],"github_in_toto":[]}"#;
+        let duplicate = br#"{"attested_builds":[],"attested_builds":[]}"#;
         assert!(verify_release_approval(duplicate, 1_784_246_400_000).is_err());
+    }
+
+    #[test]
+    fn release_evidence_requires_supported_schema_independently_of_manifest_schema() {
+        let release = release_fixture();
+        let catalog = catalog_fixture();
+        validate_release_shape(&release).unwrap();
+        validate_catalog_shape(&catalog).unwrap();
+        for schema in [
+            None,
+            Some(Value::Null),
+            Some(1.into()),
+            Some("".into()),
+            Some("stogas.release-evidence.v2".into()),
+            Some("stogas.gateway.release.v1".into()),
+        ] {
+            let mut release_value = serde_json::to_value(&release).unwrap();
+            let mut catalog_value = serde_json::to_value(&catalog).unwrap();
+            for value in [&mut release_value, &mut catalog_value] {
+                if let Some(schema) = &schema {
+                    value["schema"] = schema.clone();
+                } else {
+                    value.as_object_mut().unwrap().remove("schema");
+                }
+            }
+            assert!(
+                !serde_json::from_value::<AllowedIgvm>(release_value)
+                    .is_ok_and(|changed| validate_release_shape(&changed).is_ok())
+            );
+            assert!(
+                !serde_json::from_value::<AllowedCatalog>(catalog_value)
+                    .is_ok_and(|changed| validate_catalog_shape(&changed).is_ok())
+            );
+        }
     }
 
     #[test]
     fn staging_release_policy_is_fixed_by_the_compiled_artifact() {
         let mut release = release_fixture();
         let key = resign_release(&mut release);
-        let canonical =
-            canonical_json(&serde_json::to_value(&release.release_manifest).unwrap()).unwrap();
+        let canonical = canonical_json(&serde_json::to_value(&release.manifest).unwrap()).unwrap();
         let manifest_digest = hex::encode(Sha256::digest(canonical.as_bytes()));
-        release.github_in_toto = vec![serde_json::json!({
+        release.attested_builds = vec![serde_json::json!({
             "_type": "https://in-toto.io/Statement/v1",
             "predicateType": "https://stogas.ai/attestations/staging-development/v1",
             "predicate": { "environment": "staging" },
             "subject": [
-                { "name": "release-manifest.json", "digest": { "sha256": manifest_digest } }
+                { "name": "release-manifest.json", "digest": { "sha256": manifest_digest } },
+                { "name": "gateway.igvm", "digest": { "sha256": release.manifest.artifacts.gateway_igvm.sha256 } }
             ]
         })];
 
@@ -5638,9 +5701,18 @@ mod tests {
             assert!(verified.github_integrated_time_unix_ms.is_none());
             assert!(matches!(verified.provenance, ReleaseProvenance::Staging));
 
-            release.github_in_toto[0]["subject"][0]["digest"]["sha256"] =
-                Value::String("00".repeat(32));
-            assert!(verify_release_with_key(&release, &key, 1_784_246_400_000).is_err());
+            for subject in 0..2 {
+                let mut changed = release.clone();
+                changed.attested_builds[0]["subject"][subject]["digest"]["sha256"] =
+                    Value::String("00".repeat(32));
+                assert!(verify_release_with_key(&changed, &key, 1_784_246_400_000).is_err());
+            }
+            let mut missing = release.clone();
+            missing.attested_builds[0]["subject"]
+                .as_array_mut()
+                .unwrap()
+                .pop();
+            assert!(verify_release_with_key(&missing, &key, 1_784_246_400_000).is_err());
         }
         #[cfg(not(feature = "staging"))]
         assert!(verify_release_with_key(&release, &key, 1_784_246_400_000).is_err());
@@ -5667,12 +5739,12 @@ mod tests {
 
         // Relabeling a production signature never creates a valid staging signature.
         let mut release = release_fixture();
-        release.stogas_signature.key_id = "stogas-ed25519-staging-v1".into();
+        release.signature.key_id = "stogas-ed25519-staging-v1".into();
         let release_error = verify_release(&release, 1_784_246_400_000)
             .unwrap_err()
             .to_string();
         let mut catalog = catalog_fixture();
-        catalog.signed_release.key_id = "stogas-ed25519-staging-v1".into();
+        catalog.signature.key_id = "stogas-ed25519-staging-v1".into();
         let catalog_error = verify_catalog(&catalog, 1_784_246_400_000)
             .unwrap_err()
             .to_string();
@@ -5685,18 +5757,16 @@ mod tests {
     fn staging_catalog_policy_is_fixed_by_the_compiled_artifact() {
         let mut catalog = catalog_fixture();
         let key = resign_catalog(&mut catalog);
-        let canonical =
-            canonical_json(&serde_json::to_value(&catalog.signed_release.manifest).unwrap())
-                .unwrap();
-        let manifest_digest = hex::encode(Sha256::digest(
-            canonical.strip_suffix('\n').unwrap().as_bytes(),
-        ));
-        catalog.github_in_toto = vec![serde_json::json!({
+        let canonical = canonical_json(&serde_json::to_value(&catalog.manifest).unwrap()).unwrap();
+        let manifest_digest = hex::encode(Sha256::digest(canonical.as_bytes()));
+        catalog.attested_builds = vec![serde_json::json!({
             "_type": "https://in-toto.io/Statement/v1",
             "predicateType": "https://stogas.ai/attestations/staging-development/v1",
             "predicate": { "environment": "staging" },
             "subject": [
-                { "name": "catalog-release.json", "digest": { "sha256": manifest_digest } }
+                { "name": "catalog-release.json", "digest": { "sha256": manifest_digest } },
+                { "name": "catalog.runtime.json", "digest": { "sha256": &catalog.manifest.runtime[7..] } },
+                { "name": "catalog.public.json", "digest": { "sha256": &catalog.manifest.public[7..] } }
             ]
         })];
 
@@ -5706,9 +5776,18 @@ mod tests {
             assert!(verified.github_integrated_time_unix_ms.is_none());
             assert!(matches!(verified.provenance, ReleaseProvenance::Staging));
 
-            catalog.github_in_toto[0]["subject"][0]["digest"]["sha256"] =
-                Value::String("00".repeat(32));
-            assert!(verify_catalog_with_key(&catalog, &key, 1_784_246_400_000).is_err());
+            for subject in 0..3 {
+                let mut changed = catalog.clone();
+                changed.attested_builds[0]["subject"][subject]["digest"]["sha256"] =
+                    Value::String("00".repeat(32));
+                assert!(verify_catalog_with_key(&changed, &key, 1_784_246_400_000).is_err());
+            }
+            let mut missing = catalog.clone();
+            missing.attested_builds[0]["subject"]
+                .as_array_mut()
+                .unwrap()
+                .pop();
+            assert!(verify_catalog_with_key(&missing, &key, 1_784_246_400_000).is_err());
         }
         #[cfg(not(feature = "staging"))]
         assert!(verify_catalog_with_key(&catalog, &key, 1_784_246_400_000).is_err());
@@ -5720,23 +5799,21 @@ mod tests {
         let now = 1_784_246_400_000;
         let mut catalog = catalog_fixture();
         let key = resign_catalog(&mut catalog);
-        let canonical =
-            canonical_json(&serde_json::to_value(&catalog.signed_release.manifest).unwrap())
-                .unwrap();
-        let manifest_digest = hex::encode(Sha256::digest(
-            canonical.strip_suffix('\n').unwrap().as_bytes(),
-        ));
-        catalog.github_in_toto = vec![serde_json::json!({
+        let canonical = canonical_json(&serde_json::to_value(&catalog.manifest).unwrap()).unwrap();
+        let manifest_digest = hex::encode(Sha256::digest(canonical.as_bytes()));
+        catalog.attested_builds = vec![serde_json::json!({
             "_type": "https://in-toto.io/Statement/v1",
             "predicateType": "https://stogas.ai/attestations/staging-development/v1",
             "predicate": { "environment": "staging" },
             "subject": [
-                { "name": "catalog-release.json", "digest": { "sha256": manifest_digest } }
+                { "name": "catalog-release.json", "digest": { "sha256": manifest_digest } },
+                { "name": "catalog.runtime.json", "digest": { "sha256": &catalog.manifest.runtime[7..] } },
+                { "name": "catalog.public.json", "digest": { "sha256": &catalog.manifest.public[7..] } }
             ]
         })];
         verify_catalog_with_key(&catalog, &key, now).unwrap();
 
-        catalog.signed_release.manifest.runtime = format!("sha256:{}", "99".repeat(32));
+        catalog.manifest.runtime = format!("sha256:{}", "99".repeat(32));
         assert!(verify_catalog_with_key(&catalog, &key, now).is_err());
 
         let key = resign_catalog(&mut catalog);
@@ -5747,14 +5824,12 @@ mod tests {
                 .contains("staging development provenance subjects differ")
         );
 
-        let canonical =
-            canonical_json(&serde_json::to_value(&catalog.signed_release.manifest).unwrap())
-                .unwrap();
-        let manifest_digest = hex::encode(Sha256::digest(
-            canonical.strip_suffix('\n').unwrap().as_bytes(),
-        ));
-        catalog.github_in_toto[0]["subject"][0]["digest"]["sha256"] =
+        let canonical = canonical_json(&serde_json::to_value(&catalog.manifest).unwrap()).unwrap();
+        let manifest_digest = hex::encode(Sha256::digest(canonical.as_bytes()));
+        catalog.attested_builds[0]["subject"][0]["digest"]["sha256"] =
             Value::String(manifest_digest);
+        catalog.attested_builds[0]["subject"][1]["digest"]["sha256"] =
+            Value::String(catalog.manifest.runtime[7..].into());
         verify_catalog_with_key(&catalog, &key, now).unwrap();
     }
 
@@ -5767,7 +5842,7 @@ mod tests {
         assert_eq!(original_key, expected);
         let mut changed = release;
         changed
-            .github_in_toto
+            .attested_builds
             .push(serde_json::json!({"different": true}));
         assert_ne!(original_key, approval_cache_key(&changed).unwrap());
     }
@@ -5775,7 +5850,7 @@ mod tests {
     #[test]
     fn rejects_invalid_stogas_release_signature_before_accepting_github_evidence() {
         let mut release = release_fixture();
-        release.stogas_signature.signature = URL_SAFE_NO_PAD.encode([0_u8; 64]);
+        release.signature.signature = URL_SAFE_NO_PAD.encode([0_u8; 64]);
         let error = verify_release(&release, 1_784_246_400_000).unwrap_err();
         assert!(error.to_string().contains("release verification failed"));
     }
@@ -5785,21 +5860,21 @@ mod tests {
         let mutations: [fn(&mut AllowedIgvm); 3] = [
             |release: &mut AllowedIgvm| {
                 release
-                    .release_manifest
+                    .manifest
                     .sev_snp
                     .launch_measurement
                     .replace_range(..2, "aa");
             },
             |release: &mut AllowedIgvm| {
                 release
-                    .release_manifest
+                    .manifest
                     .artifacts
                     .gateway_igvm
                     .sha256
                     .replace_range(..2, "aa");
             },
             |release: &mut AllowedIgvm| {
-                release.release_manifest.git.tree.replace_range(..2, "aa");
+                release.manifest.git.tree.replace_range(..2, "aa");
             },
         ];
         for mutate in mutations {
