@@ -59,6 +59,9 @@ jobs:
           toolchain: 1.97.1
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32
       - run: cargo test --locked --workspace --all-targets
+      - name: Test compiled staging trust policy and transport
+        if: matrix.os == 'ubuntu-24.04'
+        run: cargo test --locked --package stogas-verifier --package stogas --all-targets --features staging
       - name: Test the verifier without optional SNP support
         if: matrix.os == 'ubuntu-24.04'
         run: cargo test --locked --package stogas-verifier --all-targets --no-default-features
