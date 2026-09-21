@@ -397,3 +397,156 @@ fn metadata_rejects_transport_overrides_and_unsupported_paths_before_submission(
         assert!(response_metadata(metadata).is_err());
     }
 }
+
+// External client serializers use this test-only HTTP bridge. Production clients
+// always call complete_verified; this fixture pins synthetic boot bytes instead.
+async fn client_fixture_proxy(session: ClientSession, endpoint: Url, node_id: String) -> Server {
+    let session = Arc::new(std::sync::Mutex::new(session));
+    let http = http();
+    let prefix = format!("/{}", hex::encode(rand::random::<[u8; 32]>()));
+    let route = format!("{prefix}/{{*path}}");
+    let app = Router::new().route(
+        &route,
+        axum::routing::any(move |request: Request<Body>| {
+            let session = Arc::clone(&session);
+            let endpoint = endpoint.clone();
+            let node_id = node_id.clone();
+            let http = http.clone();
+            let prefix = prefix.clone();
+            async move {
+                let (mut parts, body) = request.into_parts();
+                parts.uri = parts
+                    .uri
+                    .path()
+                    .strip_prefix(&prefix)
+                    .unwrap()
+                    .parse()
+                    .unwrap();
+                for name in [header::HOST, header::CONNECTION, header::TRANSFER_ENCODING] {
+                    parts.headers.remove(name);
+                }
+                let bytes = to_bytes(body, MAX_REQUEST_BYTES).await.unwrap();
+                let exchange = session.lock().unwrap().request().unwrap();
+                send(
+                    &http,
+                    endpoint,
+                    &node_id,
+                    exchange,
+                    Request::from_parts(parts, bytes),
+                    Instant::now() + Duration::from_mins(1),
+                    None,
+                )
+                .await
+                .unwrap()
+            }
+        }),
+    );
+    let mut server = Server::new(app).await;
+    server
+        .endpoint
+        .set_path(&format!("{}/v1", route.trim_end_matches("/{*path}")));
+    server
+}
+
+#[tokio::test]
+async fn open_source_client_compatibility_proxy() {
+    use base64::Engine as _;
+    if let Ok(upstream) = std::env::var("STOGAS_E2EE_TEST_UPSTREAM") {
+        let endpoint = Url::parse(&upstream).unwrap().join("/v1/session").unwrap();
+        assert_eq!(endpoint.scheme(), "http");
+        assert_eq!(endpoint.host_str(), Some("127.0.0.1"));
+        let fixture: Value =
+            serde_json::from_str(include_str!("../../../../tests/fixtures/node-boot-v1.json"))
+                .unwrap();
+        let report = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(fixture["record"]["report"].as_str().unwrap())
+            .unwrap();
+        let node_id =
+            stogas_verifier::attestation::snp_node_id(report[0x140..0x160].try_into().unwrap());
+        let mut pending = PendingSetup::new(Environment::Production).unwrap();
+        let response = http()
+            .post(endpoint.clone())
+            .header(header::CONTENT_TYPE, CONTENT_TYPE)
+            .body(pending.hello().to_vec())
+            .timeout(Duration::from_secs(10))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let response = response.bytes().await.unwrap();
+        assert!(response.len() <= stogas_verifier::channel::setup::MAX_SERVER_SETUP_BYTES);
+        let session = pending
+            .complete(&response, |evidence| {
+                assert_eq!(
+                    hex::encode(Sha256::digest(evidence.boot_document)),
+                    fixture["document_sha256"]
+                );
+                assert_eq!(evidence.boot_inclusion, b"{}");
+                Ok(())
+            })
+            .unwrap();
+        let proxy = client_fixture_proxy(session, endpoint, node_id).await;
+        println!("STOGAS_E2EE_TEST_BASE_URL={}", proxy.endpoint);
+        tokio::task::spawn_blocking(|| {
+            use std::io::Read as _;
+            std::io::stdin().read_to_end(&mut Vec::new()).unwrap();
+        })
+        .await
+        .unwrap();
+        drop(proxy);
+        return;
+    }
+
+    // Exercise real encrypted carriage and capability routing without the external
+    // Go fixture; an ordinary test run must not silently skip this test.
+    let (session, root, id) = session();
+    let peer = Server::new(Router::new().route(
+        "/v1/session",
+        post(move |request: Request<Body>| async move {
+            let wire = to_bytes(request.into_body(), 65536).await.unwrap();
+            let mut request_records = Records::new(&root, &id, 0, 1);
+            let size = channel::record_size(&wire[46..50]).unwrap();
+            let (kind, metadata) = request_records.open(&wire[46..46 + size]);
+            assert_eq!(kind, Kind::Metadata);
+            let metadata: Value = serde_json::from_slice(&metadata).unwrap();
+            assert_eq!(metadata["path"], "/v1/chat/completions");
+            assert_eq!(metadata["headers"]["authorization"], "Bearer fixture");
+            assert!(metadata["headers"].get("host").is_none());
+            let mut records = Records::new(&root, &id, 0, 2);
+            Response::builder()
+                .header(header::CONTENT_TYPE, CONTENT_TYPE)
+                .body(Body::from(
+                    [
+                        records.seal(
+                            Kind::Metadata,
+                            br#"{"status":200,"headers":{"Content-Type":"application/json"}}"#,
+                        ),
+                        records.seal(Kind::Data, b"{\"ok\":true}"),
+                        records.seal(Kind::Finished, &[]),
+                    ]
+                    .concat(),
+                ))
+                .unwrap()
+        }),
+    ))
+    .await;
+    let proxy = client_fixture_proxy(session, peer.endpoint.clone(), "owner".into()).await;
+    let response = http()
+        .post(format!("{}/chat/completions", proxy.endpoint))
+        .header(header::AUTHORIZATION, "Bearer fixture")
+        .body("{}")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.text().await.unwrap(), "{\"ok\":true}");
+    assert_eq!(
+        http()
+            .post(proxy.endpoint.join("/v1/chat/completions").unwrap())
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::NOT_FOUND
+    );
+}
