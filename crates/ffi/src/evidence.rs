@@ -215,10 +215,10 @@ pub unsafe extern "C" fn stogas_evidence_verify_logged_boot(
     })
 }
 
-/// Verify a compact content receipt against exact locally computed SHA-256 hashes.
+/// Verify a complete Stogas metadata bag against exact locally computed SHA-256 hashes.
 ///
 /// The boot is appraised against this snapshot at the caller's trusted clock.
-/// This does not establish when inference ran or sign operational metadata.
+/// The single signature covers content and canonical metadata, not inference time.
 ///
 /// # Safety
 /// Snapshot must be live. Every input must address its declared readable length.
@@ -237,7 +237,7 @@ pub unsafe extern "C" fn stogas_evidence_verify_receipt(
     response_hash_len: usize,
     now_unix_ms: i64,
 ) -> *mut c_char {
-    use stogas_verifier::{attestation::evidence::MAX_EVIDENCE_BYTES, receipt::Receipt};
+    use stogas_verifier::attestation::evidence::MAX_EVIDENCE_BYTES;
     response_coded(|| {
         // SAFETY: callers retain all slices and the snapshot through this synchronous call.
         let (snapshot, document, inclusion, receipt, request, response) = unsafe {
@@ -248,7 +248,7 @@ pub unsafe extern "C" fn stogas_evidence_verify_receipt(
                 input_slice(
                     receipt,
                     receipt_len,
-                    stogas_verifier::receipt::MAX_BYTES,
+                    stogas_verifier::receipt::MAX_METADATA_BYTES,
                     "receipt",
                 )?,
                 input_slice(request_hash, request_hash_len, 32, "request SHA-256")?,
@@ -261,9 +261,9 @@ pub unsafe extern "C" fn stogas_evidence_verify_receipt(
         let response = response
             .try_into()
             .map_err(|_| "response SHA-256 must be 32 bytes")?;
-        let receipt = Receipt::parse(receipt)?;
+
         let boot = snapshot.verify_logged_boot(document, inclusion, now_unix_ms)?;
-        Ok(receipt.verify(&boot, request, response)?)
+        Ok(stogas_verifier::receipt::verify_metadata(receipt, &boot, request, response)?.receipt)
     })
 }
 

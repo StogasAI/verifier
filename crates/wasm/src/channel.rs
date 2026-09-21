@@ -138,6 +138,17 @@ pub struct EncryptedRequest {
 
 #[wasm_bindgen(js_class = EncryptedRequest)]
 impl EncryptedRequest {
+    /// Guard SSE completion independently of optional receipt verification.
+    /// # Errors
+    /// Requires the complete request before creating its response guard.
+    pub fn response_completion(&self) -> Result<ResponseCompletion, JsError> {
+        if !self.request_finished {
+            return Err(JsError::new("request content is incomplete"));
+        }
+        Ok(ResponseCompletion {
+            core: Some(stogas_verifier::receipt::StreamCompletion::default()),
+        })
+    }
     #[wasm_bindgen(getter)]
     pub fn prefix(&self) -> Vec<u8> {
         self.prefix.clone()
@@ -167,8 +178,13 @@ impl EncryptedRequest {
         let response = response_sha256
             .try_into()
             .map_err(|_| JsError::new("response digest must be 32 bytes"))?;
-        let receipt = stogas_verifier::receipt::Receipt::parse(receipt)?;
-        let verified = receipt.verify(self.appraisal.boot(), request, response)?;
+        let verified = stogas_verifier::receipt::verify_metadata(
+            receipt,
+            self.appraisal.boot(),
+            request,
+            response,
+        )?
+        .receipt;
         super::to_js_value(&verified)
     }
 
@@ -255,6 +271,39 @@ impl EncryptedRequest {
             .ok_or_else(|| channel_error(&Error::Truncated))?
             .finish()
             .map_err(|error| channel_error(&error))
+    }
+}
+
+#[wasm_bindgen(js_name = ResponseCompletion)]
+pub struct ResponseCompletion {
+    core: Option<stogas_verifier::receipt::StreamCompletion>,
+}
+
+#[wasm_bindgen(js_class = ResponseCompletion)]
+impl ResponseCompletion {
+    /// # Errors
+    /// Rejects malformed SSE or use after completion.
+    pub fn push_sse(&mut self, bytes: &[u8]) -> Result<JsValue, JsError> {
+        let core = self
+            .core
+            .as_mut()
+            .ok_or_else(|| JsError::new("response is closed"))?;
+        let output = js_sys::Array::new();
+        for chunk in core.push(bytes)? {
+            output.push(&js_sys::Uint8Array::from(chunk.as_slice()));
+        }
+        Ok(output.into())
+    }
+
+    /// Call only after the encrypted response's completion and outer EOF are verified.
+    /// # Errors
+    /// Rejects a truncated stream or duplicate completion.
+    pub fn finish_sse(&mut self) -> Result<(), JsError> {
+        self.core
+            .take()
+            .ok_or_else(|| JsError::new("response is closed"))?
+            .finish()?;
+        Ok(())
     }
 }
 

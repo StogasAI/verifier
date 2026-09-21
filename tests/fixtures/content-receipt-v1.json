@@ -5,8 +5,28 @@
     "boot_sha256": "913b7d74a427e39b23017790c299e6f8165bbe1aed5287255f19dfd3fa11c366",
     "request_sha256": "3219e1b8e8a3a6329a3ed247a2e2a5cf74efa8843e59901c2fd138deac9f2bd2",
     "response_sha256": "21eae1c895638d0c3b0632c2e19c411aa2500d382043da580e3d59b82b1cbc62",
-    "signature": "Vj6ubSg3thAiuU1WMAVdstubI4jMXUALXVmL7cE3FzUJM8bqTmzdvF1hyjhIXDSOWy8-AxGRTAcys7gkuCGICg"
+    "signature": "8hdNZZRwoI5YnjwzZ7iPVImmS5HEkrM-nSHzl3jxwSZeBmY0el19K29F9IIlYi3pdl5GRWlgDwmd28Bh876dDg"
   },
   "request": "{\"messages\":[{\"role\":\"user\",\"content\":\"fixture\"}]}",
-  "response": "{\"choices\":[{\"message\":{\"role\":\"assistant\",\"content\":\"reply\"}}]}"
+  "response": "{\"choices\":[{\"message\":{\"role\":\"assistant\",\"content\":\"reply\"}}]}",
+  "metadata": {
+    "pricing": {
+      "total_cost_usd": "0.01"
+    },
+    "provider": {
+      "instance": "chutes-fixture",
+      "detail": {
+        "verified": true,
+        "score": 1.5,
+        "label": "<🌍>"
+      }
+    }
+  },
+  "hardware_receipt": {
+    "schema": "stogas.receipt.v1",
+    "boot_sha256": "b15007fb3787b8437954fb38e587dab564baa047e21675cc695990c992ed289e",
+    "request_sha256": "3219e1b8e8a3a6329a3ed247a2e2a5cf74efa8843e59901c2fd138deac9f2bd2",
+    "response_sha256": "21eae1c895638d0c3b0632c2e19c411aa2500d382043da580e3d59b82b1cbc62",
+    "signature": "WbMqsYuQJZIBh5AUEI6skua_pCddEjcw1GjUcLo-6nthlSOI5BijAfxJLhGfx4wS1uuTCVCSrmXNr7tdZwAWAg"
+  }
 }

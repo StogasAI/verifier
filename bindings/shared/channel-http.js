@@ -109,11 +109,14 @@ export async function sendSessionRequest({
 	let released = false;
 	let abortResponse;
 	let receipt;
+	let completion;
 	const cleanup = () => {
 		if (released) return;
 		released = true;
 		if (abortResponse) signal?.removeEventListener('abort', abortResponse);
 		reader?.release();
+		completion?.free();
+		completion = undefined;
 		exchange.free();
 		release();
 	};
@@ -129,6 +132,8 @@ export async function sendSessionRequest({
 		signal?.throwIfAborted();
 		const body = await encodeRequest(exchange, request, signal);
 		if (request.headers.get('Stogas-Metadata') === 'v1') receipt = exchange.response_receipt();
+		// Create before decoding: a Wasm push callback cannot re-enter its exchange.
+		completion = exchange.response_completion();
 		signal?.throwIfAborted();
 		submitted = true;
 		const outer = await fetch(endpoint, {
@@ -162,14 +167,19 @@ export async function sendSessionRequest({
 		let input = EMPTY;
 		let inputOffset = 0;
 		let finished = false;
+		let sse = false;
 		const emit = (kind, content) => {
 			if (kind === 1) {
 				if (metadata) throw new Error('duplicate encrypted response metadata');
 				metadata = responseMetadata(content);
+				sse =
+					metadata.headers.get('content-type')?.split(';')[0].trim().toLowerCase() ===
+					'text/event-stream';
 			} else if (kind === 2) {
 				if (!metadata || [204, 205, 304].includes(metadata.status))
 					throw new Error('unexpected encrypted response body');
-				pending.push(content);
+				if (sse) pending.push(...completion.push_sse(content));
+				else pending.push(content);
 			}
 		};
 		const advance = async () => {
@@ -177,6 +187,10 @@ export async function sendSessionRequest({
 				const next = await reader.read();
 				if (next.done) {
 					exchange.finish(); // Finished alone is insufficient: also consume outer EOF.
+					if (sse) {
+						completion.finish_sse();
+						pending.push(new Uint8Array([10, 10]));
+					}
 					finished = true;
 					cleanup();
 					return;

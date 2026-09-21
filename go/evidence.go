@@ -208,8 +208,8 @@ func (s *EvidenceSnapshot) loggedBootAt(document, inclusion []byte, now int64) (
 	return identity, err
 }
 
-// VerifyReceipt authenticates a compact content receipt against locally computed
-// hashes and the logged boot. Display metadata is not part of its signed statement.
+// VerifyReceipt authenticates the complete final stogas JSON bag against locally computed
+// hashes and the logged boot. Its single signature covers content and canonical metadata.
 func (s *EvidenceSnapshot) VerifyReceipt(document, inclusion, receipt []byte, requestHash, responseHash [32]byte) (VerifiedReceipt, error) {
 	return s.VerifyReceiptAt(document, inclusion, receipt, requestHash, responseHash, time.Now())
 }

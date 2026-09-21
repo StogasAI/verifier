@@ -550,3 +550,97 @@ async fn open_source_client_compatibility_proxy() {
         StatusCode::NOT_FOUND
     );
 }
+
+#[tokio::test]
+async fn sse_terminal_waits_for_authenticated_completion_without_receipt_opt_in() {
+    use http_body_util::BodyExt as _;
+    for fault in ["none", "truncated", "tag", "trailing", "stall"] {
+        let (mut session, root, id) = session();
+        let release = Arc::new(tokio::sync::Semaphore::new(0));
+        let gate = Arc::clone(&release);
+        let app = Router::new().route(
+            "/v1/session",
+            post(move |request: Request<Body>| {
+                let gate = Arc::clone(&gate);
+                async move {
+                    to_bytes(request.into_body(), 4096).await.unwrap();
+                    let mut records = Records::new(&root, &id, 0, 2);
+                    let initial = [
+                        records.seal(
+                            Kind::Metadata,
+                            br#"{"status":200,"headers":{"Content-Type":"text/event-stream"}}"#,
+                        ),
+                        records.seal(Kind::Data, b"data: hello\n\ndata: [DONE]\n\n"),
+                    ]
+                    .concat();
+                    let mut terminal = records.seal(Kind::Finished, &[]);
+                    if fault == "tag" {
+                        *terminal.last_mut().unwrap() ^= 1;
+                    }
+                    if fault == "truncated" {
+                        terminal.clear();
+                    }
+                    if fault == "trailing" {
+                        terminal.push(0);
+                    }
+                    let body = stream::unfold(Some((initial, terminal, gate)), |state| async {
+                        let (initial, terminal, gate) = state?;
+                        if !initial.is_empty() {
+                            return Some((
+                                Ok::<_, std::io::Error>(Bytes::from(initial)),
+                                Some((Vec::new(), terminal, gate)),
+                            ));
+                        }
+                        let _permit = gate.acquire().await.unwrap();
+                        if terminal.is_empty() {
+                            return None;
+                        }
+                        Some((Ok(Bytes::from(terminal)), None))
+                    });
+                    Response::builder()
+                        .header(header::CONTENT_TYPE, CONTENT_TYPE)
+                        .body(Body::from_stream(body))
+                        .unwrap()
+                }
+            }),
+        );
+        let server = Server::new(app).await;
+        let response = send(
+            &http(),
+            server.endpoint.clone(),
+            "owner",
+            session.request().unwrap(),
+            Request::post("/v1/chat/completions")
+                .body(Bytes::from_static(b"{}"))
+                .unwrap(),
+            Instant::now() + Duration::from_secs(1),
+            None,
+        )
+        .await
+        .unwrap();
+        let mut body = response.into_body();
+        let mut before = Vec::new();
+        while !before.ends_with(b"[DONE]") {
+            before.extend_from_slice(&body.frame().await.unwrap().unwrap().into_data().unwrap());
+        }
+        assert_eq!(before, b"data: hello\n\ndata: [DONE]");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), body.frame())
+                .await
+                .is_err()
+        );
+        if fault != "stall" {
+            release.add_permits(1);
+        }
+        let completion = body.frame().await.unwrap();
+        if fault == "none" {
+            assert_eq!(completion.unwrap().into_data().unwrap(), b"\n\n".as_slice());
+            assert!(body.frame().await.is_none());
+        } else {
+            assert!(
+                completion.is_err(),
+                "{fault} released a successful terminal event"
+            );
+        }
+    }
+}

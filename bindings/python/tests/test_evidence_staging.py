@@ -47,6 +47,17 @@ class StagingEvidenceTests(unittest.TestCase):
         # Historical handles retain the same receipt verification boundary.
         with self.assertRaises(VerificationError):
             verified.verify_receipt(b'{}', bytes(32), bytes(32))
+        vector = json.loads(
+            (Path(__file__).resolve().parents[3] / "tests/fixtures/content-receipt-v1.json").read_bytes()
+        )
+        metadata = {**vector["metadata"], "receipt": vector["hardware_receipt"]}
+        request = hashlib.sha256(vector["request"].encode()).digest()
+        response = hashlib.sha256(vector["response"].encode()).digest()
+        receipt = json.loads(verified.verify_receipt(json.dumps(metadata).encode(), request, response))
+        self.assertEqual(receipt["boot_sha256"], hashlib.sha256(boot_bytes).hexdigest())
+        metadata["provider"]["instance"] = "substituted"
+        with self.assertRaises(VerificationError):
+            verified.verify_receipt(json.dumps(metadata).encode(), request, response)
 
     def test_snapshot_survives_rejected_refresh_and_verifier_destruction(self):
         fixture = json.loads(

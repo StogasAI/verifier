@@ -111,6 +111,8 @@ func TestOfflineReceiptUsesLoggedHardwareKeyAndExactContentHashes(t *testing.T) 
 	response := sha256.Sum256([]byte("exact response bytes\n"))
 	message := append([]byte("stogas.receipt.v1\x00"), request[:]...)
 	message = append(message, response[:]...)
+	metadataHash := sha256.Sum256([]byte(`{}`))
+	message = append(message, metadataHash[:]...)
 	seed := make([]byte, ed25519.SeedSize)
 	for i := range seed {
 		seed[i] = 42
@@ -120,7 +122,7 @@ func TestOfflineReceiptUsesLoggedHardwareKeyAndExactContentHashes(t *testing.T) 
 		"request_sha256": hex.EncodeToString(request[:]), "response_sha256": hex.EncodeToString(response[:]),
 		"signature": base64.RawURLEncoding.EncodeToString(ed25519.Sign(ed25519.NewKeyFromSeed(seed), message)),
 	}
-	encoded, _ := json.Marshal(receipt)
+	encoded, _ := json.Marshal(map[string]any{"receipt": receipt})
 	now := time.UnixMilli(fixture.Now)
 	verified, err := snapshot.VerifyReceiptAt(boot, inclusion, encoded, request, response, now)
 	if err != nil || verified.BootSHA256 != receipt["boot_sha256"] || verified.RequestSHA256 != receipt["request_sha256"] || verified.ResponseSHA256 != receipt["response_sha256"] || verified.NodeID == "" {
@@ -160,7 +162,7 @@ func TestOfflineReceiptUsesLoggedHardwareKeyAndExactContentHashes(t *testing.T) 
 	}{
 		{"content", encoded, inclusion, response, now, "invalid_receipt"},
 		{"unknown field", append([]byte(`{"durability":true,`), encoded[1:]...), inclusion, request, now, "invalid_receipt"},
-		{"duplicate field", append([]byte(`{"schema":"stogas.receipt.v1",`), encoded[1:]...), inclusion, request, now, "invalid_receipt"},
+		{"duplicate field", append([]byte(`{"receipt":{},`), encoded[1:]...), inclusion, request, now, "invalid_receipt"},
 		{"missing inclusion", encoded, nil, request, now, ""},
 		{"expired collateral", encoded, inclusion, request, now.AddDate(30, 0, 0), "expired_collateral"},
 	} {
@@ -175,7 +177,7 @@ func TestOfflineReceiptUsesLoggedHardwareKeyAndExactContentHashes(t *testing.T) 
 	for _, field := range []string{"signature", "boot_sha256"} {
 		original := receipt[field]
 		receipt[field] = "invalid"
-		changed, _ := json.Marshal(receipt)
+		changed, _ := json.Marshal(map[string]any{"receipt": receipt})
 		if _, err := snapshot.VerifyReceiptAt(boot, inclusion, changed, request, response, now); err == nil {
 			t.Fatalf("accepted changed %s", field)
 		}

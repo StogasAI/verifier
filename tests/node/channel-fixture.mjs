@@ -9,6 +9,22 @@ export class Exchange {
 	freed = 0;
 	final = false;
 	buffer = '';
+	emitting = false;
+	response_completion() {
+		assert.equal(this.emitting, false, 'Wasm exchange cannot be re-entered from its callback');
+		let tail = new Uint8Array();
+		return {
+			push_sse(bytes) {
+				const all = new Uint8Array([...tail, ...bytes]);
+				tail = all.slice(-2);
+				return [all.slice(0, -2)];
+			},
+			finish_sse() {
+				assert.deepEqual([...tail], [10, 10]);
+			},
+			free() {}
+		};
+	}
 	seal(kind, bytes) {
 		this.sealed.push({ kind, bytes: bytes.slice() });
 		return new Uint8Array([kind]);
@@ -23,7 +39,12 @@ export class Exchange {
 			const [kind, value] = JSON.parse(this.buffer.slice(0, end));
 			this.buffer = this.buffer.slice(end + 1);
 			if (kind === 3) this.final = true;
-			emit(kind, new TextEncoder().encode(value));
+			this.emitting = true;
+			try {
+				emit(kind, new TextEncoder().encode(value));
+			} finally {
+				this.emitting = false;
+			}
 		}
 	}
 	finish() {

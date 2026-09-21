@@ -30,6 +30,7 @@ p256 = { version = "0.13.2", default-features = false, features = ["ecdsa", "pkc
 p384 = { version = "0.13.1", default-features = false, features = ["ecdsa", "pkcs8"], optional = true }
 serde.workspace = true
 serde_json = { workspace = true, features = ["raw_value"] }
+serde_json_canonicalizer = "=0.3.2"
 sev = { version = "8.0.0", default-features = false, features = ["crypto_nossl", "snp"], optional = true }
 sha2.workspace = true
 sha2-v11 = { package = "sha2", version = "0.11.0" }

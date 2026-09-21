@@ -1,6 +1,7 @@
 use super::*;
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use serde_json::Value;
+use sha2::Digest as _;
 
 fn fixture() -> (super::super::Verifier, Value, Vec<u8>, [u8; 32], i64) {
     let fixture: Value = serde_json::from_str(include_str!(
@@ -305,11 +306,14 @@ fn learned_release_withdrawal_blocks_warm_reappraisal_but_keeps_owned_request_ev
     // An approval update must not replace the retained identity of an admitted request.
     let request = [1; 32];
     let response = [2; 32];
+    let metadata = serde_json::json!({});
+    let digest: [u8; 32] = sha2::Sha256::digest(b"{}").into();
     let message = [
         crate::receipt::SCHEMA.as_bytes(),
         b"\0",
         &request,
         &response,
+        &digest,
     ]
     .concat();
     let receipt = crate::receipt::Receipt {
@@ -320,5 +324,7 @@ fn learned_release_withdrawal_blocks_warm_reappraisal_but_keeps_owned_request_ev
         signature: URL_SAFE_NO_PAD
             .encode(SigningKey::from_bytes(&[42; 32]).sign(&message).to_bytes()),
     };
-    receipt.verify(session.boot(), &request, &response).unwrap();
+    receipt
+        .verify(session.boot(), &request, &response, &metadata)
+        .unwrap();
 }

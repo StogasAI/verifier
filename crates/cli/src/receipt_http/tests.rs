@@ -40,7 +40,15 @@ fn peer() -> Arc<VerifiedSession> {
 fn metadata(peer: &VerifiedSession, request: [u8; 32], response: &[u8]) -> Vec<u8> {
     let response: [u8; 32] = Sha256::digest(response).into();
     let key = SigningKey::from_bytes(&[42; 32]);
-    let message = [receipt::SCHEMA.as_bytes(), b"\0", &request, &response].concat();
+    let digest: [u8; 32] = Sha256::digest(b"{}").into();
+    let message = [
+        receipt::SCHEMA.as_bytes(),
+        b"\0",
+        &request,
+        &response,
+        &digest,
+    ]
+    .concat();
     serde_json::to_vec(&json!({"receipt": {
         "schema": receipt::SCHEMA,
         "boot_sha256": hex::encode(peer.boot().document_sha256()),

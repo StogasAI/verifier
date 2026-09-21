@@ -53,9 +53,10 @@ access and reports its approved releases and catalogs. `--environment` selects c
 
 `stogas-verify proof --bundle bundle.json --boot boot-archive.json
 --request request.json --response response.json` verifies a saved content receipt offline.
-The default reads buffered JSON; `--stream` reads a complete SSE response. A detached receipt
-uses `--proof receipt.json` with the exact signed response bytes. The supplied bundle appraises
-the logged boot; the result does not establish an execution time or authenticate separate metadata.
+The default reads buffered JSON; `--stream` reads a complete SSE response. Detached verification
+uses `--proof stogas.json` with the complete final metadata object and exact response bytes.
+One signature authenticates the request, response and canonical metadata, excluding the receipt
+itself. The supplied bundle appraises the logged boot; the receipt does not establish an execution time.
 
 ## Fetch SDK
 
@@ -77,20 +78,20 @@ revocation and missing evidence retain distinct failure reasons. Verification do
 AMD, Intel, Rekor or GitHub and writes no trust state to disk.
 
 Send `Stogas-Metadata: v1` to request final metadata. Its receipt signs the exact request and response
-content; operational fields are separate. Managed transports verify requested receipts against the
+content and canonical metadata, excluding the receipt itself. Managed transports verify requested receipts against the
 request's retained evidence. A stream can release content before verification finishes, but cannot
 report normal completion without the final verified receipt. Receipt recovery never repeats inference.
 
 The Rust `stogas_verifier::evidence::Verifier` and the Wasm/C evidence APIs also accept evidence bytes
 for offline verification. Go uses `NewEvidence`, `Refresh` and the retained snapshot; C uses the
-`stogas_evidence_*` functions. `VerifyReceipt` / `stogas_evidence_verify_receipt` check a compact
-receipt using the logged boot and SHA-256 hashes computed from the exact signed content.
+`stogas_evidence_*` functions. `VerifyReceipt` / `stogas_evidence_verify_receipt` take the complete final `stogas` bag, including its receipt,
+and SHA-256 hashes computed from the exact signed content.
 An archived boot record and its log proof remain unchanged when current
 collateral or approvals are refreshed.
 
 For saved receipts, use Go's `VerifyReceiptArchive`, C's
 `stogas_evidence_verify_receipt_archive`, or Python's `verify_boot_archive` followed by
-`verify_receipt`. Supply the boot archive and its referenced evidence bundle. These methods
+`verify_receipt`. Supply the complete `stogas` bag, boot archive and its referenced evidence bundle. These methods
 appraise the boot at its authenticated log time, so routine collateral expiry does not erase
 history. They do not restore current serving permission or establish when inference occurred.
 

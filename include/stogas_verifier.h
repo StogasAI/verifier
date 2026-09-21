@@ -27,7 +27,7 @@ char *stogas_evidence_verify_registration(const StogasEvidenceSnapshot *handle, 
 char *stogas_evidence_verify_logged_boot(const StogasEvidenceSnapshot *handle, const uint8_t *document, size_t document_len, const uint8_t *inclusion, size_t inclusion_len, int64_t now_unix_ms);
 /* Request/response hashes are exactly 32 binary bytes computed from the signed content.
  * This appraises the logged boot at now_unix_ms; it does not establish inference time.
- * The receipt is the compact stogas.receipt.v1 object, without display metadata. */
+ * The receipt input is the complete final stogas metadata JSON, including its receipt. */
 char *stogas_evidence_verify_receipt(const StogasEvidenceSnapshot *handle, const uint8_t *document, size_t document_len, const uint8_t *inclusion, size_t inclusion_len, const uint8_t *receipt, size_t receipt_len, const uint8_t *request_hash, size_t request_hash_len, const uint8_t *response_hash, size_t response_hash_len, int64_t now_unix_ms);
 
 /* Historical appraisal authenticates the archive at its log-inclusion time.

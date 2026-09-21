@@ -10,7 +10,7 @@ use stogas::SecurityMode;
 use stogas_verifier::{
     MAX_INPUT_BYTES,
     evidence::Verifier,
-    receipt::{self, Receipt, VerifiedReceipt},
+    receipt::{self, VerifiedReceipt},
 };
 use tokio::io::AsyncReadExt as _;
 
@@ -70,7 +70,7 @@ enum Command {
     },
     /// Verify an exact-content receipt without network access.
     Proof {
-        /// Detached receipt JSON; --response then contains only the exact signed bytes.
+        /// Detached final Stogas metadata JSON; --response then contains only the exact signed bytes.
         #[arg(long, conflicts_with = "stream")]
         proof: Option<PathBuf>,
         /// Read a complete SSE response, including its metadata and terminal event.
@@ -229,9 +229,9 @@ async fn verify_proof_files(
     let boot = verifier.verify_boot_archive(&archive, &bundle, now)?;
     let request = hash_file(&input.request, "request body").await?;
     if let Some(path) = &input.proof {
-        let proof = read_bounded_file(path, receipt::MAX_BYTES, "receipt").await?;
+        let proof = read_bounded_file(path, receipt::MAX_METADATA_BYTES, "Stogas metadata").await?;
         let response = hash_file(&input.response, "response body").await?;
-        return Ok(Receipt::parse(&proof)?.verify(&boot, &request, &response)?);
+        return Ok(receipt::verify_metadata(&proof, &boot, &request, &response)?.receipt);
     }
     if input.stream {
         let mut response = tokio::fs::File::open(&input.response).await?;

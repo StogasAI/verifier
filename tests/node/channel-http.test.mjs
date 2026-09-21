@@ -51,13 +51,18 @@ test('binary HTTP keeps credentials inside the first record and streams across a
 			fetch: async (url, init) => {
 				sent = { url, init };
 				return response(
-					[record(1, JSON.stringify(header)), record(4), record(2, 'data: hello\n\n'), record(3)],
+					[
+						record(1, JSON.stringify(header)),
+						record(4),
+						record(2, 'data: hello\n\ndata: [DONE]\n\n'),
+						record(3)
+					],
 					{ split }
 				);
 			}
 		});
 		const result = await state.send();
-		assert.equal(await result.text(), 'data: hello\n\n');
+		assert.equal(await result.text(), 'data: hello\n\ndata: [DONE]\n\n');
 		assert.equal(result.headers.get('content-type'), 'text/event-stream');
 		assert.equal(sent.url, 'https://e2ee.example/v1/session');
 		assert.deepEqual(sent.init.headers, {

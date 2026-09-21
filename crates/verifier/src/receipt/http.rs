@@ -23,6 +23,7 @@ pub struct SseBody {
     receipt_frame: Option<Vec<u8>>,
     failed: bool,
     received: usize,
+    receipt_required: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -53,6 +54,14 @@ impl SseBody {
             receipt_frame: None,
             failed: false,
             received: 0,
+            receipt_required: true,
+        }
+    }
+
+    pub fn transport() -> Self {
+        Self {
+            receipt_required: false,
+            ..Self::new()
         }
     }
 
@@ -114,23 +123,28 @@ impl SseBody {
     /// Extract the authenticated-content input; the caller must verify before releasing
     /// the final delimiter. Transport EOF is mandatory before calling this method.
     pub fn finish(self) -> Result<(Vec<u8>, [u8; 32]), Error> {
-        if self.failed || self.state != SseState::AfterTerminal || !self.buffer.is_empty() {
-            return Err(stream_error(
-                "stream ended before its signed terminal event",
-            ));
-        }
+        self.require_complete()?;
         let proof = self
             .proof_bytes
             .ok_or_else(|| stream_error("stream has no receipt"))?;
         Ok((proof, self.response_hasher.finalize().into()))
     }
 
+    pub fn require_complete(&self) -> Result<(), Error> {
+        if self.failed || self.state != SseState::AfterTerminal || !self.buffer.is_empty() {
+            return Err(stream_error(
+                "stream ended before its signed terminal event",
+            ));
+        }
+        Ok(())
+    }
+
     fn begin_terminal(&mut self, output: &mut Vec<Vec<u8>>, state: SseState) -> Result<(), Error> {
-        let receipt = self
-            .receipt_frame
-            .take()
-            .ok_or_else(|| stream_error("terminal event arrived before the receipt"))?;
-        output.push(receipt);
+        if let Some(receipt) = self.receipt_frame.take() {
+            output.push(receipt);
+        } else if self.receipt_required {
+            return Err(stream_error("terminal event arrived before the receipt"));
+        }
         self.state = state;
         Ok(())
     }

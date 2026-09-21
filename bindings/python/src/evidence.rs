@@ -186,7 +186,10 @@ impl Boot {
         let request = digest(request_sha256.as_bytes(), "request digest")?;
         let response = digest(response_sha256.as_bytes(), "response digest")?;
         let result = py
-            .detach(|| receipt::Receipt::parse(document)?.verify(&self.core, request, response))
+            .detach(|| {
+                receipt::verify_metadata(document, &self.core, request, response)
+                    .map(|verified| verified.receipt)
+            })
             .map_err(|error| receipt_error(py, &error))?;
         super::json_bytes(py, &result)
     }

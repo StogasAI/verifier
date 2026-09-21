@@ -42,6 +42,8 @@ pub enum Error {
     Metadata,
     #[error("encrypted record failed; execution is unknown: {0}")]
     Record(#[from] channel::Error),
+    #[error("encrypted SSE completion failed; delivery is incomplete: {0}")]
+    Completion(#[from] stogas_verifier::receipt::Error),
 }
 
 /// Encrypt metadata before creating the outer request. The caller must supply a
@@ -118,6 +120,7 @@ pub async fn send(
         input: Bytes::new(),
         pending: VecDeque::new(),
         metadata: None,
+        completion: None,
         body_allowed: false,
         deadline,
         _upload: guard,
@@ -242,6 +245,7 @@ struct Incoming {
     input: Bytes,
     pending: VecDeque<Bytes>,
     metadata: Option<(StatusCode, HeaderMap)>,
+    completion: Option<stogas_verifier::receipt::StreamCompletion>,
     body_allowed: bool,
     deadline: Instant,
     _upload: CancelUpload,
@@ -259,12 +263,16 @@ impl Incoming {
             {
                 self.input = bytes;
             } else {
-                return self
-                    .decoder
+                self.decoder
                     .take()
                     .ok_or(Error::Metadata)?
                     .finish()
-                    .map_err(Error::from);
+                    .map_err(Error::from)?;
+                if let Some(completion) = self.completion.take() {
+                    completion.finish()?;
+                    self.pending.push_back(Bytes::from_static(b"\n\n"));
+                }
+                return Ok(());
             }
         }
         let bytes = self.input.split_to(self.input.len().min(MAX_RECORD_BYTES));
@@ -280,6 +288,18 @@ impl Incoming {
                     Kind::Metadata => {
                         if let Ok((status, headers)) = response_metadata(bytes) {
                             self.body_allowed = !matches!(status.as_u16(), 204 | 205 | 304);
+                            if headers
+                                .get(header::CONTENT_TYPE)
+                                .and_then(|v| v.to_str().ok())
+                                .is_some_and(|v| {
+                                    v.split(';').next().is_some_and(|v| {
+                                        v.trim().eq_ignore_ascii_case("text/event-stream")
+                                    })
+                                })
+                            {
+                                self.completion =
+                                    Some(stogas_verifier::receipt::StreamCompletion::default());
+                            }
                             self.metadata = Some((status, headers));
                         } else {
                             metadata_error = true;
@@ -287,7 +307,19 @@ impl Incoming {
                         }
                     }
                     Kind::Data if !self.body_allowed => return Err(channel::Error::Record),
-                    Kind::Data => self.pending.push_back(Bytes::copy_from_slice(bytes)),
+                    Kind::Data => {
+                        if let Some(completion) = &mut self.completion {
+                            self.pending.extend(
+                                completion
+                                    .push(bytes)
+                                    .map_err(|_| channel::Error::Record)?
+                                    .into_iter()
+                                    .map(Bytes::from),
+                            );
+                        } else {
+                            self.pending.push_back(Bytes::copy_from_slice(bytes));
+                        }
+                    }
                     Kind::Finished | Kind::Keepalive => {}
                 }
                 Ok(())

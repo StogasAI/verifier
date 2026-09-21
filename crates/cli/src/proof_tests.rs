@@ -58,7 +58,15 @@ impl Files {
     fn receipt(&self, response: &[u8]) -> Value {
         let request = Sha256::digest(std::fs::read(&self.input.request).unwrap());
         let response = Sha256::digest(response);
-        let message = [receipt::SCHEMA.as_bytes(), b"\0", &request, &response].concat();
+        let digest = Sha256::digest(b"{}");
+        let message = [
+            receipt::SCHEMA.as_bytes(),
+            b"\0",
+            &request,
+            &response,
+            &digest,
+        ]
+        .concat();
         json!({
             "schema": receipt::SCHEMA,
             "boot_sha256": self.boot_hash,
@@ -87,8 +95,7 @@ impl Drop for Files {
 async fn offline_files_verify_exact_buffered_streamed_and_detached_content() {
     let mut files = Files::new();
     let response = b"{\n\"choices\":[], \"usage\":{\"output_tokens\":2}}";
-    let metadata =
-        json!({"receipt": files.receipt(response), "provider": {"instance":"display-only"}});
+    let metadata = json!({"receipt": files.receipt(response)});
     let buffered = [
         &response[..response.len() - 1],
         b",\"stogas\":",
@@ -119,7 +126,7 @@ async fn offline_files_verify_exact_buffered_streamed_and_detached_content() {
 
     // Detached mode hashes the file itself. It must not normalize JSON or strip framing.
     let proof = files.directory.join("receipt");
-    std::fs::write(&proof, serde_json::to_vec(&metadata["receipt"]).unwrap()).unwrap();
+    std::fs::write(&proof, serde_json::to_vec(&metadata).unwrap()).unwrap();
     files.input.proof = Some(proof);
     std::fs::write(&files.input.response, response).unwrap();
     assert_eq!(
@@ -155,7 +162,7 @@ async fn offline_files_fail_closed_on_changed_evidence_content_and_oversized_rec
     let proof = files.directory.join("receipt");
     std::fs::write(
         &proof,
-        serde_json::to_vec(&files.receipt(response)).unwrap(),
+        serde_json::to_vec(&json!({"receipt":files.receipt(response)})).unwrap(),
     )
     .unwrap();
     files.input.proof = Some(proof.clone());
@@ -177,7 +184,7 @@ async fn offline_files_fail_closed_on_changed_evidence_content_and_oversized_rec
         std::fs::write(path, original).unwrap();
     }
     let original = std::fs::read(&proof).unwrap();
-    std::fs::write(&proof, vec![b' '; receipt::MAX_BYTES + 1]).unwrap();
+    std::fs::write(&proof, vec![b' '; receipt::MAX_METADATA_BYTES + 1]).unwrap();
     assert!(
         files
             .verify()

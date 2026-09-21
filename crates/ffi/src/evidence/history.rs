@@ -2,7 +2,7 @@
 
 use super::{AbiError, StogasEvidence, input_slice, response_coded};
 use std::{ffi::c_char, sync::MutexGuard};
-use stogas_verifier::{evidence, receipt::Receipt};
+use stogas_verifier::evidence;
 
 unsafe fn verifier<'a>(
     handle: *const StogasEvidence,
@@ -121,7 +121,7 @@ pub unsafe extern "C" fn stogas_evidence_verify_receipt_archive(
                 input_slice(
                     receipt,
                     receipt_len,
-                    stogas_verifier::receipt::MAX_BYTES,
+                    stogas_verifier::receipt::MAX_METADATA_BYTES,
                     "receipt",
                 )?,
                 input_slice(request_hash, request_hash_len, 32, "request SHA-256")?,
@@ -134,8 +134,8 @@ pub unsafe extern "C" fn stogas_evidence_verify_receipt_archive(
         let response = response
             .try_into()
             .map_err(|_| "response SHA-256 must be 32 bytes")?;
-        let receipt = Receipt::parse(receipt)?;
+
         let boot = verifier.verify_boot_archive(archive, bundle, now_unix_ms)?;
-        Ok(receipt.verify(&boot, request, response)?)
+        Ok(stogas_verifier::receipt::verify_metadata(receipt, &boot, request, response)?.receipt)
     })
 }
