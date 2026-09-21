@@ -1,0 +1,185 @@
+{
+  "root": {
+    "key_id": "stogas-fixture-root-20260920",
+    "public_key": "MCowBQYDK2VwAyEA3L5P2vQ8YUaIm4Kw5pD8iMEoZgUuo+oEKx95iLylrgg="
+  },
+  "keys": {
+    "manifest": {
+      "schema": "stogas.keys.v1",
+      "environment": "staging",
+      "generation": 2,
+      "active_key": {
+        "key_id": "stogas-fixture-online-20260921",
+        "public_key": "MCowBQYDK2VwAyEAuPydcLMwtdN3pSEEe853IUSnR8qiA8RTqROF3obhd8w="
+      },
+      "retired_keys": [
+        {
+          "key_id": "stogas-fixture-online-20260920",
+          "public_key": "MCowBQYDK2VwAyEAcAgq6fmIYbUU1IRrxeAvsJb7NsqVPJKDCQmBbc84oKE="
+        }
+      ]
+    },
+    "sigstore": {
+      "dsseEnvelope": {
+        "payload": "eyJhY3RpdmVfa2V5Ijp7ImtleV9pZCI6InN0b2dhcy1maXh0dXJlLW9ubGluZS0yMDI2MDkyMSIsInB1YmxpY19rZXkiOiJNQ293QlFZREsyVndBeUVBdVB5ZGNMTXd0ZE4zcFNFRWU4NTNJVVNuUjhxaUE4UlRxUk9GM29iaGQ4dz0ifSwiZW52aXJvbm1lbnQiOiJzdGFnaW5nIiwiZ2VuZXJhdGlvbiI6MiwicmV0aXJlZF9rZXlzIjpbeyJrZXlfaWQiOiJzdG9nYXMtZml4dHVyZS1vbmxpbmUtMjAyNjA5MjAiLCJwdWJsaWNfa2V5IjoiTUNvd0JRWURLMlZ3QXlFQWNBZ3E2Zm1JWWJVVTFJUnJ4ZUF2c0piN05zcVZQSktEQ1FtQmJjODRvS0U9In1dLCJzY2hlbWEiOiJzdG9nYXMua2V5cy52MSJ9Cg==",
+        "payloadType": "application/vnd.stogas.keys.v1+json",
+        "signatures": [
+          {
+            "keyid": "stogas-fixture-root-20260920",
+            "sig": "r0u/qODd0r/GOksZ9blGDmKIlyArGc+b+lDg7znN9OzPH0VYgzCFsIYVNX49xOhyWE0NaayLgIuu0YTwjwtuBw=="
+          }
+        ]
+      },
+      "mediaType": "application/vnd.dev.sigstore.bundle.v0.3+json",
+      "verificationMaterial": {
+        "publicKey": {
+          "hint": "stogas-fixture-root-20260920"
+        },
+        "timestampVerificationData": {},
+        "tlogEntries": [
+          {
+            "canonicalizedBody": "eyJhcGlWZXJzaW9uIjoiMC4wLjEiLCJraW5kIjoiZHNzZSIsInNwZWMiOnsiZW52ZWxvcGVIYXNoIjp7ImFsZ29yaXRobSI6InNoYTI1NiIsInZhbHVlIjoiNzYyY2E5NzAzNGQxM2I4MjZiM2FlNDIyMTdiODJhMTVhNzhiMGIyZjlkNzQzMzhkNzc2ZGQyMDJkYjMyYzE4ZiJ9LCJwYXlsb2FkSGFzaCI6eyJhbGdvcml0aG0iOiJzaGEyNTYiLCJ2YWx1ZSI6IjE4NGIwNjM0ODE4MGM4NjhmZWYxYzU1ZTRlZGEyODA1YzIyNDEyOWNlNmNlM2ZhNjAyNGMwNmQ5YzYxMDExNDEifSwic2lnbmF0dXJlcyI6W3sic2lnbmF0dXJlIjoicjB1L3FPRGQwci9HT2tzWjlibEdEbUtJbHlBckdjK2IrbERnN3puTjlPelBIMFZZZ3pDRnNJWVZOWDQ5eE9oeVdFME5hYXlMZ0l1dTBZVHdqd3R1Qnc9PSIsInZlcmlmaWVyIjoiTFMwdExTMUNSVWRKVGlCUVZVSk1TVU1nUzBWWkxTMHRMUzBLVFVOdmQwSlJXVVJMTWxaM1FYbEZRVE5NTlZBeWRsRTRXVlZoU1cwMFMzYzFjRVE0YVUxRmIxcG5WWFZ2SzI5RlMzZzVOV2xNZVd4eVoyYzlDaTB0TFMwdFJVNUVJRkJWUWt4SlF5QkxSVmt0TFMwdExRbz0ifV19fQ==",
+            "inclusionPromise": {
+              "signedEntryTimestamp": "MEQCIDEAT8iWfaSSpXwP9GWMVQnl3uo5BASNJ96ftYX0OWO3AiAS1qNpnbNRxwFa5OmmArDPHOXgQGN5skNh35RpOfyrpg=="
+            },
+            "inclusionProof": {
+              "checkpoint": {
+                "envelope": "rekor.sigstore.dev - 1193050959916656506\n2782767051\ntUwK+SjzgcSUBfig75KL7MqW4wGKygjELsvoZDd4OhU=\n\n— rekor.sigstore.dev wNI9ajBEAiAagUwHCp2GsfwRtHzH9Ym9HO+YVHFCckwQxS15qo+SlQIgVboiF7fX9PVr7KzuM3w//iBPiP1K7RBg6gQJ/Ja7I0I=\n"
+              },
+              "hashes": [
+                "UOfjrIpyXdym5I+KX496CpN+qICY2yTaFBExcTctx8k=",
+                "VKzSLjGv5Q2kSO1DZ9pV03k/vwpYl534LSCEiTs497k=",
+                "Eth/nyVmJLu9q/zkxTfLbcB766Iswao6c+HHWYwqj+I=",
+                "HnXpUSkRO2WvRUwuLAB2MkR/p2F6NhX8hEyGD6jFxjg=",
+                "4/y+3d/iwoaIaOf3lO4Ae5mu+6Pr2zGb6ES7dmweyOk=",
+                "EYD8rIAt41dod/kA+jra8Ba+AjDicOPHrJGoa6Baxws=",
+                "1w+mRdhX+p9q8b/9KrSr8bJ4ABXJG2k7Qa74bkT8VU0=",
+                "7n4drfCnmNxK/lyu4suWTB2IgTXYl4wPsGam8uAvGVM=",
+                "0eXBiZbnp7EDIk9esOgudCfRvb5Q9WDyyY73xTTwM5U=",
+                "g24nmKx2WA6sklPp42pE7Lpr5oSn0LRZX4iKWGaIOto=",
+                "ExED5szjRT96559VEg2SV/ZKVhj9Xk9hXTred7x5dPs=",
+                "mQz44BpvmvYveyPZ1Gf3+jYJza6UVbQ9gXLWqgNigVE=",
+                "b02iz7cDsAcNqLud5HUpMkjpciHmL0Ec/Hugt/NEudo=",
+                "ZquwFpXeOVAtLzd8b9dPvwDeTCzIv891njY8Mf+gVMI=",
+                "Bc54XkMlMU89/M0QixgX7asX6FHFKpTKrpQ35dB7Qfw=",
+                "zF3BvZn+iEh9f6TaAVVZcysqraG3EKW4/1z6pI0SQF0=",
+                "3kBWZovCkCWAir7PcZGd2a2zicmV92He+P7cWXPHdG8=",
+                "/2a58lzrUQfoAuFNUx07Dmjo61/cNyxjKuxmZfV/uSU=",
+                "tyO4Oj1UrXex15tzrEEO6sSnE8y8obZWghZ2XixBPtE=",
+                "rjDiNJHGnboMYYUH7OSezbKWj3wMXRTHGCLa/SaZ6O4=",
+                "mfWjSdNaEfNXxDww6AAOw/NoK9e6z1yKaZm5xvmMabs=",
+                "qxzHanAzz57SDdmJe0B7bJK72NTIBbwEMGBBKvDOROw=",
+                "xH/DCseLHr9eKoYT8qsORZK7zVdEGYWHuVtsVrD95wY="
+              ],
+              "logIndex": "2782767026",
+              "rootHash": "tUwK+SjzgcSUBfig75KL7MqW4wGKygjELsvoZDd4OhU=",
+              "treeSize": "2782767051"
+            },
+            "integratedTime": "1789950027",
+            "kindVersion": {
+              "kind": "dsse",
+              "version": "0.0.1"
+            },
+            "logId": {
+              "keyId": "wNI9atQGlz+VWfO6LRygH4QUfY/8W4RFwiT5i5WRgB0="
+            },
+            "logIndex": "2904671288"
+          }
+        ]
+      }
+    }
+  },
+  "hardware_policy": {
+    "policy": {
+      "policies": [
+        {
+          "chip_ids": [
+            "b2202e1f13696edf8e6f3e833df25da9278cfeb1105e70894a14452b2ec5fd2a263db3bdc596294925a01bfaff8b1dd65ad0dfb527a8e6381fed31f097d41e67"
+          ],
+          "cpuid_family": 25,
+          "cpuid_model": 1,
+          "cpuid_stepping": 1,
+          "forbidden_platform_info_mask": "0x0000000000000000",
+          "minimum_tcb": {
+            "bootloader": 4,
+            "microcode": 222,
+            "snp": 29,
+            "tee": 0
+          },
+          "required_current_mitigation_mask": "0x000000000000000b",
+          "required_launch_mitigation_mask": "0x000000000000000b",
+          "required_platform_info_mask": "0x0000000000000024"
+        }
+      ],
+      "schema": "stogas.hardware-policies.v1"
+    },
+    "sigstore": {
+      "dsseEnvelope": {
+        "payload": "eyJwb2xpY2llcyI6W3siY2hpcF9pZHMiOlsiYjIyMDJlMWYxMzY5NmVkZjhlNmYzZTgzM2RmMjVkYTkyNzhjZmViMTEwNWU3MDg5NGExNDQ1MmIyZWM1ZmQyYTI2M2RiM2JkYzU5NjI5NDkyNWEwMWJmYWZmOGIxZGQ2NWFkMGRmYjUyN2E4ZTYzODFmZWQzMWYwOTdkNDFlNjciXSwiY3B1aWRfZmFtaWx5IjoyNSwiY3B1aWRfbW9kZWwiOjEsImNwdWlkX3N0ZXBwaW5nIjoxLCJmb3JiaWRkZW5fcGxhdGZvcm1faW5mb19tYXNrIjoiMHgwMDAwMDAwMDAwMDAwMDAwIiwibWluaW11bV90Y2IiOnsiYm9vdGxvYWRlciI6NCwibWljcm9jb2RlIjoyMjIsInNucCI6MjksInRlZSI6MH0sInJlcXVpcmVkX2N1cnJlbnRfbWl0aWdhdGlvbl9tYXNrIjoiMHgwMDAwMDAwMDAwMDAwMDBiIiwicmVxdWlyZWRfbGF1bmNoX21pdGlnYXRpb25fbWFzayI6IjB4MDAwMDAwMDAwMDAwMDAwYiIsInJlcXVpcmVkX3BsYXRmb3JtX2luZm9fbWFzayI6IjB4MDAwMDAwMDAwMDAwMDAyNCJ9XSwic2NoZW1hIjoic3RvZ2FzLmhhcmR3YXJlLXBvbGljaWVzLnYxIn0K",
+        "payloadType": "application/vnd.stogas.hardware-policies.v1+json",
+        "signatures": [
+          {
+            "keyid": "stogas-fixture-online-20260921",
+            "sig": "KUIYUiafN9d6RPh6/dNqe8cjON2QL6VdRi73HoDMaZNz6YfGAlZ/cHiscfa2bEQYYRReKNMNxyiwaCUnFfgZAw=="
+          }
+        ]
+      },
+      "mediaType": "application/vnd.dev.sigstore.bundle.v0.3+json",
+      "verificationMaterial": {
+        "publicKey": {
+          "hint": "stogas-fixture-online-20260921"
+        },
+        "timestampVerificationData": {},
+        "tlogEntries": [
+          {
+            "canonicalizedBody": "eyJhcGlWZXJzaW9uIjoiMC4wLjEiLCJraW5kIjoiZHNzZSIsInNwZWMiOnsiZW52ZWxvcGVIYXNoIjp7ImFsZ29yaXRobSI6InNoYTI1NiIsInZhbHVlIjoiMzc1ODNlOTQ2OWZiNTY4ZDYxMDBmN2Y0ZTljN2MwZmU3YmUwOTA3N2JhYWJiMTgwMjUzMWRiZDI1MjVhNzJhZSJ9LCJwYXlsb2FkSGFzaCI6eyJhbGdvcml0aG0iOiJzaGEyNTYiLCJ2YWx1ZSI6IjgyNmMzMDY4YWEyZDUxYzIxNjRjNmQxMmZiMDFjODRkNDVkMTRlMGI2NGJmNDNlOTdjYTg0YzM5MzRiZDYzY2IifSwic2lnbmF0dXJlcyI6W3sic2lnbmF0dXJlIjoiS1VJWVVpYWZOOWQ2UlBoNi9kTnFlOGNqT04yUUw2VmRSaTczSG9ETWFaTno2WWZHQWxaL2NIaXNjZmEyYkVRWVlSUmVLTk1OeHlpd2FDVW5GZmdaQXc9PSIsInZlcmlmaWVyIjoiTFMwdExTMUNSVWRKVGlCUVZVSk1TVU1nUzBWWkxTMHRMUzBLVFVOdmQwSlJXVVJMTWxaM1FYbEZRWFZRZVdSalRFMTNkR1JPTTNCVFJVVmxPRFV6U1ZWVGJsSTRjV2xCT0ZKVWNWSlBSak52WW1oa09IYzlDaTB0TFMwdFJVNUVJRkJWUWt4SlF5QkxSVmt0TFMwdExRbz0ifV19fQ==",
+            "inclusionPromise": {
+              "signedEntryTimestamp": "MEUCIFYK+Ujuuet84Uvw0AY+Z9y4Hl8HM0s07QSJbIn7Fl9dAiEA4PCN0MT4pN3OjaKPBtlPpN9OlEDju3bvzHRvVQPVdxw="
+            },
+            "inclusionProof": {
+              "checkpoint": {
+                "envelope": "rekor.sigstore.dev - 1193050959916656506\n2782773759\nLdf5agEsfxFk3fgYFXw7nOWDmH4vFn6/uLPfzb2YD2M=\n\n— rekor.sigstore.dev wNI9ajBFAiBciYsLcqHVFsjYuaKJ3sEJatsDau8p5ibo6yLEmt/E9AIhAJ3nvWm2hEXEAkioLHPc2UKBMQdtwTsZLshEx4NLtN9E\n"
+              },
+              "hashes": [
+                "LhKVeIuDyMqlVPL0Pp4CXT4krIvY2/hKE0PzZI3JHA8=",
+                "1vG43OAVr6bDXHQWMe7dimjgIBf/X5pqG4KXNc9l8jc=",
+                "h9PAWX6G8wOgk+xsZ7aKCkcmP+DgpysJuCTklDFf7QU=",
+                "DryXxejiLOga7vAiPzYTkN2s04/imUH4Q83KLG0nmWM=",
+                "JKABPhIJr0aXbOq639HEDFBZpEWU/4V8WQKXvxZnyw8=",
+                "h2OeNElNEEpbKCiUmkMb7anniscJZWwZubxJR/LcYWM=",
+                "XaTDE9+ACfu9+cVMIFXwB94eCTz4K9PR8E5gJmZu6Yg=",
+                "k0BPjjwp8TPqqYSfFLPkkS2rcn42UmlclRi6XKlFTJQ=",
+                "tXKvPHY3OjhHvd1oRwnrA7yixuWi0T1ocqheQ3k5DuQ=",
+                "rMd3VPMWLEmxWa7t2LQmgjHfRnxaJNtrav140zUCIAk=",
+                "b02iz7cDsAcNqLud5HUpMkjpciHmL0Ec/Hugt/NEudo=",
+                "ZquwFpXeOVAtLzd8b9dPvwDeTCzIv891njY8Mf+gVMI=",
+                "Bc54XkMlMU89/M0QixgX7asX6FHFKpTKrpQ35dB7Qfw=",
+                "zF3BvZn+iEh9f6TaAVVZcysqraG3EKW4/1z6pI0SQF0=",
+                "3kBWZovCkCWAir7PcZGd2a2zicmV92He+P7cWXPHdG8=",
+                "/2a58lzrUQfoAuFNUx07Dmjo61/cNyxjKuxmZfV/uSU=",
+                "tyO4Oj1UrXex15tzrEEO6sSnE8y8obZWghZ2XixBPtE=",
+                "rjDiNJHGnboMYYUH7OSezbKWj3wMXRTHGCLa/SaZ6O4=",
+                "mfWjSdNaEfNXxDww6AAOw/NoK9e6z1yKaZm5xvmMabs=",
+                "qxzHanAzz57SDdmJe0B7bJK72NTIBbwEMGBBKvDOROw=",
+                "xH/DCseLHr9eKoYT8qsORZK7zVdEGYWHuVtsVrD95wY="
+              ],
+              "logIndex": "2782773757",
+              "rootHash": "Ldf5agEsfxFk3fgYFXw7nOWDmH4vFn6/uLPfzb2YD2M=",
+              "treeSize": "2782773759"
+            },
+            "integratedTime": "1789950127",
+            "kindVersion": {
+              "kind": "dsse",
+              "version": "0.0.1"
+            },
+            "logId": {
+              "keyId": "wNI9atQGlz+VWfO6LRygH4QUfY/8W4RFwiT5i5WRgB0="
+            },
+            "logIndex": "2904678019"
+          }
+        ]
+      }
+    }
+  },
+  "verified_at_ms": 1789950127506
+}

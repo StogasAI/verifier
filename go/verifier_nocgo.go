@@ -2,10 +2,7 @@
 
 package verifier
 
-import (
-	"encoding/json"
-	"errors"
-)
+import "errors"
 
 // ErrNativeLibraryUnavailable explains why the verifier requires a supported cgo build.
 var ErrNativeLibraryUnavailable = errors.New("stogas verifier requires cgo and a packaged native library")
@@ -18,11 +15,10 @@ var ErrTransportClosed = errors.New("stogas transport is closed")
 
 // TransportOptions mirrors the cgo SDK surface.
 type TransportOptions struct {
-	Security                     string
-	BundleRefreshIntervalSeconds uint64
-	BaseURL                      string
-	BundleURL                    string
-	HardwarePolicy               json.RawMessage
+	Environment    string
+	Security       string
+	MaxConnections uint64
+	BaseURL        string
 }
 
 // Transport is unavailable without cgo.
@@ -45,42 +41,3 @@ func (*Transport) RefreshBundle() (bool, error) {
 
 // Close is a no-op for an unavailable transport.
 func (*Transport) Close() error { return nil }
-
-// Verifier is unavailable without cgo.
-type Verifier struct{}
-
-// New reports that the packaged native verifier is unavailable.
-func New() (*Verifier, error) { return nil, ErrNativeLibraryUnavailable }
-
-// VerifyBundle reports that the packaged native verifier is unavailable.
-func (*Verifier) VerifyBundle([]byte) (json.RawMessage, error) {
-	return nil, ErrNativeLibraryUnavailable
-}
-
-// VerifyBundleWithPolicy reports that the packaged native verifier is unavailable.
-func (*Verifier) VerifyBundleWithPolicy([]byte, []byte) (json.RawMessage, error) {
-	return nil, ErrNativeLibraryUnavailable
-}
-
-// VerifyResponseProof reports that the packaged native verifier is unavailable.
-func (*Verifier) VerifyResponseProof([]byte, []byte, string) (json.RawMessage, error) {
-	return nil, ErrNativeLibraryUnavailable
-}
-
-// VerifyHistoricalResponseProof reports that the packaged native verifier is unavailable.
-func (*Verifier) VerifyHistoricalResponseProof([]byte, []byte, []byte, []byte, string) (json.RawMessage, error) {
-	return nil, ErrNativeLibraryUnavailable
-}
-
-// Close is a no-op for an unavailable verifier.
-func (*Verifier) Close() error { return nil }
-
-// VerifyBundle reports that the packaged native verifier is unavailable.
-func VerifyBundle([]byte) (json.RawMessage, error) {
-	return nil, ErrNativeLibraryUnavailable
-}
-
-// VerifyBundleWithPolicy reports that the packaged native verifier is unavailable.
-func VerifyBundleWithPolicy([]byte, []byte) (json.RawMessage, error) {
-	return nil, ErrNativeLibraryUnavailable
-}

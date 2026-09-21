@@ -12,80 +12,65 @@ use std::{
 };
 use tokio::sync::oneshot;
 
-pub use stogas_verifier::{
-    Error, VerificationOutput, VerifiedBundle, VerifiedNode, Verifier, verify_bundle,
-    verify_bundle_with_policy,
-};
+pub use stogas_verifier::evidence::{Error, Snapshot, Verifier};
 
-mod e2ee;
+pub mod encrypted_client;
+pub mod encrypted_http;
+pub mod encrypted_setup;
+pub mod evidence_client;
+pub mod http2_pool;
+pub mod native_http;
+pub mod native_tls;
 mod proxy;
+pub mod receipt_http;
 
-const PRODUCTION_BUNDLE_URL: &str = "https://evidence.stogas.ai/bundles/latest.json";
-const PRODUCTION_UPSTREAM: &str = "https://api.stogas.ai";
 const MAX_MANAGED_RESPONSE_LINE_BYTES: usize = 8 * 1024;
 const MAX_MANAGED_ERROR_BYTES: usize = 8 * 1024;
 
-/// Connection protections applied by the managed transport.
+pub use stogas_verifier::approvals::Environment;
+
+/// The two independently verified transport profiles.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
 pub enum SecurityMode {
-    /// `WebPKI` plus attested certificate and public-key pinning.
+    /// Fresh attestation in TLS 1.3 with mandatory hybrid key exchange.
     Tls,
-    /// Application-layer encryption to every trusted gateway.
+    /// Reusable, forward-secret hybrid encryption over ordinary HTTPS.
     E2ee,
-    /// Attested TLS and application-layer encryption together.
-    Both,
 }
 
-/// Configuration for an in-process managed transport.
 #[derive(Clone, Debug)]
 pub struct TransportOptions {
-    /// Connection protection. Native SDKs default to attested TLS.
+    pub environment: Environment,
     pub security: SecurityMode,
-    /// Scheduled bundle refresh target. Any positive duration is accepted and receives ±10% jitter.
-    pub bundle_refresh_interval: Duration,
-    /// Evidence snapshot URL.
-    pub bundle_url: String,
-    /// Public Stogas API origin.
-    pub base_url: String,
-    /// Caller-owned hardware appraisal policy. Fixed cryptographic checks are not configurable.
-    pub hardware_policy: Option<Vec<u8>>,
+    /// Maximum reusable connections or E2EE sessions. Opened lazily under capacity pressure.
+    pub max_connections: usize,
+    /// Optional HTTPS origin; compiled evidence authorities remain fixed.
+    pub base_url: Option<String>,
 }
 
-/// Configuration for the optional foreground transport frontend.
 #[derive(Clone, Debug)]
 pub struct ServeOptions {
-    /// Evidence snapshot URL.
-    pub bundle_url: String,
-    /// Public Stogas API origin.
-    pub upstream: String,
+    pub transport: TransportOptions,
     /// Loopback listener address.
     pub listen: String,
-    /// Scheduled bundle refresh target.
-    pub bundle_refresh_interval: Duration,
-    /// Connection protection.
-    pub security: SecurityMode,
-    /// Optional browser origin allowed to use the local transport.
+    /// One optional browser origin allowed to use the capability-protected local endpoint.
     pub browser_origin: Option<String>,
-    /// Caller-owned hardware appraisal policy. Fixed cryptographic checks are not configurable.
-    pub hardware_policy: Option<Vec<u8>>,
 }
 
 impl Default for TransportOptions {
     fn default() -> Self {
         Self {
+            environment: Environment::Production,
             security: SecurityMode::Tls,
-            bundle_refresh_interval: Duration::from_mins(5),
-            bundle_url: PRODUCTION_BUNDLE_URL.to_owned(),
-            base_url: PRODUCTION_UPSTREAM.to_owned(),
-            hardware_policy: None,
+            max_connections: 4,
+            base_url: None,
         }
     }
 }
-
 impl TransportOptions {
     fn validate(&self) -> Result<()> {
-        if self.bundle_refresh_interval.is_zero() {
-            bail!("bundle refresh interval must be positive");
+        if self.max_connections == 0 {
+            bail!("max_connections must be positive");
         }
         Ok(())
     }
@@ -94,8 +79,8 @@ impl TransportOptions {
 /// A managed Rust transport running inside the caller's process.
 ///
 /// The SDK returns a capability-protected loopback base URL so existing OpenAI-compatible clients
-/// keep their native request and response types while Rust owns bundle refresh, TLS pinning, E2EE,
-/// streaming, and fail-closed expiry.
+/// keep their native request and response types while Rust owns fresh attestation, evidence recovery,
+/// encrypted streaming and receipt verification.
 pub struct Transport {
     base_url: String,
     refresh_address: SocketAddr,
@@ -114,16 +99,7 @@ impl Transport {
     /// local transport runtime cannot start.
     pub fn start(options: &TransportOptions) -> Result<Self> {
         options.validate()?;
-        let config = proxy::ServeConfig::new(proxy::ServeConfigInput {
-            bundle_url: &options.bundle_url,
-            upstream: &options.base_url,
-            listen: "127.0.0.1:0",
-            bundle_refresh_interval: options.bundle_refresh_interval,
-            security: options.security,
-            browser_origin: None,
-            hardware_policy: options.hardware_policy.as_deref(),
-            protect_loopback_path: true,
-        })?;
+        let config = proxy::ServeConfig::new(options, "127.0.0.1:0", None)?;
         let (ready_tx, ready_rx) = mpsc::sync_channel(1);
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
         let terminal_error = Arc::new(Mutex::new(None));
@@ -141,7 +117,7 @@ impl Transport {
                             let message = format!(
                                 "could not initialize the Stogas transport runtime: {error}"
                             );
-                            ready_tx.send(Err(message.clone())).map_err(|_| {
+                            ready_tx.send(Err(anyhow::anyhow!(message.clone()))).map_err(|_| {
                                 anyhow::anyhow!(
                                     "the Stogas transport caller stopped during initialization: {message}"
                                 )
@@ -164,7 +140,7 @@ impl Transport {
                 if worker.join().is_err() {
                     bail!("Stogas transport worker panicked during initialization");
                 }
-                bail!(error);
+                return Err(error);
             }
             Err(_) => {
                 if worker.join().is_err() {
@@ -213,7 +189,7 @@ impl Transport {
 
     /// Fetch and atomically activate a newer bundle now.
     ///
-    /// Returns `true` when the bundle bytes changed and `false` when active bytes were reused.
+    /// Returns `true` when the verified bundle contents changed.
     ///
     /// # Errors
     ///
@@ -330,7 +306,11 @@ fn read_transport_terminal_error(terminal_error: &Mutex<Option<String>>) -> Opti
 
 impl Drop for Transport {
     fn drop(&mut self) {
-        self.close();
+        // Finalizers cannot wait on networking. The worker owns its bounded shutdown;
+        // callers that need to wait for it use close().
+        if let Some(shutdown) = self.shutdown.take() {
+            let _ = shutdown.send(());
+        }
     }
 }
 
@@ -341,16 +321,11 @@ impl Drop for Transport {
 /// Returns an error when configuration, initial evidence verification, listener binding, or the
 /// transport runtime fails.
 pub async fn serve(options: ServeOptions) -> Result<()> {
-    proxy::serve(proxy::ServeConfig::new(proxy::ServeConfigInput {
-        bundle_url: &options.bundle_url,
-        upstream: &options.upstream,
-        listen: &options.listen,
-        bundle_refresh_interval: options.bundle_refresh_interval,
-        security: options.security,
-        browser_origin: options.browser_origin.as_deref(),
-        hardware_policy: options.hardware_policy.as_deref(),
-        protect_loopback_path: false,
-    })?)
+    proxy::serve(proxy::ServeConfig::new(
+        &options.transport,
+        &options.listen,
+        options.browser_origin.as_deref(),
+    )?)
     .await
 }
 
@@ -370,23 +345,48 @@ mod tests {
     }
 
     #[test]
-    fn transport_options_accept_any_positive_refresh_interval() {
-        for interval in [
-            Duration::from_nanos(1),
-            Duration::from_mins(5),
-            Duration::from_secs(u64::MAX),
-        ] {
-            let options = TransportOptions {
-                bundle_refresh_interval: interval,
+    fn connection_preference_requires_a_positive_maximum() {
+        assert!(TransportOptions::default().validate().is_ok());
+        assert!(
+            TransportOptions {
+                max_connections: 0,
                 ..TransportOptions::default()
-            };
-            assert!(options.validate().is_ok());
-        }
-        let options = TransportOptions {
-            bundle_refresh_interval: Duration::ZERO,
-            ..TransportOptions::default()
-        };
-        assert!(options.validate().is_err());
+            }
+            .validate()
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn drop_signals_shutdown_without_waiting_but_explicit_close_waits_for_cleanup() {
+        let (shutdown, stopped) = oneshot::channel();
+        let (release, released) = mpsc::channel();
+        let (finished, completion) = mpsc::channel();
+        let worker = thread::spawn(move || {
+            stopped.blocking_recv().unwrap();
+            // The caller releases us only after Drop returns. A blocking finalizer fails
+            // this assertion rather than leaving the test hung indefinitely.
+            released.recv_timeout(Duration::from_secs(5)).unwrap();
+            finished.send(()).unwrap();
+        });
+        let mut transport = stopped_transport(None);
+        transport.shutdown = Some(shutdown);
+        transport.thread = Some(worker);
+        drop(transport);
+        release.send(()).unwrap();
+        completion.recv_timeout(Duration::from_secs(5)).unwrap();
+
+        let (shutdown, stopped) = oneshot::channel();
+        let (finished, completion) = mpsc::channel();
+        let mut transport = stopped_transport(None);
+        transport.shutdown = Some(shutdown);
+        transport.thread = Some(thread::spawn(move || {
+            stopped.blocking_recv().unwrap();
+            finished.send(()).unwrap();
+        }));
+        transport.close();
+        completion.try_recv().unwrap();
+        transport.close();
     }
 
     #[test]

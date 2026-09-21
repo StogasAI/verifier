@@ -1,0 +1,102 @@
+{
+  "description": "Dedicated public test keys; no fleet authorization. Actual Rekor inclusion for a root-signed key manifest.",
+  "root": {
+    "key_id": "stogas-fixture-root-20260920",
+    "public_key": "MCowBQYDK2VwAyEA3L5P2vQ8YUaIm4Kw5pD8iMEoZgUuo+oEKx95iLylrgg="
+  },
+  "keys": {
+    "manifest": {
+      "schema": "stogas.keys.v1",
+      "environment": "staging",
+      "generation": 1,
+      "active_key": {
+        "key_id": "stogas-fixture-online-20260920",
+        "public_key": "MCowBQYDK2VwAyEAcAgq6fmIYbUU1IRrxeAvsJb7NsqVPJKDCQmBbc84oKE="
+      },
+      "retired_keys": []
+    },
+    "sigstore": {
+      "dsseEnvelope": {
+        "payload": "eyJhY3RpdmVfa2V5Ijp7ImtleV9pZCI6InN0b2dhcy1maXh0dXJlLW9ubGluZS0yMDI2MDkyMCIsInB1YmxpY19rZXkiOiJNQ293QlFZREsyVndBeUVBY0FncTZmbUlZYlVVMUlScnhlQXZzSmI3TnNxVlBKS0RDUW1CYmM4NG9LRT0ifSwiZW52aXJvbm1lbnQiOiJzdGFnaW5nIiwiZ2VuZXJhdGlvbiI6MSwicmV0aXJlZF9rZXlzIjpbXSwic2NoZW1hIjoic3RvZ2FzLmtleXMudjEifQo=",
+        "payloadType": "application/vnd.stogas.keys.v1+json",
+        "signatures": [
+          {
+            "keyid": "stogas-fixture-root-20260920",
+            "sig": "dW6mQ3l+GfWUBTcweop18URmLN51M3faoZtIIZwif5xZk7U0CKGoX3Ft8Benm6ekeiGtQ42+fbuS3Y/UhkBhBg=="
+          }
+        ]
+      },
+      "mediaType": "application/vnd.dev.sigstore.bundle.v0.3+json",
+      "verificationMaterial": {
+        "publicKey": {
+          "hint": "stogas-fixture-root-20260920"
+        },
+        "timestampVerificationData": {},
+        "tlogEntries": [
+          {
+            "canonicalizedBody": "eyJhcGlWZXJzaW9uIjoiMC4wLjEiLCJraW5kIjoiZHNzZSIsInNwZWMiOnsiZW52ZWxvcGVIYXNoIjp7ImFsZ29yaXRobSI6InNoYTI1NiIsInZhbHVlIjoiNjgyNWMwZjU0OGNhOWEzMTJkNDkwNzQ5NDI4ODcxY2I1YmQwYWRmNjE5NGM5MmM2NjJlYTI0ZTdmZmM1Njk3ZSJ9LCJwYXlsb2FkSGFzaCI6eyJhbGdvcml0aG0iOiJzaGEyNTYiLCJ2YWx1ZSI6ImNjNzNmZTM4MDMyNWRiZDBmNmUwYzM5YTFiMzc3ZjQ0ZWMwNTMzM2Q5YTdkYTYyNjI4MTVmMTc0NGNlZTk2ODQifSwic2lnbmF0dXJlcyI6W3sic2lnbmF0dXJlIjoiZFc2bVEzbCtHZldVQlRjd2VvcDE4VVJtTE41MU0zZmFvWnRJSVp3aWY1eFprN1UwQ0tHb1gzRnQ4QmVubTZla2VpR3RRNDIrZmJ1UzNZL1Voa0JoQmc9PSIsInZlcmlmaWVyIjoiTFMwdExTMUNSVWRKVGlCUVZVSk1TVU1nUzBWWkxTMHRMUzBLVFVOdmQwSlJXVVJMTWxaM1FYbEZRVE5NTlZBeWRsRTRXVlZoU1cwMFMzYzFjRVE0YVUxRmIxcG5WWFZ2SzI5RlMzZzVOV2xNZVd4eVoyYzlDaTB0TFMwdFJVNUVJRkJWUWt4SlF5QkxSVmt0TFMwdExRbz0ifV19fQ==",
+            "inclusionPromise": {
+              "signedEntryTimestamp": "MEQCIEzc5QcKwJPqbg3tR8KZACkzSrnf8nWOeJrL8iH6QitKAiAnmLeYFuWSHDZ6Aie8MMbOCVfY6mXmPvyG8iREO+QOMg=="
+            },
+            "inclusionProof": {
+              "checkpoint": {
+                "envelope": "rekor.sigstore.dev - 1193050959916656506\n2782501593\n3LtTIlmnwjYBL1c6PiRtjmSAp/oaLjpYEjsbILoGetE=\n\n— rekor.sigstore.dev wNI9ajBFAiEAwfxFcrYkYm44PPcgyZgFGxcyDl3W4wogMt73Kj1CbicCIGQNlmd8NE5VaPpf1778Kex1v4QfbBpNlyBbTtNt4+Of\n"
+              },
+              "hashes": [
+                "lvucVpwFvkDj4ttROIMGcDTdNd+0yQzZoEDGqWKY+yU=",
+                "4dS444yMg03iw5XMcrYLfvKfYeBNYJb+tLBrjEsE6yc=",
+                "cuRzC1fxieXWnPARXQpyjkGkYhCSYfPIupzIAu7kcA0=",
+                "URuq8oq6khPhhZtkSmNvYzlg1GwdHuiL7jFb20OpNUI=",
+                "FhjWwG5CHE+OpDeBqKJMs5oe15YF9ZUYSz7dJ+6uL+M=",
+                "YXLVdcXIZn7lrO4AOee9bgJBR9is35ANYwuBxTixfBQ=",
+                "oodePUDUr2VKfTgG0tFFM9hok5gGt1hnTWxHQHH4ADk=",
+                "aC2fv8AIbUA6tqrX/ekKLtFEmcN3JuN4EEM2T3mR1eA=",
+                "MCJ6+shexPGYnD8iUm86Pu9yoJ9tgthqFDmVavrgAzA=",
+                "0xbqOtKqTGVQnYYlW2iVt6wGN1J3oVvhoFR3+O8RmGI=",
+                "+dPM8iDgH5ym8Er3fzp+OwKFWQ9WN8Vbc/UpIY1m8YI=",
+                "Z7losDObIRKy2VochcpXLKleW/eTeOcK9+bFkjzHMnc=",
+                "/rDprkIlDYuwf2vudYQtVOueU/ngGvp0zKwdfNstsKk=",
+                "zF3BvZn+iEh9f6TaAVVZcysqraG3EKW4/1z6pI0SQF0=",
+                "3kBWZovCkCWAir7PcZGd2a2zicmV92He+P7cWXPHdG8=",
+                "/2a58lzrUQfoAuFNUx07Dmjo61/cNyxjKuxmZfV/uSU=",
+                "tyO4Oj1UrXex15tzrEEO6sSnE8y8obZWghZ2XixBPtE=",
+                "rjDiNJHGnboMYYUH7OSezbKWj3wMXRTHGCLa/SaZ6O4=",
+                "mfWjSdNaEfNXxDww6AAOw/NoK9e6z1yKaZm5xvmMabs=",
+                "qxzHanAzz57SDdmJe0B7bJK72NTIBbwEMGBBKvDOROw=",
+                "xH/DCseLHr9eKoYT8qsORZK7zVdEGYWHuVtsVrD95wY="
+              ],
+              "logIndex": "2782501559",
+              "rootHash": "3LtTIlmnwjYBL1c6PiRtjmSAp/oaLjpYEjsbILoGetE=",
+              "treeSize": "2782501593"
+            },
+            "integratedTime": "1789947426",
+            "kindVersion": {
+              "kind": "dsse",
+              "version": "0.0.1"
+            },
+            "logId": {
+              "keyId": "wNI9atQGlz+VWfO6LRygH4QUfY/8W4RFwiT5i5WRgB0="
+            },
+            "logIndex": "2904405821"
+          }
+        ]
+      }
+    }
+  },
+  "approvals": {
+    "manifest": {
+      "schema": "stogas.approvals.v1",
+      "environment": "staging",
+      "revision": 1,
+      "key_manifest_sha256": "02d55940b7ded8f0aab2f65817c4bf73e0d495f65829a47f6c7c1e1f5d8106f3",
+      "gateways": [],
+      "catalogs": [],
+      "hardware_policy_sha256": "3333333333333333333333333333333333333333333333333333333333333333"
+    },
+    "signature": {
+      "key_id": "stogas-fixture-online-20260920",
+      "signature": "-M3tJ69BotlF2bJSAjY0bzQClL0ifgHaPWNTZVW8dvaGtsIXP-ylh9N98Wwznc9WqDUqSIH7ENOwF-IdyFXvCg"
+    }
+  },
+  "verified_at_ms": 1789947426713
+}

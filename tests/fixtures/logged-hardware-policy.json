@@ -1,0 +1,93 @@
+{
+  "policy": {
+    "policies": [
+      {
+        "chip_ids": [
+          "b2202e1f13696edf8e6f3e833df25da9278cfeb1105e70894a14452b2ec5fd2a263db3bdc596294925a01bfaff8b1dd65ad0dfb527a8e6381fed31f097d41e67"
+        ],
+        "cpuid_family": 25,
+        "cpuid_model": 1,
+        "cpuid_stepping": 1,
+        "forbidden_platform_info_mask": "0x0000000000000000",
+        "minimum_tcb": {
+          "bootloader": 4,
+          "microcode": 222,
+          "snp": 29,
+          "tee": 0
+        },
+        "required_current_mitigation_mask": "0x000000000000000b",
+        "required_launch_mitigation_mask": "0x000000000000000b",
+        "required_platform_info_mask": "0x0000000000000024"
+      }
+    ],
+    "schema": "stogas.hardware-policies.v1"
+  },
+  "sigstore": {
+    "dsseEnvelope": {
+      "payload": "eyJwb2xpY2llcyI6W3siY2hpcF9pZHMiOlsiYjIyMDJlMWYxMzY5NmVkZjhlNmYzZTgzM2RmMjVkYTkyNzhjZmViMTEwNWU3MDg5NGExNDQ1MmIyZWM1ZmQyYTI2M2RiM2JkYzU5NjI5NDkyNWEwMWJmYWZmOGIxZGQ2NWFkMGRmYjUyN2E4ZTYzODFmZWQzMWYwOTdkNDFlNjciXSwiY3B1aWRfZmFtaWx5IjoyNSwiY3B1aWRfbW9kZWwiOjEsImNwdWlkX3N0ZXBwaW5nIjoxLCJmb3JiaWRkZW5fcGxhdGZvcm1faW5mb19tYXNrIjoiMHgwMDAwMDAwMDAwMDAwMDAwIiwibWluaW11bV90Y2IiOnsiYm9vdGxvYWRlciI6NCwibWljcm9jb2RlIjoyMjIsInNucCI6MjksInRlZSI6MH0sInJlcXVpcmVkX2N1cnJlbnRfbWl0aWdhdGlvbl9tYXNrIjoiMHgwMDAwMDAwMDAwMDAwMDBiIiwicmVxdWlyZWRfbGF1bmNoX21pdGlnYXRpb25fbWFzayI6IjB4MDAwMDAwMDAwMDAwMDAwYiIsInJlcXVpcmVkX3BsYXRmb3JtX2luZm9fbWFzayI6IjB4MDAwMDAwMDAwMDAwMDAyNCJ9XSwic2NoZW1hIjoic3RvZ2FzLmhhcmR3YXJlLXBvbGljaWVzLnYxIn0K",
+      "payloadType": "application/vnd.stogas.hardware-policies.v1+json",
+      "signatures": [
+        {
+          "keyid": "stogas-fixture-online-20260920",
+          "sig": "YoH95LXijbIFhpjM609Scd45YkVypnQvVCIdtMy3aolT78kv1tJKqC/fWPvX2uzfcyXUJqSIYkGdlhWltNjrCw=="
+        }
+      ]
+    },
+    "mediaType": "application/vnd.dev.sigstore.bundle.v0.3+json",
+    "verificationMaterial": {
+      "publicKey": {
+        "hint": "stogas-fixture-online-20260920"
+      },
+      "timestampVerificationData": {},
+      "tlogEntries": [
+        {
+          "canonicalizedBody": "eyJhcGlWZXJzaW9uIjoiMC4wLjEiLCJraW5kIjoiZHNzZSIsInNwZWMiOnsiZW52ZWxvcGVIYXNoIjp7ImFsZ29yaXRobSI6InNoYTI1NiIsInZhbHVlIjoiZTI5ODJmYTFmMTE5MzA3N2Q5MDExMWMyNzVlYjRiMzgyNGM3MWUzNjJkNDI4MGQ4NGMyZTY2MzdjNmVlMDU2OCJ9LCJwYXlsb2FkSGFzaCI6eyJhbGdvcml0aG0iOiJzaGEyNTYiLCJ2YWx1ZSI6IjgyNmMzMDY4YWEyZDUxYzIxNjRjNmQxMmZiMDFjODRkNDVkMTRlMGI2NGJmNDNlOTdjYTg0YzM5MzRiZDYzY2IifSwic2lnbmF0dXJlcyI6W3sic2lnbmF0dXJlIjoiWW9IOTVMWGlqYklGaHBqTTYwOVNjZDQ1WWtWeXBuUXZWQ0lkdE15M2FvbFQ3OGt2MXRKS3FDL2ZXUHZYMnV6ZmN5WFVKcVNJWWtHZGxoV2x0TmpyQ3c9PSIsInZlcmlmaWVyIjoiTFMwdExTMUNSVWRKVGlCUVZVSk1TVU1nUzBWWkxTMHRMUzBLVFVOdmQwSlJXVVJMTWxaM1FYbEZRV05CWjNFMlptMUpXV0pWVlRGSlVuSjRaVUYyYzBwaU4wNXpjVlpRU2t0RVExRnRRbUpqT0RSdlMwVTlDaTB0TFMwdFJVNUVJRkJWUWt4SlF5QkxSVmt0TFMwdExRbz0ifV19fQ==",
+          "inclusionPromise": {
+            "signedEntryTimestamp": "MEYCIQCjTXr6L9LJ/TA8FCt4ZsJhF+GjQAoq1UERj7M5/q+GDQIhANGQlFePxvwr8zFVsX4YTbtACKEcxRT3ZkOLl5jMrJJf"
+          },
+          "inclusionProof": {
+            "checkpoint": {
+              "envelope": "rekor.sigstore.dev - 1193050959916656506\n2782573564\n0coD6vqzgwn0AV3ftKSUl9XMsAY9o7QvmPKiCcJz3+I=\n\n— rekor.sigstore.dev wNI9ajBFAiEA49xu9C2b0oFMKTHL78WYMyNy7LCGMkF2pEC61wmYEVACIEP/SAUxh3QhNzkzg3O+mTNVNateVAtp2bMQc/IyYHrI\n"
+            },
+            "hashes": [
+              "950V+yio3S2qqtCKjTAhbmpbPxwAYx60mPP8m+b71sc=",
+              "Ot3DzZtbLUjt2H8i/8AnNnzLKN9UFkri11a5l1bcQ4c=",
+              "JTUlqIm2tni3z5s52YbnRidUFGsfbCyRbOSiJOkuWpM=",
+              "46zJfr5mvWwznfnc5gQcWaLg9Qs6VsIl2ASoIvKhIuc=",
+              "wvp7bOBP3aepTM5yl7R3p+bcHc/czlqGWWSSq2v7DTE=",
+              "kSseMh1y0foXv9C5Sc/xyl1bZ/2tD6yBduaXXSrV/S8=",
+              "u7pfs7e7wSQj5Yp4ZK1nyFIyLIfAuiC8UjRoXG4GLjg=",
+              "kmYTp2gN8WrnOQgFTFXAN3YYUgrS0tOy9tjF5jzpTAA=",
+              "m5uGTI8IdcPU5svQQPl2UXgRcpnoHucjmd5/ZQD1G6I=",
+              "96+/foJfHQKfkhMmPmCOgGW2lTzZEE1c3MRNSSak+v4=",
+              "YFFnnqyMs1kSE/bBWQecDl1XjNpqRqZ40MznBA5tftE=",
+              "rNL/bH47Zt6t/VGNtHtW+KuRpvMvloM3RAEfcCqi28g=",
+              "4/FKwyLFNzoDwxXzF99xaMM4exCrtnHA/hM5/QqP7mI=",
+              "wCEEybR7chv0BFxn6Wukj9khH6alGsQkJzdjwiQmz28=",
+              "zF3BvZn+iEh9f6TaAVVZcysqraG3EKW4/1z6pI0SQF0=",
+              "3kBWZovCkCWAir7PcZGd2a2zicmV92He+P7cWXPHdG8=",
+              "/2a58lzrUQfoAuFNUx07Dmjo61/cNyxjKuxmZfV/uSU=",
+              "tyO4Oj1UrXex15tzrEEO6sSnE8y8obZWghZ2XixBPtE=",
+              "rjDiNJHGnboMYYUH7OSezbKWj3wMXRTHGCLa/SaZ6O4=",
+              "mfWjSdNaEfNXxDww6AAOw/NoK9e6z1yKaZm5xvmMabs=",
+              "qxzHanAzz57SDdmJe0B7bJK72NTIBbwEMGBBKvDOROw=",
+              "xH/DCseLHr9eKoYT8qsORZK7zVdEGYWHuVtsVrD95wY="
+            ],
+            "logIndex": "2782573533",
+            "rootHash": "0coD6vqzgwn0AV3ftKSUl9XMsAY9o7QvmPKiCcJz3+I=",
+            "treeSize": "2782573564"
+          },
+          "integratedTime": "1789948001",
+          "kindVersion": {
+            "kind": "dsse",
+            "version": "0.0.1"
+          },
+          "logId": {
+            "keyId": "wNI9atQGlz+VWfO6LRygH4QUfY/8W4RFwiT5i5WRgB0="
+          },
+          "logIndex": "2904477795"
+        }
+      ]
+    }
+  }
+}

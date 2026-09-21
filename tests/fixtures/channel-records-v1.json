@@ -1,0 +1,137 @@
+{
+  "description": "Independent Python cryptography HKDF-Expand-SHA256 and AES-256-GCM vectors for stogas.e2ee.record.v1.",
+  "root_hex": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+  "session_id_hex": "202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f",
+  "streams": [
+    {
+      "number": "0",
+      "direction": 1,
+      "records": [
+        {
+          "kind": 1,
+          "plaintext_hex": "7b226d6574686f64223a22504f5354222c2270617468223a222f76312f636861742f636f6d706c6574696f6e73227d",
+          "encoded_hex": "00000044efefdad08cc3cce8148c7e2c6cc0cb4eea65e10a87ecec0f24692ddf47a1bdd6d781d2328ceccfaec1181be5d36027bba308fe931dfdccd8d779deae869f7a9a"
+        },
+        {
+          "kind": 2,
+          "plaintext_hex": "00ff0a7b2270726f6d7074223a2268656c6c6f227d",
+          "encoded_hex": "0000002a6826a90eadd6e669ed015dc8af5611ea4d502d5bb10c9ea447e828cfb8cd24e976fc23f79908"
+        },
+        {
+          "kind": 3,
+          "plaintext_hex": "",
+          "encoded_hex": "00000015a23740f1a50ee10908cef6dd5b2194744c"
+        }
+      ]
+    },
+    {
+      "number": "0",
+      "direction": 2,
+      "records": [
+        {
+          "kind": 4,
+          "plaintext_hex": "",
+          "encoded_hex": "000000150f3fc99edd9341730e3b3b25ea86ff0afa"
+        },
+        {
+          "kind": 1,
+          "plaintext_hex": "7b22737461747573223a3230307d",
+          "encoded_hex": "000000236ed0e47a5247291a4de40c65ed41a5eaf4bbe59e4fef1c43ae773e57584725"
+        },
+        {
+          "kind": 2,
+          "plaintext_hex": "646174613a207b2274657874223a2268656c6c6f227d0a0a",
+          "encoded_hex": "0000002d2064d0165bc0789ffdcf492a96db79acdff94a3685bff66248dc6764c2e353ce6e0132b6bde1adc066"
+        },
+        {
+          "kind": 4,
+          "plaintext_hex": "",
+          "encoded_hex": "00000015028a694af37cd1241e4c3d329919a3853f"
+        },
+        {
+          "kind": 3,
+          "plaintext_hex": "",
+          "encoded_hex": "0000001573f1d9358f1dbe5fdf2037806dd9f8915d"
+        }
+      ]
+    },
+    {
+      "number": "1152921504606847042",
+      "direction": 1,
+      "records": [
+        {
+          "kind": 1,
+          "plaintext_hex": "7b226d6574686f64223a22504f5354222c2270617468223a222f76312f636861742f636f6d706c6574696f6e73227d",
+          "encoded_hex": "0000004435da5f4689b6fe0036bc092ae706b2c588e8ced67b264775cc4d56b3df75d4a2590233e23b5abf69a7ce9f22c0796a919092ab0c0b2f52e1017efc8db5e8efa7"
+        },
+        {
+          "kind": 2,
+          "plaintext_hex": "00ff0a7b2270726f6d7074223a2268656c6c6f227d",
+          "encoded_hex": "0000002a91690627bd9e507e3e3bb7c7d4533521e061e0e0e43b670a4f7a41ac076900f5c1ccad681351"
+        },
+        {
+          "kind": 3,
+          "plaintext_hex": "",
+          "encoded_hex": "000000156f6da4224cca58181e397fdaead3798885"
+        }
+      ]
+    },
+    {
+      "number": "1152921504606847042",
+      "direction": 2,
+      "records": [
+        {
+          "kind": 4,
+          "plaintext_hex": "",
+          "encoded_hex": "000000151e180e5edded9896f99ba92da73354cd3b"
+        },
+        {
+          "kind": 1,
+          "plaintext_hex": "7b22737461747573223a3230307d",
+          "encoded_hex": "0000002338ea31db521171034d98a591d50a42d6aed041e8ad7885fa0ccf224e3ebc29"
+        },
+        {
+          "kind": 2,
+          "plaintext_hex": "646174613a207b2274657874223a2268656c6c6f227d0a0a",
+          "encoded_hex": "0000002d6401f910ed0f3d5a21c2e1cda17d4e2392f13c380c69bd224e3961a5674713fd12af496b312d3d3dbf"
+        },
+        {
+          "kind": 4,
+          "plaintext_hex": "",
+          "encoded_hex": "00000015b2415d177b8077730d35265c3c936bc5ec"
+        },
+        {
+          "kind": 3,
+          "plaintext_hex": "",
+          "encoded_hex": "00000015a5dc74f931ab8d96d9eb0ef018d4cb4143"
+        }
+      ]
+    }
+  ],
+  "invalid_firsts": [
+    {
+      "direction": 1,
+      "encoded_hex": "00000015ea2f6ec559877cf06d6c565830e723b33d"
+    },
+    {
+      "direction": 1,
+      "encoded_hex": "00000015ef08dc29d65b9b573dafd9d988cfef876a"
+    },
+    {
+      "direction": 1,
+      "encoded_hex": "00000016ececdd9f037c7cd8c4a5ebb678650201066e"
+    },
+    {
+      "direction": 1,
+      "encoded_hex": "00000015edca97bb2fd6a7bee22e752692753d30b6"
+    },
+    {
+      "direction": 2,
+      "encoded_hex": "00000015f4e8e9a642c812b8d2e190c7d54be55377"
+    },
+    {
+      "direction": 2,
+      "encoded_hex": "000000160f87b0248211e44d8c572f745c6ebbc76e6c"
+    }
+  ]
+}

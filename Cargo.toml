@@ -14,7 +14,7 @@ resolver = "2"
 [workspace.package]
 version = "0.1.0-alpha.1"
 edition = "2024"
-rust-version = "1.97.1"
+rust-version = "1.93"
 license-file = "LICENSE"
 repository = "https://github.com/StogasAI/verifier"
 

@@ -1,0 +1,12 @@
+{
+  "public_key": "O2onvM62pC1io6jQKm8Nc2UyFXcd4kOmOsBIoYtZ2ik",
+  "receipt": {
+    "schema": "stogas.receipt.v1",
+    "boot_sha256": "913b7d74a427e39b23017790c299e6f8165bbe1aed5287255f19dfd3fa11c366",
+    "request_sha256": "3219e1b8e8a3a6329a3ed247a2e2a5cf74efa8843e59901c2fd138deac9f2bd2",
+    "response_sha256": "21eae1c895638d0c3b0632c2e19c411aa2500d382043da580e3d59b82b1cbc62",
+    "signature": "Vj6ubSg3thAiuU1WMAVdstubI4jMXUALXVmL7cE3FzUJM8bqTmzdvF1hyjhIXDSOWy8-AxGRTAcys7gkuCGICg"
+  },
+  "request": "{\"messages\":[{\"role\":\"user\",\"content\":\"fixture\"}]}",
+  "response": "{\"choices\":[{\"message\":{\"role\":\"assistant\",\"content\":\"reply\"}}]}"
+}

@@ -244,7 +244,7 @@ pub fn verify_keyed_dsse(
         .decode(&bundle.dsse_envelope.payload)
         .map_err(|error| format!("invalid DSSE payload encoding: {error}"))?;
     if payload != expected_payload {
-        return Err("DSSE payload differs from the expected hardware policy".into());
+        return Err("DSSE payload differs from the expected document".into());
     }
     let entry = &bundle.verification_material.tlog_entries[0];
     let root = TrustedRoot::production()?;

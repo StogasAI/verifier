@@ -10,6 +10,21 @@ permissions:
   contents: read
 
 jobs:
+  minimum-rust:
+    name: Minimum Rust and offline embedding
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c
+        with:
+          toolchain: 1.93.0
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32
+      - run: cargo +1.93.0 check --locked --workspace --all-targets
+      - run: cargo +1.93.0 test --locked --package stogas-verifier --package stogas-verifier-ffi --no-default-features --features staging
+
   security:
     name: Dependency security
     runs-on: ubuntu-24.04
@@ -41,6 +56,7 @@ jobs:
       - run: cargo fmt --all --check
       - run: cargo clippy --locked --workspace --all-targets -- -D warnings
       - run: cargo clippy --locked --package stogas-verifier --all-targets --no-default-features -- -D warnings
+      - run: cargo clippy --locked --package stogas-verifier-ffi --all-targets --no-default-features --features staging -- -D warnings
 
   native:
     name: Native tests (${{ matrix.os }})
@@ -81,17 +97,23 @@ jobs:
         run: |
           set -euo pipefail
           python -m pip install --force-reinstall dist/*.whl
-          python - <<'PY'
-          import stogas_verifier
+          python -m unittest discover -s bindings/python/tests -v
 
-          verifier = stogas_verifier.Verifier()
-          try:
-              verifier.verify_bundle(b'{"body":')
-          except ValueError as error:
-              assert "invalid bundle JSON" in str(error)
-          else:
-              raise AssertionError("malformed bundle was accepted")
-          PY
+      - name: Build the staging Python wheel
+        if: matrix.os == 'ubuntu-24.04'
+        uses: PyO3/maturin-action@36db84001d74475ad1b8e6613557ae4ee2dc3598
+        with:
+          manylinux: 'off'
+          args: --locked --features staging --out dist-staging --manifest-path bindings/python/Cargo.toml
+      - name: Test Python snapshot ownership with signed evidence
+        if: matrix.os == 'ubuntu-24.04'
+        shell: bash
+        env:
+          STOGAS_TEST_STAGING: '1'
+        run: |
+          set -euo pipefail
+          python -m pip install --force-reinstall dist-staging/*.whl
+          python -m unittest discover -s bindings/python/tests -v
 
   go:
     name: Go binding and C ABI
@@ -116,6 +138,27 @@ jobs:
           CGO_ENABLED: '1'
           CGO_LDFLAGS: -L${{ github.workspace }}/target/debug
         run: go test ./...
+      - run: cargo build --locked --package stogas-verifier-ffi --features staging
+      - name: Test staging evidence ownership through the Go adapter
+        working-directory: go
+        env:
+          CGO_ENABLED: '1'
+          CGO_LDFLAGS: -L${{ github.workspace }}/target/debug
+        run: go test -race -tags staging ./...
+      - run: cargo test --locked --package stogas-verifier-ffi --no-default-features --features staging
+      - run: cargo build --locked --package stogas-verifier-ffi --no-default-features --features staging
+      - name: Test Go offline embedding without native transport dependencies
+        working-directory: go
+        env:
+          CGO_ENABLED: '1'
+          CGO_LDFLAGS: -L${{ github.workspace }}/target/debug
+        run: go test -race -tags staging,stogas_offline ./...
+      - name: Test fully static offline embedding
+        working-directory: go
+        env:
+          CGO_ENABLED: '1'
+          CGO_LDFLAGS: -L${{ github.workspace }}/target/debug
+        run: go test -tags staging,stogas_offline,netgo,osusergo -ldflags='-linkmode=external -extldflags "-static -Wl,--gc-sections,--build-id=none"' ./...
 
   wasm-compile:
     name: Browser WASM and network-disabled E2E
@@ -151,10 +194,6 @@ jobs:
           set -euo pipefail
           cargo install wasm-bindgen-cli --version =0.2.126 --locked
           cargo build --locked --release --package stogas-offline-sigstore-wasm --package stogas-verifier-wasm --target wasm32-unknown-unknown
-          wasm-bindgen target/wasm32-unknown-unknown/release/stogas_verifier_wasm.wasm \
-            --target no-modules \
-            --out-dir target/browser \
-            --out-name stogas_verifier
           wasm-bindgen target/wasm32-unknown-unknown/release/stogas_offline_sigstore_wasm.wasm \
             --target no-modules \
             --out-dir target/offline-browser \
@@ -167,6 +206,12 @@ jobs:
             --target web \
             --out-dir packages/offline-sigstore/pkg/browser \
             --out-name stogas_offline_sigstore
+          cargo build --locked --release --package stogas-verifier-wasm --features staging \
+            --target wasm32-unknown-unknown --target-dir target/wasm-staging
+          wasm-bindgen target/wasm-staging/wasm32-unknown-unknown/release/stogas_verifier_wasm.wasm \
+            --target no-modules \
+            --out-dir target/browser \
+            --out-name stogas_verifier
       - name: Install browser test runtime
         run: |
           npm ci --ignore-scripts --workspaces=false
@@ -285,6 +330,6 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          for target in sigstore bundle_x509_snp_drand heartbeat_admission c_abi e2ee_client; do
+          for target in sigstore current_evidence session_evidence c_abi encrypted_setup; do
             cargo fuzz run "$target" -- -max_total_time=10 -timeout=10
           done

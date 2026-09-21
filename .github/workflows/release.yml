@@ -229,16 +229,7 @@ jobs:
         run: |
           set -euo pipefail
           python -m pip install --force-reinstall dist/*.whl
-          python - <<'PY'
-          import stogas_verifier
-          verifier = stogas_verifier.Verifier()
-          try:
-              verifier.verify_bundle(b'{"body":')
-          except ValueError as error:
-              assert "invalid bundle JSON" in str(error)
-          else:
-              raise AssertionError("malformed bundle was accepted")
-          PY
+          python -m unittest discover -s bindings/python/tests -v
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
           name: python-${{ matrix.platform }}
@@ -287,12 +278,12 @@ jobs:
           node --input-type=module <<'NODE'
           const full = await import('@stogas/verifier')
           const offline = await import('@stogas/offline-sigstore')
-          const verifier = new full.Verifier()
+          const verifier = new full.EvidenceVerifier('prod', 'package-test', 'MCowBQYDK2VwAyEA3L5P2vQ8YUaIm4Kw5pD8iMEoZgUuo+oEKx95iLylrgg=')
           try {
-            verifier.verify_bundle(new TextEncoder().encode('{"body":'))
+            verifier.refresh(new TextEncoder().encode('{"body":'))
             throw new Error('packed verifier accepted malformed input')
           } catch (error) {
-            if (!String(error).includes('invalid bundle JSON')) throw error
+            if (!String(error).includes('invalid current evidence')) throw error
           } finally {
             verifier.free()
           }

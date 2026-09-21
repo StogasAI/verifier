@@ -8,6 +8,8 @@
 /go/LICENSE
 /node_modules
 /test-results
+__pycache__/
+*.pyc
 **/*.so
 **/*.dylib
 **/*.dll

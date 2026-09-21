@@ -3,9 +3,7 @@
 use libfuzzer_sys::fuzz_target;
 use stogas_offline_sigstore::{GithubPolicy, Subject, verify_github_attestation};
 
-const FIXTURE: &[u8] = include_bytes!(
-    "../../tests/fixtures/gateway-v0.0.1-attestation.jsonl"
-);
+const FIXTURE: &[u8] = include_bytes!("../../tests/fixtures/gateway-v0.0.1-attestation.jsonl");
 const NOW_UNIX_MS: i64 = 1_784_246_400_000;
 
 fuzz_target!(|data: &[u8]| {

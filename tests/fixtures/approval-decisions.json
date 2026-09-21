@@ -1,0 +1,46 @@
+{
+  "unsigned_release": {
+    "schema": "stogas.gateway.release.v1",
+    "build": {
+      "z": 2,
+      "a": 1
+    }
+  },
+  "release_id": "a75d53072b40e7c772162807e4f77591c9d60d3b500798731aff72d5b8e7dab1",
+  "key_manifest": {
+    "schema": "stogas.keys.v1",
+    "environment": "prod",
+    "generation": 1,
+    "active_key": {
+      "key_id": "key-2",
+      "public_key": "MCowBQYDK2VwAyEAgTl3Dqh9F19Wo1Rmw0x+zMuNipG07jeiXfYPW4/Js5Q="
+    },
+    "retired_keys": []
+  },
+  "key_manifest_sha256": "2d53b80e433af8579f6b9e0ac8fcfb9db49e4e58f0d3dda0aad49ae54ede574c",
+  "approval": {
+    "manifest": {
+      "schema": "stogas.approvals.v1",
+      "environment": "prod",
+      "revision": 1,
+      "key_manifest_sha256": "2d53b80e433af8579f6b9e0ac8fcfb9db49e4e58f0d3dda0aad49ae54ede574c",
+      "gateways": [
+        "a75d53072b40e7c772162807e4f77591c9d60d3b500798731aff72d5b8e7dab1"
+      ],
+      "catalogs": [
+        "2222222222222222222222222222222222222222222222222222222222222222"
+      ],
+      "hardware_policy_sha256": "3333333333333333333333333333333333333333333333333333333333333333"
+    },
+    "signature": {
+      "key_id": "key-2",
+      "signature": "SYLlBQBdcqfePTM1r_m3ey8ntYaBLR2ljNtGEapElsbPDXCm1glpMB3NxCubYvw2Rhu-IRfaYsnd5KVSmxlADA"
+    }
+  },
+  "unicode_payload": {
+    "": "bmp",
+    "😀": "astral",
+    "text": "\u0000\n\"\\ "
+  },
+  "unicode_payload_sha256": "c19bb8b33539e5169960f401b572a94d2b1026d1442bc95a6db2397d34e86e42"
+}
