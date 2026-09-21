@@ -150,6 +150,16 @@ jobs:
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32
       - name: Build the Go static library
         run: cargo build --locked --release --target ${{ matrix.target }} --package stogas-verifier-ffi
+      - uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c
+        with:
+          go-version-file: go/go.mod
+          cache-dependency-path: go/go.mod
+      - name: Test the Go adapter with the release library
+        working-directory: go
+        env:
+          CGO_ENABLED: '1'
+          CGO_LDFLAGS: -L${{ github.workspace }}/target/${{ matrix.target }}/release
+        run: go test ./...
       - name: Stage the module-native library
         shell: bash
         run: |

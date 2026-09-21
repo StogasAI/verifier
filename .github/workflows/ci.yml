@@ -76,23 +76,18 @@ jobs:
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32
       - run: cargo test --locked --workspace --all-targets
       - name: Test compiled staging trust policy and transport
-        if: matrix.os == 'ubuntu-24.04'
         run: cargo test --locked --package stogas-verifier --package stogas --all-targets --features staging
       - name: Test the verifier without optional SNP support
-        if: matrix.os == 'ubuntu-24.04'
         run: cargo test --locked --package stogas-verifier --all-targets --no-default-features
       - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405
-        if: matrix.os == 'ubuntu-24.04'
         with:
           python-version: '3.10'
       - name: Build the Python wheel smoke artifact
-        if: matrix.os == 'ubuntu-24.04'
         uses: PyO3/maturin-action@36db84001d74475ad1b8e6613557ae4ee2dc3598
         with:
           manylinux: 'off'
           args: --locked --out dist --manifest-path bindings/python/Cargo.toml
       - name: Import the Python wheel and reject malformed evidence
-        if: matrix.os == 'ubuntu-24.04'
         shell: bash
         run: |
           set -euo pipefail
@@ -100,13 +95,11 @@ jobs:
           python -m unittest discover -s bindings/python/tests -v
 
       - name: Build the staging Python wheel
-        if: matrix.os == 'ubuntu-24.04'
         uses: PyO3/maturin-action@36db84001d74475ad1b8e6613557ae4ee2dc3598
         with:
           manylinux: 'off'
           args: --locked --features staging --out dist-staging --manifest-path bindings/python/Cargo.toml
       - name: Test Python snapshot ownership with signed evidence
-        if: matrix.os == 'ubuntu-24.04'
         shell: bash
         env:
           STOGAS_TEST_STAGING: '1'
@@ -116,9 +109,25 @@ jobs:
           python -m unittest discover -s bindings/python/tests -v
 
   go:
-    name: Go binding and C ABI
-    runs-on: ubuntu-24.04
-    timeout-minutes: 20
+    name: Go binding and C ABI (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+          - os: macos-15
+            target: aarch64-apple-darwin
+          - os: windows-2025
+            target: x86_64-pc-windows-gnu
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    env:
+      CARGO_BUILD_TARGET: ${{ matrix.target }}
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
         with:
@@ -126,6 +135,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c
         with:
           toolchain: 1.97.1
+          targets: ${{ matrix.target }}
       - uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c
         with:
           go-version-file: go/go.mod
@@ -136,14 +146,14 @@ jobs:
         working-directory: go
         env:
           CGO_ENABLED: '1'
-          CGO_LDFLAGS: -L${{ github.workspace }}/target/debug
+          CGO_LDFLAGS: -L${{ github.workspace }}/target/${{ matrix.target }}/debug
         run: go test ./...
       - run: cargo build --locked --package stogas-verifier-ffi --features staging
       - name: Test staging evidence ownership through the Go adapter
         working-directory: go
         env:
           CGO_ENABLED: '1'
-          CGO_LDFLAGS: -L${{ github.workspace }}/target/debug
+          CGO_LDFLAGS: -L${{ github.workspace }}/target/${{ matrix.target }}/debug
         run: go test -race -tags staging ./...
       - run: cargo test --locked --package stogas-verifier-ffi --no-default-features --features staging
       - run: cargo build --locked --package stogas-verifier-ffi --no-default-features --features staging
@@ -151,13 +161,14 @@ jobs:
         working-directory: go
         env:
           CGO_ENABLED: '1'
-          CGO_LDFLAGS: -L${{ github.workspace }}/target/debug
+          CGO_LDFLAGS: -L${{ github.workspace }}/target/${{ matrix.target }}/debug
         run: go test -race -tags staging,stogas_offline ./...
       - name: Test fully static offline embedding
+        if: matrix.os == 'ubuntu-24.04'
         working-directory: go
         env:
           CGO_ENABLED: '1'
-          CGO_LDFLAGS: -L${{ github.workspace }}/target/debug
+          CGO_LDFLAGS: -L${{ github.workspace }}/target/${{ matrix.target }}/debug
         run: go test -tags staging,stogas_offline,netgo,osusergo -ldflags='-linkmode=external -extldflags "-static -Wl,--gc-sections,--build-id=none"' ./...
 
   wasm-compile:
