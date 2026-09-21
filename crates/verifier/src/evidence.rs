@@ -33,7 +33,7 @@ pub use session::VerifiedSession;
 #[cfg(feature = "snp")]
 pub use snp::VerifiedSnpReport;
 
-/// The replacement body of `bundles/latest.json`. Boot records travel with session evidence.
+/// The replacement body of `evidence/latest.json`. Boot records travel with session evidence.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Bundle {

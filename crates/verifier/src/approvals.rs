@@ -43,13 +43,13 @@ impl Environment {
     pub const fn evidence_origins(self) -> [&'static str; 2] {
         match self {
             Self::Production => [
-                "https://evidence.stogas.ai/bundles/latest.json",
-                "https://evidence2.stogas.ai/bundles/latest.json",
+                "https://evidence.stogas.ai/evidence/latest.json",
+                "https://evidence2.stogas.ai/evidence/latest.json",
             ],
             #[cfg(feature = "staging")]
             Self::Staging => [
-                "https://evidence-staging.stogas.ai/bundles/latest.json",
-                "https://evidence2-staging.stogas.ai/bundles/latest.json",
+                "https://evidence-staging.stogas.ai/evidence/latest.json",
+                "https://evidence2-staging.stogas.ai/evidence/latest.json",
             ],
         }
     }

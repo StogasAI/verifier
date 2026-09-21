@@ -3,8 +3,8 @@ import { test } from 'node:test';
 import { EvidenceClient } from '../../bindings/shared/evidence-client.js';
 
 const origins = [
-	'https://evidence.example/bundles/latest.json',
-	'https://replica.example/bundles/latest.json'
+	'https://evidence.example/evidence/latest.json',
+	'https://replica.example/evidence/latest.json'
 ];
 // Only delivery/ownership is doubled here. Signed decision and CRL behavior is
 // exercised by Rust and packaged Wasm tests against genuine evidence.
