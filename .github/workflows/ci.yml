@@ -116,16 +116,24 @@ jobs:
         include:
           - os: ubuntu-24.04
             target: x86_64-unknown-linux-gnu
+            platform: linux-amd64
           - os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
+            platform: linux-arm64
           - os: macos-15-intel
             target: x86_64-apple-darwin
+            platform: darwin-amd64
           - os: macos-15
             target: aarch64-apple-darwin
+            platform: darwin-arm64
           - os: windows-2025
             target: x86_64-pc-windows-gnu
+            platform: windows-amd64
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
+    defaults:
+      run:
+        shell: bash
     env:
       CARGO_BUILD_TARGET: ${{ matrix.target }}
     steps:
@@ -141,34 +149,39 @@ jobs:
           go-version-file: go/go.mod
           cache-dependency-path: go/go.mod
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32
-      - run: cargo build --locked --package stogas-verifier-ffi
+      - run: |
+          cargo build --locked --package stogas-verifier-ffi
+          mkdir -p "go/native/${{ matrix.platform }}"
+          cp "target/${{ matrix.target }}/debug/libstogas_verifier_ffi.a" "go/native/${{ matrix.platform }}/"
       - name: Test the Go adapter against the static Rust library
         working-directory: go
         env:
           CGO_ENABLED: '1'
-          CGO_LDFLAGS: -L${{ github.workspace }}/target/${{ matrix.target }}/debug
         run: go test ./...
-      - run: cargo build --locked --package stogas-verifier-ffi --features staging
+      - run: |
+          cargo build --locked --package stogas-verifier-ffi --features staging
+          mkdir -p "go/native/${{ matrix.platform }}"
+          cp "target/${{ matrix.target }}/debug/libstogas_verifier_ffi.a" "go/native/${{ matrix.platform }}/"
       - name: Test staging evidence ownership through the Go adapter
         working-directory: go
         env:
           CGO_ENABLED: '1'
-          CGO_LDFLAGS: -L${{ github.workspace }}/target/${{ matrix.target }}/debug
         run: go test -race -tags staging ./...
       - run: cargo test --locked --package stogas-verifier-ffi --no-default-features --features staging
-      - run: cargo build --locked --package stogas-verifier-ffi --no-default-features --features staging
+      - run: |
+          cargo build --locked --package stogas-verifier-ffi --no-default-features --features staging
+          mkdir -p "go/native/${{ matrix.platform }}"
+          cp "target/${{ matrix.target }}/debug/libstogas_verifier_ffi.a" "go/native/${{ matrix.platform }}/"
       - name: Test Go offline embedding without native transport dependencies
         working-directory: go
         env:
           CGO_ENABLED: '1'
-          CGO_LDFLAGS: -L${{ github.workspace }}/target/${{ matrix.target }}/debug
         run: go test -race -tags staging,stogas_offline ./...
       - name: Test fully static offline embedding
         if: matrix.os == 'ubuntu-24.04'
         working-directory: go
         env:
           CGO_ENABLED: '1'
-          CGO_LDFLAGS: -L${{ github.workspace }}/target/${{ matrix.target }}/debug
         run: go test -tags staging,stogas_offline,netgo,osusergo -ldflags='-linkmode=external -extldflags "-static -Wl,--gc-sections,--build-id=none"' ./...
 
   wasm-compile:

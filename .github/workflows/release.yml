@@ -154,18 +154,18 @@ jobs:
         with:
           go-version-file: go/go.mod
           cache-dependency-path: go/go.mod
-      - name: Test the Go adapter with the release library
-        working-directory: go
-        env:
-          CGO_ENABLED: '1'
-          CGO_LDFLAGS: -L${{ github.workspace }}/target/${{ matrix.target }}/release
-        run: go test ./...
       - name: Stage the module-native library
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p "go-native/${{ matrix.platform }}"
+          mkdir -p "go-native/${{ matrix.platform }}" "go/native/${{ matrix.platform }}"
           cp "target/${{ matrix.target }}/release/libstogas_verifier_ffi.a" "go-native/${{ matrix.platform }}/"
+          cp "go-native/${{ matrix.platform }}/libstogas_verifier_ffi.a" "go/native/${{ matrix.platform }}/"
+      - name: Test the Go adapter with the release library
+        working-directory: go
+        env:
+          CGO_ENABLED: '1'
+        run: go test ./...
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
           name: go-native-${{ matrix.platform }}
