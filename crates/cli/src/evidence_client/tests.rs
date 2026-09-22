@@ -553,6 +553,25 @@ async fn warm_rejection_preserves_cause_and_old_requests_without_reusing_stale_a
         .prepare(&client, deadline(), move || Ok(now))
         .await
         .unwrap();
+    // A ready cached channel must still honor an already-expired caller budget.
+    // Tokio may poll a ready future before observing its timeout.
+    assert!(matches!(
+        channel
+            .prepare(&client, Instant::now(), move || Ok(now))
+            .await,
+        Err(crate::native_http::Error::Evidence(Error::Deadline))
+    ));
+    assert!(matches!(
+        client
+            .reappraise_session(
+                Arc::clone(&retained.snapshot),
+                Arc::clone(&retained.session),
+                Instant::now(),
+                now,
+            )
+            .await,
+        Err(Error::Deadline)
+    ));
     let mut body = fixture["bundle"]["body"].clone();
     body["approvals"]["manifest"]["revision"] =
         json!(body["approvals"]["manifest"]["revision"].as_u64().unwrap() + 1);

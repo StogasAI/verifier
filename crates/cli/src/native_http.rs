@@ -188,6 +188,9 @@ impl Channel {
         deadline: Instant,
         now: impl Fn() -> Result<i64, evidence_client::Error> + Copy + Send + Sync + 'static,
     ) -> Result<Arc<RequestContext>, Error> {
+        if Instant::now() >= deadline {
+            return Err(Error::Evidence(evidence_client::Error::Deadline));
+        }
         timeout_at(deadline, async {
             let mut retained = self.current.lock().await;
             let latest = evidence.current()?.ok_or(evidence_client::Error::State)?;

@@ -158,6 +158,9 @@ impl EvidenceClient {
         deadline: Instant,
         now_unix_ms: i64,
     ) -> Result<Arc<VerifiedSession>, Error> {
+        if Instant::now() >= deadline {
+            return Err(Error::Deadline);
+        }
         timeout_at(
             deadline,
             run_cpu(Arc::clone(&self.cpu), move || {
