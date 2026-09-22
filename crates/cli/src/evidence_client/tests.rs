@@ -686,11 +686,21 @@ async fn encrypted_setup_bounds_delivery_and_never_recovers_invalid_protocol_dat
         .await;
         match case {
             "malformed" => assert!(matches!(result, Err(Error::Setup(_)))),
-            "stall" => assert!(matches!(result, Err(Error::Deadline))),
+            // The same absolute deadline also bounds setup-key generation. On
+            // a busy runner it may expire there before HTTP starts.
+            "stall" => assert!(
+                matches!(
+                    result,
+                    Err(Error::Deadline | Error::Evidence(super::Error::Deadline))
+                ),
+                "unexpected setup result: {:?}",
+                result.err()
+            ),
             _ => assert!(matches!(result, Err(Error::Response))),
         }
     }
-    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 6);
+    let calls_before_expired_setup = calls.load(std::sync::atomic::Ordering::SeqCst);
+    assert!((5..=6).contains(&calls_before_expired_setup));
     assert_eq!(
         origins.state.requests.lock().unwrap().len(),
         1,
@@ -705,6 +715,9 @@ async fn encrypted_setup_bounds_delivery_and_never_recovers_invalid_protocol_dat
     )
     .await;
     assert!(matches!(result, Err(Error::Deadline)));
-    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 6);
+    assert_eq!(
+        calls.load(std::sync::atomic::Ordering::SeqCst),
+        calls_before_expired_setup
+    );
     task.abort();
 }
