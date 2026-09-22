@@ -141,25 +141,30 @@ test('concurrent requests share one verified setup and explicit close sends one 
 });
 
 test('canceling the first waiter preserves shared setup for another request', async () => {
-	const ready = Promise.withResolvers();
-	const setup = Promise.withResolvers();
+	let markReady, finishSetup;
+	const ready = new Promise((resolve) => {
+		markReady = resolve;
+	});
+	const setup = new Promise((resolve) => {
+		finishSetup = resolve;
+	});
 	let setupSignal;
 	const state = fixture({
 		fetchSetup: ({ signal }) => {
 			setupSignal = signal;
-			ready.resolve();
-			return setup.promise;
+			markReady();
+			return setup;
 		}
 	});
 	const controller = new AbortController();
 	const first = state.send(controller.signal);
 	const rejected = assert.rejects(first, { submission: 'not_sent' });
-	await ready.promise;
+	await ready;
 	const second = state.send();
 	controller.abort();
 	await rejected;
 	assert.equal(setupSignal.aborted, false);
-	setup.resolve(
+	finishSetup(
 		new Response(new Uint8Array([12]), { headers: { 'content-type': SESSION_CONTENT_TYPE } })
 	);
 	assert.deepEqual(await (await second).json(), { ok: true });

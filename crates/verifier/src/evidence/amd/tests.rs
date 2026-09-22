@@ -146,6 +146,44 @@ fn malformed_neighbor_does_not_discard_authentic_revocation() {
     }
 }
 
+#[test]
+fn signed_crl_extensions_and_entries_enforce_the_supported_scope() {
+    let vectors = fixture()["extension_vectors"].clone();
+    let ark = der(&vectors, "ark");
+    let now = vectors["now"].as_i64().unwrap();
+    for case in vectors["cases"].as_array().unwrap() {
+        assert_eq!(
+            authenticate_crl(&ark, &der(case, "der"), now).is_ok(),
+            case["valid"].as_bool().unwrap(),
+            "{}",
+            case["name"]
+        );
+    }
+    let original = der(&vectors["cases"][0], "der");
+    let mut trailing = original.clone();
+    trailing.push(0);
+    assert!(authenticate_crl(&ark, &trailing, now).is_err());
+
+    let mut issuer = Issuer {
+        certificate: ark.clone().into(),
+        latest: None,
+        conflicting: false,
+    };
+    issuer
+        .learn(authenticate_crl(&ark, &original, now).unwrap())
+        .unwrap();
+    // A new randomized signature over the same signed contents is not equivocation.
+    let resigned = der(&vectors, "resigned_same_contents");
+    assert_ne!(original, resigned);
+    issuer
+        .learn(authenticate_crl(&ark, &resigned, now).unwrap())
+        .unwrap();
+    assert!(matches!(
+        issuer.learn(authenticate_crl(&ark, &der(&vectors, "older_higher_number"), now).unwrap()),
+        Err(Error::CrlOrder)
+    ));
+}
+
 #[cfg(feature = "staging")]
 #[test]
 fn incomplete_bundle_cannot_hide_authenticated_negative_appraisal() {

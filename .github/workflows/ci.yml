@@ -244,6 +244,11 @@ jobs:
         run: npm run test:browser
       - name: Verify the Node package entrypoint
         run: npm run test:node
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e
+        with:
+          node-version: 20.20.2
+      - name: Verify the minimum supported Node major
+        run: npm run test:node
 
   sigstore-conformance:
     name: Sigstore conformance and differential verification
