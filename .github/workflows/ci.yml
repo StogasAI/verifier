@@ -381,9 +381,13 @@ jobs:
           python3 examples/check_http_client.py php examples/php-openai/main.php
       - name: Qualify the LuaJIT native bridge and HTTP client
         run: |
-          sudo apt-get install -y --no-install-recommends luajit lua-cjson lua-http
+          sudo apt-get install -y --no-install-recommends luajit libluajit-5.1-dev lua-cjson luarocks
+          sudo luarocks --lua-version=5.1 install Lua-cURL 0.3.13-1 LUA_INCDIR=/usr/include/luajit-2.1 \
+            CURL_INCDIR="$(pkg-config --variable=includedir libcurl)" CURL_LIBDIR="$(pkg-config --variable=libdir libcurl)"
           luajit examples/luajit-http/test_transport.lua "$PWD/target/${{ env.CARGO_BUILD_TARGET }}/debug/libstogas_verifier_ffi.so"
           python3 examples/check_http_client.py --sse-framing luajit examples/luajit-http/main.lua
+          python3 examples/check_http_client.py --unary luajit examples/luajit-http/main.lua --no-stream
+          python3 examples/check_http_client.py --cancel luajit examples/luajit-http/main.lua
       - uses: dart-lang/setup-dart@6afc89df92d6eb3834022f73cd65adc8cdfcb92d
         with:
           sdk: '3.13.4'
