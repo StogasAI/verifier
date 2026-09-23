@@ -143,7 +143,8 @@ jobs:
           python3 examples/check_http_client.py ruby examples/ruby-openai/main.rb
       - name: .NET typed streaming and failures
         run: |
-          dotnet build --locked-mode examples/dotnet-openai/Example.csproj
+          dotnet restore --locked-mode examples/dotnet-openai/Example.csproj
+          dotnet build --no-restore examples/dotnet-openai/Example.csproj
           python3 examples/check_http_client.py dotnet examples/dotnet-openai/bin/Debug/net10.0/Example.dll
 
   swift-http:
