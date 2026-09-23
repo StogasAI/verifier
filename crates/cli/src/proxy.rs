@@ -174,11 +174,54 @@ pub struct EmbeddedEndpoints {
     pub base_url: String,
     pub refresh_path: String,
 }
-pub async fn serve(config: ServeConfig) -> Result<()> {
+pub async fn serve(config: ServeConfig, exit_on_stdin_close: bool) -> Result<()> {
+    let stdin_closed = if exit_on_stdin_close {
+        let (closed, receiver) = oneshot::channel();
+        // Tokio's blocking stdin worker cannot be cancelled and would delay runtime
+        // shutdown. A plain process-owned thread does not keep a stopped CLI alive.
+        std::thread::Builder::new()
+            .name("stogas-parent".into())
+            .spawn(move || {
+                let _ = std::io::copy(&mut std::io::stdin().lock(), &mut std::io::sink());
+                let _ = closed.send(());
+            })?;
+        Some(receiver)
+    } else {
+        None
+    };
+    // Install Unix handlers before advertising readiness. Supervisors send
+    // SIGTERM; interactive users send SIGINT. Both use the same close budget.
+    #[cfg(unix)]
+    let shutdown = {
+        use tokio::signal::unix::{SignalKind, signal};
+        let mut interrupt = signal(SignalKind::interrupt())?;
+        let mut terminate = signal(SignalKind::terminate())?;
+        async move {
+            tokio::select! {
+                _ = interrupt.recv() => {},
+                _ = terminate.recv() => {},
+            }
+        }
+    };
+    #[cfg(not(unix))]
+    let shutdown = async {
+        let _ = tokio::signal::ctrl_c().await;
+    };
     run(
         config,
-        async {
-            let _ = tokio::signal::ctrl_c().await;
+        async move {
+            let parent_closed = async move {
+                match stdin_closed {
+                    Some(receiver) => {
+                        let _ = receiver.await;
+                    }
+                    None => std::future::pending::<()>().await,
+                }
+            };
+            tokio::select! {
+                () = shutdown => {},
+                () = parent_closed => {},
+            }
         },
         None,
     )

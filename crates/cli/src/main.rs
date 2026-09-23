@@ -46,6 +46,7 @@ struct ServeCommandInput {
     max_connections: usize,
     security: SecurityMode,
     browser_origin: Option<String>,
+    exit_on_stdin_close: bool,
 }
 
 fn parse_environment(value: &str) -> Result<stogas::Environment, String> {
@@ -114,6 +115,9 @@ enum Command {
         /// Allow one browser origin to use the capability-protected local endpoint.
         #[arg(long)]
         browser_origin: Option<String>,
+        /// Close when the parent closes stdin; intended for supervised child processes.
+        #[arg(long)]
+        exit_on_stdin_close: bool,
     },
 }
 
@@ -165,6 +169,7 @@ async fn main() -> Result<()> {
             max_connections,
             security,
             browser_origin,
+            exit_on_stdin_close,
         } => {
             run_serve(ServeCommandInput {
                 environment,
@@ -173,6 +178,7 @@ async fn main() -> Result<()> {
                 max_connections,
                 security,
                 browser_origin,
+                exit_on_stdin_close,
             })
             .await?;
         }
@@ -210,6 +216,7 @@ async fn run_serve(input: ServeCommandInput) -> Result<()> {
         },
         listen: input.listen,
         browser_origin: input.browser_origin,
+        exit_on_stdin_close: input.exit_on_stdin_close,
     })
     .await
 }

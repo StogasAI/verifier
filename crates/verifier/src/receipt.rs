@@ -382,7 +382,7 @@ mod http_tests {
     }
     fn metadata(boot: &VerifiedBoot, request: [u8; 32], response: &[u8]) -> Value {
         let response: [u8; 32] = Sha256::digest(response).into();
-        let digest = metadata_digest(&json!({"pricing":{"total_cost_usd":"0.01"}})).unwrap();
+        let digest = metadata_digest(&json!({"billed_cost_usd":"0.01"})).unwrap();
         let message = [SCHEMA.as_bytes(), b"\0", &request, &response, &digest].concat();
         // Public deterministic key used only by the isolated diagnostic fixture.
         let key = SigningKey::from_bytes(&[42; 32]);
@@ -394,7 +394,7 @@ mod http_tests {
             "schema":SCHEMA, "boot_sha256":hex::encode(boot.document_sha256()),
             "request_sha256":hex::encode(request), "response_sha256":hex::encode(response),
             "signature":URL_SAFE_NO_PAD.encode(key.sign(&message).to_bytes())
-        }, "pricing":{"total_cost_usd":"0.01"}})
+        }, "billed_cost_usd":"0.01"})
     }
     #[test]
     fn buffered_metadata_verifies_content_and_metadata_under_the_original_hardware_key() {
@@ -413,9 +413,9 @@ mod http_tests {
         };
         let result = verify_buffered(peer.boot(), &request, &encode(&bag)).unwrap();
         assert_eq!(result.receipt.node_id, peer.boot().hardware().node_id());
-        bag["pricing"]["total_cost_usd"] = json!("0.02");
+        bag["billed_cost_usd"] = json!("0.02");
         assert!(verify_buffered(peer.boot(), &request, &encode(&bag)).is_err());
-        bag["pricing"]["total_cost_usd"] = json!("0.01");
+        bag["billed_cost_usd"] = json!("0.01");
         let changed = String::from_utf8(encode(&bag))
             .unwrap()
             .replace("output_tokens\":2", "output_tokens\":3");

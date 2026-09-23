@@ -1,0 +1,9 @@
+<project xmlns="http://maven.apache.org/POM/4.0.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+  <modelVersion>4.0.0</modelVersion>
+  <groupId>example</groupId><artifactId>stogas-clojure-openai</artifactId><version>1.0.0</version>
+  <dependencies>
+    <dependency><groupId>org.clojure</groupId><artifactId>clojure</artifactId><version>1.12.6</version></dependency>
+    <dependency><groupId>ai.stogas</groupId><artifactId>verifier</artifactId><version>0.1.0-alpha.1</version></dependency>
+    <dependency><groupId>com.openai</groupId><artifactId>openai-java</artifactId><version>4.68.0</version></dependency>
+  </dependencies>
+</project>

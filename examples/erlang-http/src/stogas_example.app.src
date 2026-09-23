@@ -1,0 +1,6 @@
+{application, stogas_example, [
+    {description, "OpenAI-compatible HTTP through the Stogas verifier"},
+    {vsn, "0.1.0"},
+    {applications, [kernel, stdlib, gun]},
+    {modules, []}
+]}.

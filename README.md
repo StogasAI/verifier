@@ -47,6 +47,7 @@ Pass the complete printed URL, including its random capability, to your client. 
 loopback-only and accepts Chat Completions and Responses. `--security e2ee` selects application
 encryption. `--browser-origin https://app.example.com` permits one browser origin without changing
 the selected transport. Use `serve --help` for all options.
+Stop it with Ctrl+C, or SIGTERM on Unix, for bounded graceful cleanup.
 
 `stogas-verify verify bundle.json --json` verifies a downloaded current bundle without network
 access and reports its approved releases and catalogs. `--environment` selects compiled trust.
@@ -108,6 +109,10 @@ The Go binding's matching `stogas_offline` build tag omits `Transport`; normal S
 | `@stogas/verifier`                | JavaScript and WebAssembly SDK                                  |
 | `stogas-verifier` on PyPI         | Python 3.10+ SDK through a native PyO3 extension                |
 | `github.com/StogasAI/verifier/go` | Go SDK through the packaged native library                      |
+| [Java](bindings/java/)           | Native transport for Java 17+, Kotlin, Scala and Clojure        |
+| [.NET](bindings/dotnet/)         | Native transport for C# and F#                                  |
+| [Ruby](bindings/ruby/)           | Native transport with explicit and block-based cleanup         |
+| [Swift](bindings/swift/)         | Native transport for macOS and Linux                            |
 | `stogas_verifier.h`               | Complete bounded C ABI for native integrations                  |
 | `stogas-offline-sigstore`         | Generic Rust verifier for the supported GitHub/Sigstore profile |
 | `@stogas/offline-sigstore`        | JavaScript/WebAssembly build of the Sigstore verifier           |
@@ -120,7 +125,13 @@ in that client; the Rust SDK does not bundle or re-export `async-openai`. The
 and cleanup. Their tests also check that client retries and truncated streams do not hide
 an incomplete request. See the [language guides](https://stogas.ai/docs/sdk-overview).
 
-Java 22+ and other JVM languages can use the Foreign Function & Memory API, .NET can use P/Invoke, Swift and Objective-C have native C interoperability, and Kotlin/Native can use `cinterop`. These are self-managed C ABI integrations rather than separate Stogas SDK implementations. See the [C and C++ guide](https://stogas.ai/docs/c-cpp) for the ABI and memory-ownership contract.
+Supervised CLI children can pass `--exit-on-stdin-close` and keep stdin piped.
+Closing that pipe, including after the parent exits, requests graceful cleanup.
+Without the option, closing stdin does not stop the CLI.
+
+Other runtimes can use the C ABI or the CLI's local URL. The language guides include complete
+native bridges or supervised CLI examples. See the [C and C++ guide](https://stogas.ai/docs/c-cpp)
+for the ABI and memory-ownership contract.
 
 ## Sigstore support
 

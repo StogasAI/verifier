@@ -55,6 +55,8 @@ pub struct ServeOptions {
     pub listen: String,
     /// One optional browser origin allowed to use the capability-protected local endpoint.
     pub browser_origin: Option<String>,
+    /// Close when a supervising parent's stdin pipe closes.
+    pub exit_on_stdin_close: bool,
 }
 
 impl Default for TransportOptions {
@@ -321,11 +323,14 @@ impl Drop for Transport {
 /// Returns an error when configuration, initial evidence verification, listener binding, or the
 /// transport runtime fails.
 pub async fn serve(options: ServeOptions) -> Result<()> {
-    proxy::serve(proxy::ServeConfig::new(
-        &options.transport,
-        &options.listen,
-        options.browser_origin.as_deref(),
-    )?)
+    proxy::serve(
+        proxy::ServeConfig::new(
+            &options.transport,
+            &options.listen,
+            options.browser_origin.as_deref(),
+        )?,
+        options.exit_on_stdin_close,
+    )
     .await
 }
 

@@ -5,14 +5,11 @@
     "boot_sha256": "913b7d74a427e39b23017790c299e6f8165bbe1aed5287255f19dfd3fa11c366",
     "request_sha256": "3219e1b8e8a3a6329a3ed247a2e2a5cf74efa8843e59901c2fd138deac9f2bd2",
     "response_sha256": "21eae1c895638d0c3b0632c2e19c411aa2500d382043da580e3d59b82b1cbc62",
-    "signature": "8hdNZZRwoI5YnjwzZ7iPVImmS5HEkrM-nSHzl3jxwSZeBmY0el19K29F9IIlYi3pdl5GRWlgDwmd28Bh876dDg"
+    "signature": "k4HkMYchcc2ZeDnOejx-H7-IqSGQ2OgRaarRXLTaMezg-Sz20VIgtiUk671wWj6sqWwzy9hFdNqcD79HgFCVBQ"
   },
   "request": "{\"messages\":[{\"role\":\"user\",\"content\":\"fixture\"}]}",
   "response": "{\"choices\":[{\"message\":{\"role\":\"assistant\",\"content\":\"reply\"}}]}",
   "metadata": {
-    "pricing": {
-      "total_cost_usd": "0.01"
-    },
     "provider": {
       "instance": "chutes-fixture",
       "detail": {
@@ -20,13 +17,34 @@
         "score": 1.5,
         "label": "<🌍>"
       }
-    }
+    },
+    "meters": {
+      "input_tokens": {
+        "quantity": "1000",
+        "rateKey": "per_mill_tokens",
+        "rateUsd": "10",
+        "usd": "0.01"
+      },
+      "cached_input_tokens": {
+        "quantity": "200",
+        "rateKey": "per_mill_tokens",
+        "rateUsd": "0",
+        "usd": "0"
+      },
+      "total_tokens": {
+        "quantity": "1200"
+      }
+    },
+    "upstream_cost_usd": "0.01",
+    "billed_cost_usd": "0.01",
+    "cache_read_savings_usd": "0.002",
+    "cache_write_overhead_usd": null
   },
   "hardware_receipt": {
     "schema": "stogas.receipt.v1",
     "boot_sha256": "b15007fb3787b8437954fb38e587dab564baa047e21675cc695990c992ed289e",
     "request_sha256": "3219e1b8e8a3a6329a3ed247a2e2a5cf74efa8843e59901c2fd138deac9f2bd2",
     "response_sha256": "21eae1c895638d0c3b0632c2e19c411aa2500d382043da580e3d59b82b1cbc62",
-    "signature": "WbMqsYuQJZIBh5AUEI6skua_pCddEjcw1GjUcLo-6nthlSOI5BijAfxJLhGfx4wS1uuTCVCSrmXNr7tdZwAWAg"
+    "signature": "GD3fOTQLgdMvyu_9Y_05x-O-pJ6SHOZsMqk__hIxq9ao-03olYkE76J7zseUzUZF_M01tpXE8JIp5BhC7-oGBg"
   }
 }

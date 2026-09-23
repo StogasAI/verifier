@@ -1,5 +1,6 @@
 /target
 /examples/*/target
+/examples/*/vendor
 /pkg
 /packages/offline-sigstore/pkg
 /fuzz/artifacts
@@ -24,6 +25,10 @@ __pycache__/
 /examples/*/bin
 /examples/*/obj
 /examples/*/.build
+/examples/*/.dart_tool
+/examples/*/_build
+/examples/*/deps
+/examples/*/dist-newstyle
 
 /bindings/dotnet/**/bin
 /bindings/dotnet/**/obj

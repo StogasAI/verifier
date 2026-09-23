@@ -16,7 +16,8 @@ public final class Main {
                 .followRedirects(false)
                 .proxy(Proxy.NO_PROXY)
                 .timeout(Duration.ofMinutes(45))
-                .build();
+                .build()
+                .withOptions(options -> options.httpClient(new SingleUseHttpClient(options.build().httpClient())));
     }
 
     public static void main(String[] args) {

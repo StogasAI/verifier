@@ -209,11 +209,28 @@ jobs:
           gem install openai:0.94.0 webrick:1.9.2 minitest:5.20.0 --no-document
           ruby examples/ruby-openai/test_client.rb
           python3 examples/check_http_client.py ruby examples/ruby-openai/main.rb
+      - name: Kotlin typed requests and streaming failures
+        run: |
+          mvn -q -f examples/kotlin-openai/pom.xml package dependency:build-classpath -Dmdep.outputFile=target/classpath
+          python3 examples/check_http_client.py java -cp "examples/kotlin-openai/target/classes:$(cat examples/kotlin-openai/target/classpath)" example.MainKt
+      - name: Clojure typed requests and streaming failures
+        run: |
+          mvn -q -f examples/clojure-openai/pom.xml dependency:build-classpath -Dmdep.outputFile=target/classpath
+          python3 examples/check_http_client.py java -cp "examples/clojure-openai/src:$(cat examples/clojure-openai/target/classpath)" clojure.main -m example
+      - name: Scala typed requests and streaming failures
+        run: |
+          mvn -q -f examples/scala-openai/pom.xml package dependency:build-classpath -Dmdep.outputFile=target/classpath
+          python3 examples/check_http_client.py java -cp "examples/scala-openai/target/classes:$(cat examples/scala-openai/target/classpath)" example.Main
       - name: .NET typed streaming and failures
         run: |
           dotnet restore --locked-mode examples/dotnet-openai/Example.csproj
           dotnet build --no-restore examples/dotnet-openai/Example.csproj
           python3 examples/check_http_client.py dotnet examples/dotnet-openai/bin/Debug/net10.0/Example.dll
+      - name: F# typed streaming and failures
+        run: |
+          dotnet restore --locked-mode examples/fsharp-openai/Example.fsproj
+          dotnet build --no-restore examples/fsharp-openai/Example.fsproj
+          python3 examples/check_http_client.py dotnet examples/fsharp-openai/bin/Debug/net10.0/Example.dll
 
   swift-http:
     name: Swift standard HTTP client
@@ -234,6 +251,22 @@ jobs:
           python3 scripts/stage-native-bindings.py --platform darwin-arm64 --native-dir target/debug
           swift build --package-path examples/swift-http
           python3 examples/check_http_client.py examples/swift-http/.build/debug/StogasHTTPExample
+      - name: Qualify Objective-C native ownership and HTTP
+        run: |
+          brew install json-c
+          cargo build --locked --package stogas-verifier-ffi --features staging
+          export DYLD_LIBRARY_PATH="$PWD/target/debug"
+          clang -fobjc-arc -Wall -Wextra -Werror -framework Foundation -Iinclude \
+            examples/objective-c-http/Transport.m examples/objective-c-http/test_native.m \
+            -Ltarget/debug -Wl,-rpath,"$PWD/target/debug" -lstogas_verifier_ffi -o /tmp/stogas-objective-c-native
+          /tmp/stogas-objective-c-native
+          clang -fobjc-arc -Wall -Wextra -Werror -framework Foundation -Iinclude \
+            examples/objective-c-http/Transport.m examples/objective-c-http/main.m \
+            -Ltarget/debug -Wl,-rpath,"$PWD/target/debug" -lstogas_verifier_ffi $(pkg-config --cflags --libs libcurl json-c) \
+            -o /tmp/stogas-objective-c-example
+          python3 examples/check_http_client.py --sse-framing /tmp/stogas-objective-c-example
+          python3 examples/check_http_client.py --unary /tmp/stogas-objective-c-example --no-stream
+          python3 examples/check_http_client.py --cancel /tmp/stogas-objective-c-example
 
   go:
     name: Go binding and C ABI (${{ matrix.os }})
@@ -285,13 +318,14 @@ jobs:
         env:
           CGO_ENABLED: '1'
         run: go test ./...
-      - name: Compile the C HTTP example against the public ABI
+      - name: Qualify the C HTTP example against the public ABI
         if: matrix.os == 'ubuntu-24.04'
         run: |
           sudo apt-get install -y --no-install-recommends libcurl4-openssl-dev libjson-c-dev
           cc -std=c11 -Wall -Wextra -Werror -Iinclude examples/c-http/main.c \
             "target/${{ matrix.target }}/debug/libstogas_verifier_ffi.a" \
             $(pkg-config --cflags --libs libcurl json-c) -ldl -lpthread -lm -o /tmp/stogas-request
+          python3 examples/check_http_client.py --sse-framing /tmp/stogas-request --stream
       - name: Qualify the Go OpenAI client example
         working-directory: examples/go-openai
         env:
@@ -322,6 +356,113 @@ jobs:
         env:
           CGO_ENABLED: '1'
         run: go test -tags staging,stogas_offline,netgo,osusergo -ldflags='-linkmode=external -extldflags "-static -Wl,--gc-sections,--build-id=none"' ./...
+
+  additional-languages:
+    name: Native examples and supervised clients
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      CARGO_BUILD_TARGET: x86_64-unknown-linux-gnu
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c
+        with:
+          toolchain: 1.97.1
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32
+      - run: cargo build --locked --package stogas-verifier-ffi --package stogas --features staging
+      - run: sudo apt-get install -y --no-install-recommends libcurl4-openssl-dev
+      - name: Qualify the PHP native bridge and OpenAI client
+        run: |
+          sudo apt-get install -y --no-install-recommends php-cli php-curl php-xml php-mbstring composer
+          composer install --no-interaction --no-plugins --no-scripts --working-dir=examples/php-openai
+          php -d ffi.enable=true examples/php-openai/test_transport.php "$PWD/target/${{ env.CARGO_BUILD_TARGET }}/debug/libstogas_verifier_ffi.so"
+          python3 examples/check_http_client.py php examples/php-openai/main.php
+      - name: Qualify the LuaJIT native bridge and HTTP client
+        run: |
+          sudo apt-get install -y --no-install-recommends luajit lua-cjson lua-http
+          luajit examples/luajit-http/test_transport.lua "$PWD/target/${{ env.CARGO_BUILD_TARGET }}/debug/libstogas_verifier_ffi.so"
+          python3 examples/check_http_client.py --sse-framing luajit examples/luajit-http/main.lua
+      - uses: dart-lang/setup-dart@6afc89df92d6eb3834022f73cd65adc8cdfcb92d
+        with:
+          sdk: '3.13.4'
+      - name: Qualify the Dart native bridge and OpenAI client
+        run: |
+          (cd examples/dart-openai && dart pub get --enforce-lockfile && dart analyze)
+          dart run examples/dart-openai/test_transport.dart "$PWD/target/${{ env.CARGO_BUILD_TARGET }}/debug/libstogas_verifier_ffi.so"
+          python3 examples/check_http_client.py dart run examples/dart-openai/main.dart
+          python3 examples/check_http_client.py --unary dart run examples/dart-openai/main.dart --no-stream
+          python3 examples/check_http_client.py --cancel dart run examples/dart-openai/main.dart
+      - uses: julia-actions/setup-julia@4c0cb0fce8556fdb04a90347310e5db8b1f98fb9
+        with:
+          version: '1.13.0'
+      - name: Qualify the Julia native bridge and OpenAI/HTTP clients
+        run: |
+          julia --project=examples/julia-openai -e 'using Pkg; Pkg.instantiate()'
+          julia --project=examples/julia-openai examples/julia-openai/test_transport.jl "$PWD/target/${{ env.CARGO_BUILD_TARGET }}/debug/libstogas_verifier_ffi.so"
+          python3 examples/check_http_client.py --sse-framing julia --project=examples/julia-openai examples/julia-openai/main.jl
+          python3 examples/check_http_client.py --unary julia --project=examples/julia-openai examples/julia-openai/main.jl --no-stream
+          python3 examples/check_http_client.py --cancel julia --project=examples/julia-openai examples/julia-openai/main.jl
+      - uses: erlef/setup-beam@54075bcc5e249e4758d363f27d099f55d843f124
+        with:
+          otp-version: '27.3.4.6'
+          elixir-version: '1.18.3'
+          rebar3-version: '3.26.0'
+      - name: Qualify the Elixir OpenAI client and supervised verifier
+        run: |
+          cd examples/elixir-openai
+          mix deps.get --check-locked
+          mix compile --warnings-as-errors
+          mix run test_transport.exs "$GITHUB_WORKSPACE/target/${{ env.CARGO_BUILD_TARGET }}/debug/stogas-verify"
+          mix run test_client.exs
+          python3 ../check_http_client.py mix run main.exs
+          python3 ../check_http_client.py --unary mix run main.exs --no-stream
+      - name: Qualify the Erlang HTTP client and supervised verifier
+        working-directory: examples/erlang-http
+        run: |
+          rebar3 escriptize
+          STOGAS_VERIFY_BIN="$GITHUB_WORKSPACE/target/${{ env.CARGO_BUILD_TARGET }}/debug/stogas-verify" rebar3 eunit
+          python3 ../check_http_client.py --sse-framing _build/default/bin/stogas-example
+          python3 ../check_http_client.py --unary _build/default/bin/stogas-example --no-stream
+      - uses: haskell-actions/setup@7fd2bb5ca789761088fbc831406b2910e47e56f1
+        with:
+          ghc-version: '9.10.3'
+          cabal-version: '3.12.1.0'
+      - name: Qualify the Haskell native bridge and HTTP client
+        working-directory: examples/haskell-http
+        run: |
+          export LD_LIBRARY_PATH="$GITHUB_WORKSPACE/target/${{ env.CARGO_BUILD_TARGET }}/debug"
+          cabal update
+          cabal build all --enable-tests --extra-lib-dirs="$LD_LIBRARY_PATH"
+          cabal test --enable-tests --extra-lib-dirs="$LD_LIBRARY_PATH"
+          stogas_example_binary=$(cabal list-bin exe:stogas-example)
+          python3 ../check_http_client.py --sse-framing "$stogas_example_binary"
+          python3 ../check_http_client.py --unary "$stogas_example_binary" --no-stream
+          python3 ../check_http_client.py --cancel "$stogas_example_binary"
+      - uses: ocaml/setup-ocaml@93303b622b2522e4411e295f9e77411a24912ac7
+        with:
+          ocaml-compiler: '5.4.0'
+      - name: Qualify the OCaml native bridge and HTTP client
+        working-directory: examples/ocaml-http
+        run: |
+          opam install . --deps-only --yes
+          opam exec -- dune build
+          opam exec -- _build/default/test_native.exe "$GITHUB_WORKSPACE/target/${{ env.CARGO_BUILD_TARGET }}/debug/libstogas_verifier_ffi.so"
+          opam exec -- python3 ../check_http_client.py --sse-framing _build/default/main.exe
+          opam exec -- python3 ../check_http_client.py --unary _build/default/main.exe --no-stream
+          opam exec -- python3 ../check_http_client.py --cancel _build/default/main.exe
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29
+        with:
+          version: '0.16.0'
+      - name: Qualify the Zig native bridge and HTTP client
+        run: |
+          export LD_LIBRARY_PATH="$PWD/target/${{ env.CARGO_BUILD_TARGET }}/debug"
+          zig test examples/zig-http/test_native.zig -Iinclude -L"$LD_LIBRARY_PATH" -lstogas_verifier_ffi -lcurl -lc
+          zig build-exe examples/zig-http/main.zig -Iinclude -L"$LD_LIBRARY_PATH" -lstogas_verifier_ffi -lcurl -lc -femit-bin=/tmp/stogas-zig-example
+          python3 examples/check_http_client.py --sse-framing /tmp/stogas-zig-example
+          python3 examples/check_http_client.py --unary /tmp/stogas-zig-example --no-stream
+          python3 examples/check_http_client.py --cancel /tmp/stogas-zig-example
 
   wasm-compile:
     name: Browser WASM and network-disabled E2E

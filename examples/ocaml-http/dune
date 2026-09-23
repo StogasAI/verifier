@@ -1,0 +1,14 @@
+(library
+ (name transport)
+ (modules transport)
+ (libraries ctypes ctypes.foreign yojson))
+
+(executable
+ (name main)
+ (modules main)
+ (libraries transport curl yojson uri))
+
+(executable
+ (name test_native)
+ (modules test_native)
+ (libraries transport unix uri))

@@ -14,6 +14,92 @@ static int progress(void *context, curl_off_t download, curl_off_t downloaded,
     return cancelled != 0;
 }
 
+// Bound one JSON response or SSE event, not the duration or total size of a stream.
+#define MAX_EVENT_BYTES (8 * 1024 * 1024)
+struct Response {
+    char *pending;
+    size_t length;
+    int streaming;
+    int completed;
+    int after_cr;
+};
+
+static int inspect_json(const char *data, struct Response *response) {
+    struct json_tokener *parser = json_tokener_new();
+    if (!parser) return 0;
+    json_tokener_set_flags(parser, JSON_TOKENER_STRICT | JSON_TOKENER_VALIDATE_UTF8);
+    struct json_object *json = json_tokener_parse_ex(parser, data, (int)strlen(data) + 1);
+    enum json_tokener_error parsed = json_tokener_get_error(parser);
+    json_tokener_free(parser);
+    struct json_object *error = NULL, *type = NULL, *status = NULL;
+    if (parsed != json_tokener_success || !json || !json_object_is_type(json, json_type_object)) {
+        if (json) json_object_put(json);
+        return 0;
+    }
+    json_object_object_get_ex(json, "type", &type);
+    json_object_object_get_ex(json, "status", &status);
+    const char *kind = type ? json_object_get_string(type) : "";
+    const char *state = status ? json_object_get_string(status) : "";
+    int valid = !(json_object_object_get_ex(json, "error", &error) && error) &&
+        strcmp(kind, "error") != 0 && strcmp(kind, "response.failed") != 0 &&
+        strcmp(kind, "response.incomplete") != 0 && strcmp(state, "failed") != 0;
+    if (valid && strcmp(kind, "response.completed") == 0) response->completed = 1;
+    json_object_put(json);
+    return valid;
+}
+
+static int inspect_event(struct Response *response) {
+    // Compact data lines in place. SSE joins multiple data fields with newlines.
+    size_t used = 0;
+    for (char *line = response->pending; *line;) {
+        char *end = strchr(line, '\n');
+        if (!end) break;
+        *end = '\0';
+        size_t length = strlen(line);
+        if (length && line[length - 1] == '\r') line[--length] = '\0';
+        if (strncmp(line, "data:", 5) == 0) {
+            char *data = line + 5;
+            if (*data == ' ') data++;
+            size_t count = strlen(data);
+            memmove(response->pending + used, data, count);
+            used += count;
+            response->pending[used++] = '\n';
+        }
+        line = end + 1;
+    }
+    if (!used) return 1; // Comments and event names carry no application data.
+    response->pending[used - 1] = '\0';
+    if (strcmp(response->pending, "[DONE]") == 0) {
+        response->completed = 1;
+        return 1;
+    }
+    return inspect_json(response->pending, response);
+}
+
+static size_t receive(char *data, size_t size, size_t count, void *context) {
+    struct Response *response = context;
+    if (size && count > SIZE_MAX / size) return 0;
+    size_t bytes = size * count;
+    for (size_t i = 0; i < bytes; i++) {
+        if (cancelled || data[i] == '\0' || response->length == MAX_EVENT_BYTES) return 0;
+        char byte = data[i];
+        if (response->streaming) {
+            int skip = response->after_cr && byte == '\n';
+            response->after_cr = byte == '\r';
+            if (skip) continue;
+            if (byte == '\r') byte = '\n';
+        }
+        response->pending[response->length++] = byte;
+        response->pending[response->length] = '\0';
+        size_t n = response->length;
+        if (response->streaming && byte == '\n' && n >= 2 && response->pending[n - 2] == '\n') {
+            if (!inspect_event(response)) return 0;
+            response->length = 0;
+        }
+    }
+    return fwrite(data, 1, bytes, stdout);
+}
+
 int main(int argc, char **argv) {
     const char *key = getenv("STOGAS_API_KEY"), *model = getenv("STOGAS_MODEL");
     if (!key || !*key || !model || !*model || strpbrk(key, "\r\n")) {
@@ -34,19 +120,26 @@ int main(int argc, char **argv) {
     struct curl_slist *headers = NULL;
     struct json_object *started = NULL, *body = NULL, *ok = NULL, *value = NULL, *base = NULL;
     char *url = NULL;
-    const char *configuration = "{}";
-    char *raw = stogas_transport_start((const uint8_t *)configuration, strlen(configuration), &transport);
-    if (raw) started = json_tokener_parse(raw);
-    stogas_verifier_string_free(raw);
-    if (!transport || !started || !json_object_object_get_ex(started, "ok", &ok) ||
-        !json_object_get_boolean(ok) || !json_object_object_get_ex(started, "value", &value) ||
-        !json_object_object_get_ex(value, "base_url", &base) ||
-        !json_object_is_type(base, json_type_string)) {
-        fputs("Unable to establish verified transport; request not sent.\n", stderr);
-        goto cleanup;
+    struct Response response = { .pending = malloc(MAX_EVENT_BYTES + 1), .streaming = streaming };
+    if (!response.pending) goto cleanup;
+    response.pending[0] = '\0';
+    // An explicit URL may point to a separately managed verifier CLI.
+    const char *base_url = getenv("STOGAS_BASE_URL");
+    if (!base_url) {
+        const char *configuration = "{}";
+        char *raw = stogas_transport_start((const uint8_t *)configuration, strlen(configuration), &transport);
+        if (raw) started = json_tokener_parse(raw);
+        stogas_verifier_string_free(raw);
+        if (!transport || !started || !json_object_object_get_ex(started, "ok", &ok) ||
+            !json_object_get_boolean(ok) || !json_object_object_get_ex(started, "value", &value) ||
+            !json_object_object_get_ex(value, "base_url", &base) ||
+            !json_object_is_type(base, json_type_string)) {
+            fputs("Unable to establish verified transport; request not sent.\n", stderr);
+            goto cleanup;
+        }
+        base_url = json_object_get_string(base);
     }
 
-    const char *base_url = json_object_get_string(base);
     const char *path = "/responses";
     size_t length = strlen(base_url) + strlen(path) + 1;
     url = malloc(length);
@@ -73,11 +166,14 @@ int main(int argc, char **argv) {
     curl_easy_setopt(http, CURLOPT_NOSIGNAL, 1L);
     curl_easy_setopt(http, CURLOPT_NOPROGRESS, 0L);
     curl_easy_setopt(http, CURLOPT_XFERINFOFUNCTION, progress);
-    // The default output callback writes buffered JSON or incremental SSE to stdout.
+    curl_easy_setopt(http, CURLOPT_WRITEFUNCTION, receive);
+    curl_easy_setopt(http, CURLOPT_WRITEDATA, &response);
+    // Read through EOF even after the application terminal event.
     CURLcode outcome = curl_easy_perform(http);
     long status = 0;
     curl_easy_getinfo(http, CURLINFO_RESPONSE_CODE, &status);
-    if (outcome == CURLE_OK && status >= 200 && status < 300 && !cancelled) {
+    if (outcome == CURLE_OK && status >= 200 && status < 300 && !cancelled &&
+        (streaming ? response.completed && response.length == 0 : inspect_json(response.pending, &response))) {
         result = 0;
     } else {
         fprintf(stderr, "Request incomplete or rejected (HTTP %ld, curl %d). Do not replay automatically.\n",
@@ -90,6 +186,7 @@ cleanup:
     if (body) json_object_put(body);
     if (started) json_object_put(started);
     free(url);
+    free(response.pending);
     stogas_transport_close(transport);
     stogas_transport_free(transport);
     curl_global_cleanup();
