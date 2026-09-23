@@ -16,16 +16,23 @@ defmodule StogasTransportTest do
 
       {:ok, socket} ->
         :gen_tcp.close(socket)
+        await_closed(port, deadline)
 
-        if System.monotonic_time(:millisecond) >= deadline do
-          false
-        else
-          Process.sleep(20)
-          closed?(port, deadline)
-        end
+      {:error, reason} when reason in [:econnreset, :timeout] ->
+        # Closing the listener can reset a connect already in progress.
+        await_closed(port, deadline)
 
       _ ->
         false
+    end
+  end
+
+  defp await_closed(port, deadline) do
+    if System.monotonic_time(:millisecond) >= deadline do
+      false
+    else
+      Process.sleep(20)
+      closed?(port, deadline)
     end
   end
 
@@ -44,7 +51,8 @@ defmodule StogasTransportTest do
         Process.exit(transport, :kill)
       end
 
-      assert closed?(url.port, System.monotonic_time(:millisecond) + 7000)
+      assert closed?(url.port, System.monotonic_time(:millisecond) + 7000),
+             "verifier listener survived #{stop}"
     end
   end
 

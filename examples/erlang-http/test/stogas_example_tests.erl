@@ -23,11 +23,17 @@ closed(Port, Deadline) ->
         {error, econnrefused} -> true;
         {ok, Socket} ->
             gen_tcp:close(Socket),
-            case erlang:monotonic_time(millisecond) < Deadline of
-                true -> timer:sleep(20), closed(Port, Deadline);
-                false -> false
-            end;
+            await_closed(Port, Deadline);
+        {error, Reason} when Reason =:= econnreset; Reason =:= timeout ->
+            % Closing the listener can reset a connect already in progress.
+            await_closed(Port, Deadline);
         _ -> false
+    end.
+
+await_closed(Port, Deadline) ->
+    case erlang:monotonic_time(millisecond) < Deadline of
+        true -> timer:sleep(20), closed(Port, Deadline);
+        false -> false
     end.
 
 quiet_request_cancellation_test() ->
