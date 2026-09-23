@@ -1,5 +1,6 @@
 package example;
 
+import ai.stogas.verifier.Transport;
 import com.openai.client.OpenAIClient;
 import com.openai.client.okhttp.OpenAIOkHttpClient;
 import com.openai.models.chat.completions.ChatCompletionCreateParams;
@@ -19,17 +20,20 @@ public final class Main {
     }
 
     public static void main(String[] args) {
-        // Start `stogas-verify serve` and use its complete printed capability URL.
-        var client = client(System.getenv("STOGAS_BASE_URL"), System.getenv("STOGAS_API_KEY"));
-        try {
-            var request = ChatCompletionCreateParams.builder()
+        // An explicit URL can also use a separately managed verifier CLI.
+        String external = System.getenv("STOGAS_BASE_URL");
+        try (var transport = external == null ? new Transport() : null) {
+            var client = client(external == null ? transport.baseUrl().toString() : external, System.getenv("STOGAS_API_KEY"));
+            try {
+                var request = ChatCompletionCreateParams.builder()
                     .model(System.getenv("STOGAS_MODEL"))
                     .addUserMessage("Say hello in one sentence.")
                     .build();
-            try (var response = client.chat().completions().createStreaming(request)) {
-                response.stream().forEach(chunk -> chunk.choices().forEach(choice ->
-                        choice.delta().content().ifPresent(System.out::print)));
-            }
-        } finally { client.close(); }
+                try (var response = client.chat().completions().createStreaming(request)) {
+                    response.stream().forEach(chunk -> chunk.choices().forEach(choice ->
+                            choice.delta().content().ifPresent(System.out::print)));
+                }
+            } finally { client.close(); }
+        }
     }
 }

@@ -9,6 +9,7 @@ typedef struct StogasTransport StogasTransport;
 char *stogas_transport_start(const uint8_t *configuration, size_t configuration_len, StogasTransport **transport_out);
 char *stogas_transport_refresh(const StogasTransport *transport);
 void stogas_transport_free(StogasTransport *transport);
+void stogas_transport_close(const StogasTransport *transport);
 */
 import "C"
 
@@ -100,6 +101,7 @@ func (transport *Transport) Close() error {
 	transport.mu.Lock()
 	defer transport.mu.Unlock()
 	if transport.handle != nil {
+		C.stogas_transport_close(transport.handle)
 		C.stogas_transport_free(transport.handle)
 		transport.handle = nil
 		transport.baseURL = ""

@@ -30,10 +30,7 @@ jobs:
           set -euo pipefail
           version="${GITHUB_REF_NAME#v}"
           [[ "$GITHUB_REF_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]]
-          test "$(node -p "require('./package.json').version")" = "$version"
-          test "$(node -p "require('./packages/offline-sigstore/package.json').version")" = "$version"
-          test "$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n1)" = "$version"
-          test "$(sed -n 's/^version = "\([^"]*\)"/\1/p' bindings/python/Cargo.toml | head -n1)" = ""
+          python3 scripts/check-package-versions.py "$version"
           printf 'version=%s\n' "$version" >> "$GITHUB_OUTPUT"
 
   native:
@@ -90,6 +87,18 @@ jobs:
           else
             "$target/stogas-verify" --help
           fi
+      - uses: ruby/setup-ruby@e8944e80fb94b20106697132f8c20c665fab29e9
+        with:
+          ruby-version: '3.3'
+      - name: Build and test the platform Ruby gem
+        shell: bash
+        run: |
+          python scripts/stage-native-bindings.py --platform ${{ matrix.platform }} --native-dir target/${{ matrix.target }}/release
+          mkdir -p dist
+          gem -C bindings/ruby build stogas-verifier.gemspec --output "$PWD/dist/stogas-verifier-${GITHUB_REF_NAME}-${{ matrix.platform }}.gem"
+          gem install "dist/stogas-verifier-${GITHUB_REF_NAME}-${{ matrix.platform }}.gem" --no-document
+          gem install minitest:5.20.0 --no-document
+          ruby bindings/ruby/test/transport_test.rb
       - name: Assemble native package
         shell: bash
         run: |
@@ -111,7 +120,9 @@ jobs:
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
           name: native-${{ matrix.platform }}
-          path: dist/stogas-verifier-${{ github.ref_name }}-${{ matrix.platform }}.${{ matrix.archive }}
+          path: |
+            dist/stogas-verifier-${{ github.ref_name }}-${{ matrix.platform }}.${{ matrix.archive }}
+            dist/stogas-verifier-${{ github.ref_name }}-${{ matrix.platform }}.gem
           if-no-files-found: error
           retention-days: 7
 
@@ -453,6 +464,23 @@ jobs:
         with:
           name: rust-crates
           path: dist
+      - uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: actions/setup-dotnet@26b0ec14cb23fa6904739307f278c14f94c95bf1
+        with:
+          dotnet-version: '10.0.x'
+      - name: Assemble Java, NuGet and Swift packages from verified native artifacts
+        run: |
+          python3 scripts/stage-release-bindings.py --artifacts dist
+          mvn -q -f bindings/java/pom.xml package
+          cp bindings/java/target/verifier-${{ needs.metadata.outputs.version }}.jar dist/
+          cp bindings/java/pom.xml dist/verifier-${{ needs.metadata.outputs.version }}.pom
+          dotnet pack bindings/dotnet/Stogas.Verifier -o dist
+          dotnet restore bindings/dotnet/tests/Consumer.csproj --source "$PWD/dist" --source https://api.nuget.org/v3/index.json
+          dotnet run --no-restore --project bindings/dotnet/tests/Consumer.csproj
+          tar -C bindings/swift -czf "dist/stogas-verifier-swift-${GITHUB_REF_NAME}.tar.gz" Package.swift Sources README.md CStogas.artifactbundle
       - name: Create and verify reproducible checksum manifest
         shell: bash
         run: |

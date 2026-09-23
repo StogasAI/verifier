@@ -30,9 +30,7 @@ jobs:
           tag="$RELEASE_TAG"
           [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]]
           version="${tag#v}"
-          test "$(node -p "require('./package.json').version")" = "$version"
-          test "$(node -p "require('./packages/offline-sigstore/package.json').version")" = "$version"
-          test "$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n1)" = "$version"
+          python3 scripts/check-package-versions.py "$version"
           test "$(git rev-list -n1 "$tag")" = "$(git rev-parse HEAD)"
           printf 'version=%s\n' "$version" >> "$GITHUB_OUTPUT"
 

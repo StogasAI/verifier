@@ -14,7 +14,7 @@ command = sys.argv[1:]
 if not command:
     raise SystemExit("usage: python check_http_client.py COMMAND [ARGS...]")
 
-for scenario in ("success", "quota", "unavailable", "truncated", "truncated_chunk"):
+for scenario in ("success", "quota", "unavailable", "disconnected", "stream_error", "truncated", "truncated_chunk"):
     calls = []
 
     class Handler(BaseHTTPRequestHandler):
@@ -26,6 +26,10 @@ for scenario in ("success", "quota", "unavailable", "truncated", "truncated_chun
         def do_POST(self):
             body = self.rfile.read(int(self.headers["Content-Length"]))
             calls.append((self.path, self.headers["Authorization"], json.loads(body)))
+            if scenario == "disconnected":
+                # The application request arrived, but no response bytes did. Do not replay it.
+                self.close_connection = True
+                return
             chunk = json.dumps({"id": "example", "object": "chat.completion.chunk", "created": 1,
                                 "model": "example", "choices": [{"index": 0, "delta": {"content": "Hello"}, "finish_reason": None}]})
             prefix = f": STOGAS PROCESSING\n\ndata: {chunk}\n\n".encode()
@@ -35,7 +39,10 @@ for scenario in ("success", "quota", "unavailable", "truncated", "truncated_chun
                 self.send_header("Content-Type", "application/json")
             else:
                 self.send_response(200)
-                data = prefix + (b"data: [DONE]\n\n" if scenario == "success" else b"")
+                if scenario == "stream_error":
+                    data = prefix + b'data: {"error":{"message":"provider disconnected","type":"provider_unavailable","code":"provider_unavailable"},"choices":[{"index":0,"delta":{},"finish_reason":"error"}]}\n\ndata: [DONE]\n\n'
+                else:
+                    data = prefix + (b"data: [DONE]\n\n" if scenario == "success" else b"")
                 self.send_header("Content-Type", "text/event-stream")
             if scenario == "truncated_chunk":
                 self.send_header("Transfer-Encoding", "chunked")

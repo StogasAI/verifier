@@ -90,6 +90,9 @@
         "type": "Transitive",
         "resolved": "10.0.9",
         "contentHash": "YweovHiLUoEdbr2Xv8eRqCSkTu1vMms4a6xBHaQiMSFVy32PL+hXv6Vhol2NWOmLHjaVgTyhJ3R52U6JxS6w3Q=="
+      },
+      "stogas.verifier": {
+        "type": "Project"
       }
     }
   }

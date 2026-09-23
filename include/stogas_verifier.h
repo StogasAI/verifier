@@ -59,7 +59,10 @@ char *stogas_transport_start(
 );
 /* Manual refresh returns whether the verified bundle contents changed. */
 char *stogas_transport_refresh(const StogasTransport *transport);
-/* Explicit graceful close waits up to five seconds for active work. */
+/* Explicit graceful close waits up to five seconds for active work; it retains the handle. */
+void stogas_transport_close(const StogasTransport *transport);
+/* Release exactly once after concurrent calls finish. Finalizers may use this without waiting.
+ * Explicit disposal should call close first, then free. */
 void stogas_transport_free(StogasTransport *transport);
 
 /*

@@ -90,6 +90,7 @@ cleanup:
     if (body) json_object_put(body);
     if (started) json_object_put(started);
     free(url);
+    stogas_transport_close(transport);
     stogas_transport_free(transport);
     curl_global_cleanup();
     return result;

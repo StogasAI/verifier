@@ -1,4 +1,5 @@
 import Foundation
+import StogasVerifier
 
 final class NoRedirects: NSObject, URLSessionTaskDelegate, @unchecked Sendable {
     func urlSession(_ session: URLSession, task: URLSessionTask,
@@ -11,10 +12,17 @@ final class NoRedirects: NSObject, URLSessionTaskDelegate, @unchecked Sendable {
 
 @main struct Example {
     static func main() async throws {
-        // Start `stogas-verify serve`; use its complete printed capability URL.
         let environment = ProcessInfo.processInfo.environment
-        guard let base = environment["STOGAS_BASE_URL"],
-              let key = environment["STOGAS_API_KEY"],
+        // An explicit URL can also use a separately managed verifier CLI.
+        let transport: Transport?
+        if environment["STOGAS_BASE_URL"] == nil {
+            transport = try await Task.detached { try Transport() }.value
+        } else {
+            transport = nil
+        }
+        defer { transport?.close() }
+        let base = environment["STOGAS_BASE_URL"] ?? transport!.baseURL.absoluteString
+        guard let key = environment["STOGAS_API_KEY"],
               let model = environment["STOGAS_MODEL"],
               let url = URL(string: base + "/chat/completions") else {
             throw URLError(.badURL)
@@ -42,6 +50,11 @@ final class NoRedirects: NSObject, URLSessionTaskDelegate, @unchecked Sendable {
         for try await line in bytes.lines {
             try Task.checkCancellation()
             if line == "data: [DONE]" { completed = true }
+            else if line.hasPrefix("data:") {
+                let data = Data(line.dropFirst(5).utf8)
+                let event = try JSONSerialization.jsonObject(with: data) as? [String: Any]
+                guard event != nil, event?["error"] == nil else { throw URLError(.badServerResponse) }
+            }
             print(line)
         }
         try Task.checkCancellation()

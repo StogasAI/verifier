@@ -1,7 +1,7 @@
 # frozen_string_literal: true
 require "openai"
+require "stogas_verifier"
 
-# Start `stogas-verify serve`; use its complete printed capability URL.
 def stogas_client(base_url, api_key, http)
   OpenAI::Client.new(
     base_url: base_url,
@@ -21,10 +21,12 @@ def local_http
 end
 
 if $PROGRAM_NAME == __FILE__
+  # An explicit URL can also use a separately managed verifier CLI.
+  transport = Stogas::Transport.new unless ENV.key?("STOGAS_BASE_URL")
   http = local_http
   stream = nil
   begin
-    client = stogas_client(ENV.fetch("STOGAS_BASE_URL"), ENV.fetch("STOGAS_API_KEY"), http)
+    client = stogas_client(ENV.fetch("STOGAS_BASE_URL") { transport.base_url }, ENV.fetch("STOGAS_API_KEY"), http)
     stream = client.chat.completions.stream_raw(
       model: ENV.fetch("STOGAS_MODEL"),
       messages: [{role: "user", content: "Say hello in one sentence."}]
@@ -35,5 +37,6 @@ if $PROGRAM_NAME == __FILE__
   ensure
     stream&.close
     http.close
+    transport&.close
   end
 end

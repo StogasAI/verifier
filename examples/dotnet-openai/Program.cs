@@ -2,8 +2,12 @@ using OpenAI;
 using OpenAI.Chat;
 using System.ClientModel;
 using System.ClientModel.Primitives;
+using Stogas.Verifier;
 
-// Start `stogas-verify serve`; use its complete printed capability URL.
+// An explicit URL can also use a separately managed verifier CLI.
+string? external = Environment.GetEnvironmentVariable("STOGAS_BASE_URL");
+using var transport = external is null ? new Transport() : null;
+var baseUrl = external is null ? transport!.BaseUrl : new Uri(external);
 using var cancellation = new CancellationTokenSource();
 Console.CancelKeyPress += (_, e) => { e.Cancel = true; cancellation.Cancel(); };
 using var http = new HttpClient(new SocketsHttpHandler
@@ -16,7 +20,7 @@ var client = new ChatClient(
     new ApiKeyCredential(Environment.GetEnvironmentVariable("STOGAS_API_KEY")!),
     new OpenAIClientOptions
     {
-        Endpoint = new Uri(Environment.GetEnvironmentVariable("STOGAS_BASE_URL")!),
+        Endpoint = baseUrl,
         Transport = new HttpClientPipelineTransport(http),
         RetryPolicy = new ClientRetryPolicy(maxRetries: 0),
         NetworkTimeout = TimeSpan.FromMinutes(45)

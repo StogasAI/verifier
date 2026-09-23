@@ -117,20 +117,35 @@ pub unsafe extern "C" fn stogas_transport_refresh(
     })
 }
 
-/// Stop and release a managed transport.
+/// Wait for bounded graceful shutdown without releasing the handle.
+/// Repeated calls are harmless. Finalizers must use `stogas_transport_free` instead.
 ///
 /// # Safety
 ///
-/// `transport` must be null or a live pointer returned by `stogas_transport_start`, freed once.
+/// `transport` must be null or a live pointer returned by `stogas_transport_start`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stogas_transport_close(transport: *const StogasTransport) {
+    // SAFETY: validity for the duration of this call is required by the public ABI.
+    if let Some(transport) = unsafe { transport.as_ref() } {
+        transport
+            .transport
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .close();
+    }
+}
+
+/// Release a managed transport without waiting for network shutdown.
+/// Its worker retains ownership until bounded cleanup finishes.
+///
+/// # Safety
+///
+/// `transport` must be null or a live pointer returned by `stogas_transport_start`, freed once
+/// after all concurrent calls have returned.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn stogas_transport_free(transport: *mut StogasTransport) {
     if !transport.is_null() {
         // SAFETY: ownership and exactly-once release are required by the public ABI.
-        let mut transport = unsafe { Box::from_raw(transport) };
-        transport
-            .transport
-            .get_mut()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .close();
+        drop(unsafe { Box::from_raw(transport) });
     }
 }

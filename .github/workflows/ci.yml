@@ -59,13 +59,23 @@ jobs:
       - run: cargo clippy --locked --package stogas-verifier-ffi --all-targets --no-default-features --features staging -- -D warnings
 
   native:
-    name: Native tests (${{ matrix.os }})
+    name: Native tests and language packages (${{ matrix.os }})
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-24.04, ubuntu-24.04-arm, macos-15, macos-15-intel, windows-2025]
+        include:
+          - os: ubuntu-24.04
+            platform: linux-amd64
+          - os: ubuntu-24.04-arm
+            platform: linux-arm64
+          - os: macos-15-intel
+            platform: darwin-amd64
+          - os: macos-15
+            platform: darwin-arm64
+          - os: windows-2025
+            platform: windows-amd64
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 30
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
         with:
@@ -114,6 +124,49 @@ jobs:
           python -m pip install --force-reinstall dist-staging/*.whl
           python -m unittest discover -s bindings/python/tests -v
 
+      - name: Stage native language packages
+        shell: bash
+        run: |
+          cargo build --locked --package stogas-verifier-ffi
+          python scripts/stage-native-bindings.py --platform ${{ matrix.platform }} --native-dir target/debug
+      - uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: actions/setup-dotnet@26b0ec14cb23fa6904739307f278c14f94c95bf1
+        with:
+          dotnet-version: '10.0.x'
+      - uses: ruby/setup-ruby@e8944e80fb94b20106697132f8c20c665fab29e9
+        with:
+          ruby-version: '3.3'
+      - name: Java native loading, errors and installed consumer
+        shell: bash
+        run: |
+          mvn -q -f bindings/java/pom.xml install
+          mvn -q -f examples/java-openai/pom.xml test
+      - name: NuGet native loading and handle ownership
+        shell: bash
+        run: |
+          dotnet pack bindings/dotnet/Stogas.Verifier -o "$RUNNER_TEMP/stogas-nuget"
+          dotnet restore bindings/dotnet/tests/Consumer.csproj --source "$RUNNER_TEMP/stogas-nuget" --source https://api.nuget.org/v3/index.json
+          dotnet run --no-restore --project bindings/dotnet/tests/Consumer.csproj
+      - name: Ruby platform gem loading and native errors
+        shell: bash
+        run: |
+          gem -C bindings/ruby build stogas-verifier.gemspec --output "$RUNNER_TEMP/stogas-verifier.gem"
+          gem install "$RUNNER_TEMP/stogas-verifier.gem" --no-document
+          gem install minitest:5.20.0 --no-document
+          ruby bindings/ruby/test/transport_test.rb
+      - name: Swift static package on macOS
+        if: runner.os == 'macOS'
+        run: swift test --package-path bindings/swift
+      - name: Swift static package on Linux
+        if: runner.os == 'Linux'
+        run: >-
+          docker run --rm -v "$PWD:/work" -w /work/bindings/swift
+          swift@sha256:9bea530093ffff8cf6c259991715ee843fe4d0f932e612f7f4b79cca6e00db87
+          swift test -j 4
+
   http-clients:
     name: Documented native HTTP clients
     runs-on: ubuntu-24.04
@@ -132,6 +185,17 @@ jobs:
       - uses: ruby/setup-ruby@e8944e80fb94b20106697132f8c20c665fab29e9
         with:
           ruby-version: '3.3'
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c
+        with:
+          toolchain: 1.97.1
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32
+      - name: Install native transport dependencies
+        run: |
+          cargo build --locked --package stogas-verifier-ffi
+          python3 scripts/stage-native-bindings.py --platform linux-amd64 --native-dir target/debug
+          mvn -q -f bindings/java/pom.xml install -DskipTests
+          gem -C bindings/ruby build stogas-verifier.gemspec --output "$RUNNER_TEMP/stogas-verifier.gem"
+          gem install "$RUNNER_TEMP/stogas-verifier.gem" --no-document
       - name: Java typed requests and streaming failures
         run: |
           mvn -q -f examples/java-openai/pom.xml test dependency:build-classpath -Dmdep.outputFile=target/classpath
@@ -155,9 +219,15 @@ jobs:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
         with:
           persist-credentials: false
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c
+        with:
+          toolchain: 1.97.1
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32
       - run: |
-          swiftc -parse-as-library examples/swift-http/main.swift -o /tmp/stogas-swift-request
-          python3 examples/check_http_client.py /tmp/stogas-swift-request
+          cargo build --locked --package stogas-verifier-ffi
+          python3 scripts/stage-native-bindings.py --platform darwin-arm64 --native-dir target/debug
+          swift build --package-path examples/swift-http
+          python3 examples/check_http_client.py examples/swift-http/.build/debug/StogasHTTPExample
 
   go:
     name: Go binding and C ABI (${{ matrix.os }})
