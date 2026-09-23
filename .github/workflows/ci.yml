@@ -159,6 +159,8 @@ jobs:
           ruby bindings/ruby/test/transport_test.rb
       - name: Swift static package on macOS
         if: runner.os == 'macOS'
+        env:
+          DEVELOPER_DIR: /Applications/Xcode_26.3.app/Contents/Developer
         run: swift test --package-path bindings/swift
       - name: Swift static package on Linux
         if: runner.os == 'Linux'
@@ -215,6 +217,8 @@ jobs:
     name: Swift standard HTTP client
     runs-on: macos-15
     timeout-minutes: 10
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_26.3.app/Contents/Developer
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
         with:
