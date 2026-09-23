@@ -71,7 +71,7 @@ test('binary HTTP keeps credentials inside the first record and streams across a
 			'Stogas-Node-ID': 'test-owner'
 		});
 		assert.equal(sent.init.credentials, 'omit');
-		assert.equal(sent.init.redirect, 'error');
+		assert.equal(sent.init.redirect, 'manual');
 		assert.ok(sent.init.body instanceof Blob);
 		assert.deepEqual([...new Uint8Array(await sent.init.body.arrayBuffer())], [7, 8, 9, 1, 2, 3]);
 		assert.equal(

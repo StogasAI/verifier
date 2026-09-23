@@ -140,7 +140,7 @@ export async function sendSessionRequest({
 			method: 'POST',
 			body,
 			credentials: 'omit',
-			redirect: 'error',
+			redirect: 'manual',
 			headers: {
 				'content-type': SESSION_CONTENT_TYPE,
 				accept: SESSION_CONTENT_TYPE,

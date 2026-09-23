@@ -102,7 +102,7 @@ test('explicit refresh shares acquisition, exposes copied evidence, and isolates
 		fetch: async (url, options) => {
 			attempts.push(url);
 			assert.equal(options.credentials, 'omit');
-			assert.equal(options.redirect, 'error');
+			assert.equal(options.redirect, 'manual');
 			assert.equal(new Headers(options.headers).has('authorization'), false);
 			return url.includes('r2') ? new Response(null, { status: 503 }) : new Response('{}');
 		}

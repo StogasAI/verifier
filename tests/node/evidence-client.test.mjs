@@ -66,7 +66,7 @@ test('R2-first recovery checks progress before accepting 200/304 and keeps origi
 	assert.equal(calls[1].options.headers['if-none-match'], 'r2-1');
 	assert.equal(calls[2].options.headers['if-none-match'], undefined);
 	assert.equal(
-		calls.every(({ options }) => options.credentials === 'omit' && options.redirect === 'error'),
+		calls.every(({ options }) => options.credentials === 'omit' && options.redirect === 'manual'),
 		true
 	);
 	client.close();

@@ -1,9 +1,12 @@
 /target
+/examples/*/target
 /pkg
 /packages/offline-sigstore/pkg
 /fuzz/artifacts
 /fuzz/coverage
 /fuzz/target
+# libFuzzer-generated SHA-1 filenames; keep named regression seeds under version control.
+/fuzz/corpus/*/????????????????????????????????????????
 /go/native
 /go/LICENSE
 /node_modules
@@ -17,3 +20,6 @@ __pycache__/
 **/*.lib
 *.profraw
 .DS_Store
+
+/examples/*/bin
+/examples/*/obj

@@ -159,7 +159,7 @@ export class SessionTransport {
 				method: 'POST',
 				body: setup.hello,
 				credentials: 'omit',
-				redirect: 'error',
+				redirect: 'manual',
 				signal,
 				headers: { 'content-type': SESSION_CONTENT_TYPE, accept: SESSION_CONTENT_TYPE }
 			});

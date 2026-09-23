@@ -118,7 +118,7 @@ export class EvidenceClient {
 				const response = await this.#fetch(this.#origins[index], {
 					method: 'GET',
 					credentials: 'omit',
-					redirect: 'error',
+					redirect: 'manual',
 					signal: attempt.signal,
 					headers: {
 						accept: 'application/json',

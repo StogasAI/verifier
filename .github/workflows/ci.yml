@@ -75,6 +75,8 @@ jobs:
           toolchain: 1.97.1
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32
       - run: cargo test --locked --workspace --all-targets
+      - name: Qualify the Rust OpenAI client example
+        run: cargo test --locked --manifest-path examples/rust-openai/Cargo.toml
       - name: Test compiled staging trust policy and transport
         run: cargo test --locked --package stogas-verifier --package stogas --all-targets --features staging
       - name: Test the verifier without optional SNP support
@@ -93,6 +95,10 @@ jobs:
           set -euo pipefail
           python -m pip install --force-reinstall dist/*.whl
           python -m unittest discover -s bindings/python/tests -v
+      - name: Qualify the Python OpenAI client example
+        run: |
+          python -m pip install -r examples/python-openai/requirements.txt
+          python -m unittest discover -s examples/python-openai -v
 
       - name: Build the staging Python wheel
         uses: PyO3/maturin-action@36db84001d74475ad1b8e6613557ae4ee2dc3598
@@ -107,6 +113,48 @@ jobs:
           set -euo pipefail
           python -m pip install --force-reinstall dist-staging/*.whl
           python -m unittest discover -s bindings/python/tests -v
+
+  http-clients:
+    name: Documented native HTTP clients
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961
+        with:
+          distribution: temurin
+          java-version: '21'
+      - uses: actions/setup-dotnet@26b0ec14cb23fa6904739307f278c14f94c95bf1
+        with:
+          dotnet-version: '10.0.x'
+      - name: Java typed requests and streaming failures
+        run: |
+          mvn -q -f examples/java-openai/pom.xml test dependency:build-classpath -Dmdep.outputFile=target/classpath
+          python3 examples/check_http_client.py java -cp "examples/java-openai/target/classes:$(cat examples/java-openai/target/classpath)" example.Main
+      - name: Ruby typed requests and streaming failures
+        run: |
+          sudo apt-get install -y --no-install-recommends ruby ruby-dev ruby-webrick ruby-minitest
+          gem install --user-install openai --version 0.94.0 --no-document
+          ruby examples/ruby-openai/test_client.rb
+          python3 examples/check_http_client.py ruby examples/ruby-openai/main.rb
+      - name: .NET typed streaming and failures
+        run: |
+          dotnet build --locked-mode examples/dotnet-openai/Example.csproj
+          python3 examples/check_http_client.py dotnet examples/dotnet-openai/bin/Debug/net10.0/Example.dll
+
+  swift-http:
+    name: Swift standard HTTP client
+    runs-on: macos-15
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+        with:
+          persist-credentials: false
+      - run: |
+          swiftc -parse-as-library examples/swift-http/main.swift -o /tmp/stogas-swift-request
+          python3 examples/check_http_client.py /tmp/stogas-swift-request
 
   go:
     name: Go binding and C ABI (${{ matrix.os }})
@@ -158,6 +206,18 @@ jobs:
         env:
           CGO_ENABLED: '1'
         run: go test ./...
+      - name: Compile the C HTTP example against the public ABI
+        if: matrix.os == 'ubuntu-24.04'
+        run: |
+          sudo apt-get install -y --no-install-recommends libcurl4-openssl-dev libjson-c-dev
+          cc -std=c11 -Wall -Wextra -Werror -Iinclude examples/c-http/main.c \
+            "target/${{ matrix.target }}/debug/libstogas_verifier_ffi.a" \
+            $(pkg-config --cflags --libs libcurl json-c) -ldl -lpthread -lm -o /tmp/stogas-request
+      - name: Qualify the Go OpenAI client example
+        working-directory: examples/go-openai
+        env:
+          CGO_ENABLED: '1'
+        run: go test -race ./...
       - run: |
           cargo build --locked --package stogas-verifier-ffi --features staging
           mkdir -p "go/native/${{ matrix.platform }}"
@@ -244,6 +304,8 @@ jobs:
         run: npm run test:browser
       - name: Verify the Node package entrypoint
         run: npm run test:node
+      - name: Verify the Worker package in workerd
+        run: npm run test:worker
       - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e
         with:
           node-version: 20.20.2

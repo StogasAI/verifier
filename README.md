@@ -114,6 +114,12 @@ The Go binding's matching `stogas_offline` build tag omits `Transport`; normal S
 
 Python wheels use PyO3's stable `abi3-py310` ABI. Go uses cgo. The native packages cover Linux x86-64/ARM64, macOS x86-64/ARM64, and Windows x86-64.
 
+Use your language's OpenAI client with the verifier transport. OpenAI request types remain
+in that client; the Rust SDK does not bundle or re-export `async-openai`. The
+[examples](examples/) cover maintained clients and standard HTTP, streaming, cancellation,
+and cleanup. Their tests also check that client retries and truncated streams do not hide
+an incomplete request. See the [language guides](https://stogas.ai/docs/sdk-overview).
+
 Java 22+ and other JVM languages can use the Foreign Function & Memory API, .NET can use P/Invoke, Swift and Objective-C have native C interoperability, and Kotlin/Native can use `cinterop`. These are self-managed C ABI integrations rather than separate Stogas SDK implementations. See the [C and C++ guide](https://stogas.ai/docs/c-cpp) for the ABI and memory-ownership contract.
 
 ## Sigstore support

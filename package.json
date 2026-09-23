@@ -43,9 +43,12 @@
 	},
 	"scripts": {
 		"test:browser": "playwright test --config tests/browser/playwright.config.ts",
+		"test:worker": "node --test tests/worker/*.test.mjs",
 		"test:node": "node --test tests/node/*.test.mjs"
 	},
 	"devDependencies": {
-		"@playwright/test": "1.62.1"
+		"@playwright/test": "1.62.1",
+		"miniflare": "5.20260921.0-alpha",
+		"openai": "7.5.0"
 	}
 }
