@@ -124,6 +124,8 @@ pub struct Snapshot {
     #[cfg(feature = "snp")]
     identity: Arc<()>,
     approvals: VerifiedApprovals,
+    keys_evidence: SignedKeyManifest,
+    approvals_evidence: SignedApprovalManifest,
     key_state: Arc<approvals::KeyState>,
     gateways: BTreeMap<String, Cached<VerifiedRelease>>,
     catalogs: BTreeMap<String, Cached<VerifiedCatalogRelease>>,
@@ -165,6 +167,7 @@ impl Snapshot {
             .collect();
         serde_json::json!({
             "keys": self.approvals.keys(), "approvals": self.approvals.manifest(),
+            "keys_evidence": self.keys_evidence, "approvals_evidence": self.approvals_evidence,
             "gateways": gateways, "catalogs": catalogs, "hardware_policy": self.hardware_policy(),
             "hardware_policy_evidence": {"policy": self.policy, "sigstore": self.hardware_sigstore}
         })
@@ -383,6 +386,8 @@ impl Verifier {
             #[cfg(feature = "snp")]
             identity: Arc::new(()),
             approvals,
+            keys_evidence: body.keys,
+            approvals_evidence: body.approvals,
             key_state: self.approvals.key_state(),
             gateways,
             catalogs,

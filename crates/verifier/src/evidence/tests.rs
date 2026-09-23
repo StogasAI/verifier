@@ -124,6 +124,9 @@ mod staging {
     fn complete_logged_bundle_installs_and_reuses_unchanged_approvals() {
         let (mut verifier, body, now) = fixture();
         let first = verifier.refresh(&encode(&body), now).unwrap();
+        let summary = first.summary();
+        assert_eq!(summary["keys_evidence"], body["keys"]);
+        assert_eq!(summary["approvals_evidence"], body["approvals"]);
         let second = verifier.refresh(&encode(&body), now + 1000).unwrap();
         assert!(Arc::ptr_eq(&first.hardware.value, &second.hardware.value));
         let gateway_id = &first.approvals.manifest().gateways[0];
