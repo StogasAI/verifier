@@ -129,14 +129,16 @@ jobs:
       - uses: actions/setup-dotnet@26b0ec14cb23fa6904739307f278c14f94c95bf1
         with:
           dotnet-version: '10.0.x'
+      - uses: ruby/setup-ruby@e8944e80fb94b20106697132f8c20c665fab29e9
+        with:
+          ruby-version: '3.3'
       - name: Java typed requests and streaming failures
         run: |
           mvn -q -f examples/java-openai/pom.xml test dependency:build-classpath -Dmdep.outputFile=target/classpath
           python3 examples/check_http_client.py java -cp "examples/java-openai/target/classes:$(cat examples/java-openai/target/classpath)" example.Main
       - name: Ruby typed requests and streaming failures
         run: |
-          sudo apt-get install -y --no-install-recommends ruby ruby-dev ruby-webrick ruby-minitest
-          gem install --user-install openai --version 0.94.0 --no-document
+          gem install openai:0.94.0 webrick:1.9.2 minitest:5.20.0 --no-document
           ruby examples/ruby-openai/test_client.rb
           python3 examples/check_http_client.py ruby examples/ruby-openai/main.rb
       - name: .NET typed streaming and failures
