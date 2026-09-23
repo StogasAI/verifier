@@ -145,10 +145,11 @@ jobs:
           mvn -q -f bindings/java/pom.xml install
           mvn -q -f examples/java-openai/pom.xml test
       - name: NuGet native loading and handle ownership
-        shell: bash
+        shell: pwsh
         run: |
-          dotnet pack bindings/dotnet/Stogas.Verifier -o "$RUNNER_TEMP/stogas-nuget"
-          dotnet restore bindings/dotnet/tests/Consumer.csproj --source "$RUNNER_TEMP/stogas-nuget" --source https://api.nuget.org/v3/index.json
+          $PSNativeCommandUseErrorActionPreference = $true
+          dotnet pack bindings/dotnet/Stogas.Verifier -o "$env:RUNNER_TEMP/stogas-nuget"
+          dotnet restore bindings/dotnet/tests/Consumer.csproj --source "$env:RUNNER_TEMP/stogas-nuget" --source https://api.nuget.org/v3/index.json
           dotnet run --no-restore --project bindings/dotnet/tests/Consumer.csproj
       - name: Ruby platform gem loading and native errors
         shell: bash
