@@ -2,15 +2,37 @@ import { EvidenceVerifier } from '../../bindings/worker/worker.js';
 import { EvidenceClient } from '../../bindings/shared/evidence-client.js';
 import { SessionTransport } from '../../bindings/shared/session-transport.js';
 import { sendSessionRequest } from '../../bindings/shared/channel-http.js';
+import {
+	sign_mldsa65,
+	verify_mldsa65,
+	prepare_rekor_submission
+} from '../../pkg/browser/stogas_verifier.js';
 import root from './root.js';
+import signing from './signing.js';
 
 const fetchOrigin = (input, init) => globalThis.fetch(input, init);
 
-// Network-boundary doubles only. The packaged Wasm core is loaded above and its
-// cryptographic fixtures are exercised separately by the browser/Rust suites.
+// Transport checks use network-boundary doubles. Signing uses the packaged Wasm
+// and the shared Go vector, including the runtime's randomness and key erasure.
 export default {
 	async fetch(request) {
 		const path = new URL(request.url).pathname;
+		if (path === '/sign') {
+			const bytes = (hex) => Uint8Array.from(hex.match(/../g), (part) => Number.parseInt(part, 16));
+			const message = bytes(signing.message);
+			const context = new TextEncoder().encode(signing.context);
+			const publicKey = bytes(signing.spki);
+			verify_mldsa65(publicKey, message, context, bytes(signing.context_signature));
+			const privateKey = bytes(signing.pkcs8);
+			const signature = sign_mldsa65(privateKey, message, context);
+			verify_mldsa65(publicKey, message, context, signature);
+			const submission = JSON.parse(prepare_rekor_submission(message));
+			return Response.json({
+				erased: privateKey.every((byte) => byte === 0),
+				signatureBytes: signature.length,
+				hash: submission.spec.data.hash
+			});
+		}
 		if (path === '/core') {
 			const verifier = new EvidenceVerifier('prod', root.key_id, root.public_key);
 			try {
