@@ -5,6 +5,7 @@ use std::{
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use serde_json::Value;
+use sev::certs::snp::{Certificate, Verifiable as _};
 use sha2::{Digest, Sha256, Sha384};
 use x509_parser::{extensions::ParsedExtension, parse_x509_certificate, parse_x509_crl};
 
@@ -43,7 +44,6 @@ impl Revocations {
         if rows.len() > crate::MAX_VENDOR_COLLATERAL {
             return Err(Error::TooLarge);
         }
-        let mut issuers = self.issuers.lock().map_err(collateral_error)?;
         // Missing or malformed unrelated objects cannot hide independently authenticated revocation.
         for row in rows.iter().filter(|row| row["collateral_type"] == "ark") {
             let Ok(der) = row_der(row) else { continue };
@@ -53,19 +53,40 @@ impl Revocations {
             let id: IssuerId = Sha384::digest(cert.public_key().raw).into();
             if !remaining.is_empty()
                 || cert.subject() != cert.issuer()
+                || cert.signature_algorithm != cert.tbs_certificate.signature
                 || !crate::AMD_PRODUCT_PROFILES
                     .iter()
                     .any(|profile| profile.root_spki_sha384 == hex::encode(id))
             {
                 continue;
             }
-            issuers.entry(id).or_insert_with(|| Issuer {
-                certificate: der.into(),
-                latest: None,
-                conflicting: false,
-            });
+            if self
+                .issuers
+                .lock()
+                .map_err(collateral_error)?
+                .contains_key(&id)
+            {
+                continue;
+            }
+            // The SPKI pin authenticates the key, not the delivered issuer name or
+            // extensions used to match CRLs. Authenticate those before retaining them.
+            // As with CRLs, expensive signature work must not hold the admission lock.
+            let Ok(root) = Certificate::from_der(&der) else {
+                continue;
+            };
+            if (&root, &root).verify().is_err() {
+                continue;
+            }
+            self.issuers
+                .lock()
+                .map_err(collateral_error)?
+                .entry(id)
+                .or_insert_with(|| Issuer {
+                    certificate: der.into(),
+                    latest: None,
+                    conflicting: false,
+                });
         }
-        drop(issuers);
         let mut failure = None;
         for row in rows.iter().filter(|row| row["collateral_type"] == "crl") {
             let der = match row_der(row) {

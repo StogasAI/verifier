@@ -35,6 +35,63 @@ fn trusted_fixture() -> (Value, IssuerId, Revocations) {
 }
 
 #[test]
+fn forged_root_metadata_cannot_poison_later_authentic_crl_delivery() {
+    let fixture: Value = serde_json::from_str(include_str!(
+        "../../../../../tests/fixtures/current-evidence-v1.json"
+    ))
+    .unwrap();
+    let rows = fixture["bundle"]["body"]["vendor_collateral"]
+        .as_array()
+        .unwrap();
+    let original = rows
+        .iter()
+        .find(|row| row["collateral_type"] == "ark")
+        .unwrap();
+    let crl = rows
+        .iter()
+        .find(|row| row["collateral_type"] == "crl")
+        .unwrap();
+    let bytes = row_der(original).unwrap();
+    let mut forged_name = bytes.clone();
+    let name = b"ARK-Milan";
+    let offsets: Vec<_> = forged_name
+        .windows(name.len())
+        .enumerate()
+        .filter_map(|(offset, value)| (value == name).then_some(offset))
+        .collect();
+    assert_eq!(offsets.len(), 2); // Replace both issuer and subject; leave the pinned SPKI intact.
+    for offset in offsets {
+        forged_name[offset] = b'B';
+    }
+    let mut forged_signature = bytes;
+    *forged_signature.last_mut().unwrap() ^= 1;
+    for forged in [forged_name, forged_signature] {
+        let state = Revocations::default();
+        let now = fixture["verified_at_ms"].as_i64().unwrap();
+        state
+            .observe(
+                &serde_json::json!({"vendor_collateral":[row(&forged, "ark")]}),
+                now,
+            )
+            .unwrap();
+        assert!(
+            state.issuers.lock().unwrap().is_empty(),
+            "cached unauthenticated root metadata"
+        );
+        state
+            .observe(
+                &serde_json::json!({"vendor_collateral":[original, crl]}),
+                now,
+            )
+            .unwrap();
+        let issuers = state.issuers.lock().unwrap();
+        assert_eq!(issuers.len(), 1);
+        assert!(issuers.values().next().unwrap().latest.is_some());
+        drop(issuers);
+    }
+}
+
+#[test]
 fn authenticated_revocation_survives_expiry_and_stale_replica() {
     let (value, id, state) = trusted_fixture();
     let now = value["now"].as_i64().unwrap();
