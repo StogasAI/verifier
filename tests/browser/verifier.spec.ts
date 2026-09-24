@@ -33,6 +33,71 @@ const POLICY = {
 		'https://github.com/StogasAI/gateway/.github/workflows/gateway-igvm-release.yml@refs/tags/v0.0.1'
 };
 
+test('ML-DSA publisher bindings verify independent Go signatures and erase key inputs', async ({
+	page
+}) => {
+	const requests = await initialize(page);
+	const fixture = JSON.parse(
+		await readFile(resolve(ROOT, 'tests/fixtures/mldsa65-v1.json'), 'utf8')
+	);
+	fixture.sha512 = createHash('sha512').update(Buffer.from(fixture.message, 'hex')).digest('hex');
+	const result = await page.evaluate((fixture) => {
+		const api = (
+			globalThis as unknown as {
+				stogasVerifierBindings: typeof import('../../pkg/browser/stogas_verifier.js');
+			}
+		).stogasVerifierBindings;
+		const bytes = (value: string) =>
+			Uint8Array.from(value.match(/../g)!, (part) => Number.parseInt(part, 16));
+		const hex = (value: Uint8Array) =>
+			[...value].map((byte) => byte.toString(16).padStart(2, '0')).join('');
+		const message = bytes(fixture.message);
+		const context = new TextEncoder().encode(fixture.context);
+		const publicKey = bytes(fixture.spki);
+		api.verify_mldsa65(publicKey, message, context, bytes(fixture.context_signature));
+		const privateKey = bytes(fixture.pkcs8);
+		const derived = api.mldsa65_public_key(privateKey);
+		const derivedErased = privateKey.every((byte) => byte === 0);
+		privateKey.set(bytes(fixture.pkcs8));
+		const signature = api.sign_mldsa65(privateKey, message, context);
+		api.verify_mldsa65(publicKey, message, context, signature);
+		const signedErased = privateKey.every((byte) => byte === 0);
+		let rejected = 0;
+		try {
+			api.verify_mldsa65(publicKey, message, new Uint8Array(), signature);
+		} catch {
+			rejected++;
+		}
+		const malformed = new Uint8Array([1, 2, 3]);
+		try {
+			api.sign_mldsa65(malformed, message, context);
+		} catch {
+			rejected++;
+		}
+		const failedErased = malformed.every((byte) => byte === 0);
+		const submission = JSON.parse(api.prepare_rekor_submission(message));
+		return {
+			publicKey: hex(derived),
+			derivedErased,
+			signedErased,
+			failedErased,
+			rejected,
+			kind: submission.kind,
+			digestMatches: submission.spec.data.hash.value === fixture.sha512
+		};
+	}, fixture);
+	expect(result).toEqual({
+		publicKey: fixture.spki,
+		derivedErased: true,
+		signedErased: true,
+		failedErased: true,
+		rejected: 2,
+		kind: 'hashedrekord',
+		digestMatches: true
+	});
+	expect(requests).toEqual([]);
+});
+
 test('browser boot history remains offline and separate from current evidence', async ({
 	page
 }) => {

@@ -140,7 +140,7 @@ impl TrustedRoot {
     }
 
     #[cfg(test)]
-    pub fn tsa_test_root(json: &str) -> Result<Self, String> {
+    pub fn test_root(json: &str) -> Result<Self, String> {
         Self::from_json(json)
     }
 

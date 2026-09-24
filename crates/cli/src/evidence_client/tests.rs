@@ -9,6 +9,7 @@ use axum::{
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use ed25519_dalek::{Signer as _, SigningKey};
 use serde_json::{Value, json};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 #[derive(Clone)]
 struct Reply {
@@ -625,14 +626,14 @@ async fn encrypted_setup_bounds_delivery_and_never_recovers_invalid_protocol_dat
     let origins = Server::new([reply(signed(body), "\"evidence\""), reply(vec![], "unused")]).await;
     let evidence = origins.client(root);
     evidence.refresh(deadline()).await.unwrap();
-    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let calls = Arc::new(AtomicUsize::new(0));
     let observed = Arc::clone(&calls);
     let app = Router::new().route(
         "/{scenario}",
         post(move |Path(case): Path<String>, request: Request<Body>| {
             let observed = Arc::clone(&observed);
             async move {
-                observed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                observed.fetch_add(1, Ordering::SeqCst);
                 assert!(!request.headers().contains_key("authorization"));
                 assert!(!request.headers().contains_key("stogas-node-id"));
                 assert_eq!(request.headers()["content-type"], CONTENT_TYPE);
@@ -699,7 +700,7 @@ async fn encrypted_setup_bounds_delivery_and_never_recovers_invalid_protocol_dat
             _ => assert!(matches!(result, Err(Error::Response))),
         }
     }
-    let calls_before_expired_setup = calls.load(std::sync::atomic::Ordering::SeqCst);
+    let calls_before_expired_setup = calls.load(Ordering::SeqCst);
     assert!((5..=6).contains(&calls_before_expired_setup));
     assert_eq!(
         origins.state.requests.lock().unwrap().len(),
@@ -715,9 +716,6 @@ async fn encrypted_setup_bounds_delivery_and_never_recovers_invalid_protocol_dat
     )
     .await;
     assert!(matches!(result, Err(Error::Deadline)));
-    assert_eq!(
-        calls.load(std::sync::atomic::Ordering::SeqCst),
-        calls_before_expired_setup
-    );
+    assert_eq!(calls.load(Ordering::SeqCst), calls_before_expired_setup);
     task.abort();
 }

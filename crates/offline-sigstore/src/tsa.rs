@@ -494,7 +494,7 @@ mod tests {
         let timestamp = SignedTimestamp {
             signed_timestamp: fixture.timestamp,
         };
-        let root = TrustedRoot::tsa_test_root(include_str!(
+        let root = TrustedRoot::test_root(include_str!(
             "../../../tests/fixtures/github-rfc3161-trusted-root.json"
         ))
         .unwrap();

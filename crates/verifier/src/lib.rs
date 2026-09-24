@@ -10,6 +10,7 @@ pub mod evidence;
 #[cfg(feature = "snp")]
 pub mod receipt;
 pub mod secret_release;
+pub mod signing;
 pub use types::*;
 
 use base64::{

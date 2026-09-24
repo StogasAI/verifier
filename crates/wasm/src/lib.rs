@@ -1,6 +1,7 @@
 //! Browser and Node/Bun adapter. The core remains deterministic and networkless.
 mod channel;
 mod evidence;
+mod signing;
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use serde::{Deserialize, Serialize};
 use stogas_offline_sigstore::{GithubPolicy, Subject, verify_github_attestation};

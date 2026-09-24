@@ -645,6 +645,6 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          for target in sigstore current_evidence session_evidence c_abi encrypted_setup; do
+          for target in sigstore current_evidence session_evidence c_abi encrypted_setup signatures; do
             cargo fuzz run "$target" -- -max_total_time=10 -timeout=10
           done

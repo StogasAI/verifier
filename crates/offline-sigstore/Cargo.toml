@@ -18,7 +18,7 @@ chrono.workspace = true
 cms = { version = "0.2.3", default-features = false }
 const-oid = "0.9.6"
 der = { version = "0.7.10", features = ["derive"] }
-ed25519-dalek.workspace = true
+ed25519-dalek = { workspace = true, features = ["digest"] }
 hex.workspace = true
 p256 = { version = "0.13.2", default-features = false, features = ["ecdsa", "pkcs8"] }
 p384 = { version = "0.13.1", default-features = false, features = ["ecdsa", "pkcs8"] }

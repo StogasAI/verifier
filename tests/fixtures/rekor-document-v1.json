@@ -1,0 +1,46 @@
+{
+  "artifact": "synthetic document for Rekor binding fuzz coverage\n",
+  "bundle": {
+    "mediaType": "application/vnd.dev.sigstore.bundle.v0.3+json",
+    "messageSignature": {
+      "messageDigest": {
+        "algorithm": "SHA2_512",
+        "digest": "QfVMRxXVZPyEmUHLf2PpULEcmVYvfxtoR3O2tKcpA6gahHB5R/SVT4e3J60XwtyUH2KIWnUcxyrLZqEqs01rmg=="
+      },
+      "signature": "H5UTXl/AvZkkGhlIkE4HcweJXbY2WEakDnFxOT0YS8B1MejBXol/4sTJnv/s35M/VHrLlxEJvUHEO4ky96x3BQ=="
+    },
+    "verificationMaterial": {
+      "publicKey": {
+        "hint": "ed7204998d1901c7bc21e0ec84a5089b62e1523513e67f320e3e76774ebae567"
+      },
+      "timestampVerificationData": {},
+      "tlogEntries": [
+        {
+          "canonicalizedBody": "eyJhcGlWZXJzaW9uIjoiMC4wLjEiLCJraW5kIjoiaGFzaGVkcmVrb3JkIiwic3BlYyI6eyJkYXRhIjp7Imhhc2giOnsiYWxnb3JpdGhtIjoic2hhNTEyIiwidmFsdWUiOiI0MWY1NGM0NzE1ZDU2NGZjODQ5OTQxY2I3ZjYzZTk1MGIxMWM5OTU2MmY3ZjFiNjg0NzczYjZiNGE3MjkwM2E4MWE4NDcwNzk0N2Y0OTU0Zjg3YjcyN2FkMTdjMmRjOTQxZjYyODg1YTc1MWNjNzJhY2I2NmExMmFiMzRkNmI5YSJ9fSwic2lnbmF0dXJlIjp7ImNvbnRlbnQiOiJINVVUWGwvQXZaa2tHaGxJa0U0SGN3ZUpYYlkyV0Vha0RuRnhPVDBZUzhCMU1lakJYb2wvNHNUSm52L3MzNU0vVkhyTGx4RUp2VUhFTzRreTk2eDNCUT09IiwicHVibGljS2V5Ijp7ImNvbnRlbnQiOiJMUzB0TFMxQ1JVZEpUaUJRVlVKTVNVTWdTMFZaTFMwdExTMEtUVU52ZDBKUldVUkxNbFozUVhsRlFWcHpNV2RwTlV0TWFVOVZUMFIyTm5GTkwzSjRlRVI2ZGpSSVMxVnpUR2dyYml0RGNuQnhVRkJrYWswOUNpMHRMUzB0UlU1RUlGQlZRa3hKUXlCTFJWa3RMUzB0TFFvPSJ9fX19",
+          "inclusionPromise": {
+            "signedEntryTimestamp": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=="
+          },
+          "inclusionProof": {
+            "checkpoint": {
+              "envelope": "synthetic invalid checkpoint"
+            },
+            "hashes": [],
+            "logIndex": "0",
+            "rootHash": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+            "treeSize": "1"
+          },
+          "integratedTime": "1784246400",
+          "kindVersion": {
+            "kind": "hashedrekord",
+            "version": "0.0.1"
+          },
+          "logId": {
+            "keyId": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+          },
+          "logIndex": "0"
+        }
+      ]
+    }
+  },
+  "description": "Synthetic log proof; valid Go Ed25519ph submission signature. This fixture must never pass trusted Rekor verification."
+}
