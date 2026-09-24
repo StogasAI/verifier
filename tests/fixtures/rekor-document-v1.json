@@ -42,5 +42,6 @@
       ]
     }
   },
-  "description": "Synthetic log proof; valid Go Ed25519ph submission signature. This fixture must never pass trusted Rekor verification."
+  "description": "Synthetic log proof; valid Go Ed25519ph submission signature. This fixture must never pass trusted Rekor verification.",
+  "submission_key_spki": "302a300506032b657003210066cd608b928b88e50e0efeaa33faf1c43cefe07294b0b87e9fe0aba6a3cf7633"
 }

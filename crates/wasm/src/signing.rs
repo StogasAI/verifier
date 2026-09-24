@@ -55,15 +55,34 @@ pub fn verify_mldsa65(
     signing::verify(key, message, context, signature).map_err(error)
 }
 
-/// Prepare a public Rekor submission using a disposable key, without publishing it.
-/// The caller must persist the exact result before delivery and independently verify
-/// the Stogas signature on the complete document being logged.
+/// Derive the stable Rekor submission public key, erasing the mutable input DER.
+/// Its authenticated association with the ML-DSA key enables independent log searches.
 ///
 /// # Errors
-/// Rejects oversized input, unavailable randomness and signing failures.
+/// Rejects malformed or unsupported private keys.
 #[wasm_bindgen]
-pub fn prepare_rekor_submission(signed_document: &[u8]) -> Result<String, JsError> {
-    signing::prepare_rekor_submission(signed_document).map_err(error)
+pub fn rekor_public_key(private_key_der: &mut [u8]) -> Result<Vec<u8>, JsError> {
+    let key = signing::SigningKey::from_pkcs8(private_key_der);
+    private_key_der.zeroize();
+    key.map_err(error)?.rekor_public_key_spki().map_err(error)
+}
+
+/// Prepare a public Rekor submission using the authorized publisher's derived key.
+/// Erases the mutable input DER. The caller must persist the exact result before
+/// delivery and independently verify the ML-DSA signature on the complete document.
+///
+/// # Errors
+/// Rejects malformed keys, oversized input and signing failures.
+#[wasm_bindgen]
+pub fn prepare_rekor_submission(
+    private_key_der: &mut [u8],
+    signed_document: &[u8],
+) -> Result<String, JsError> {
+    let key = signing::SigningKey::from_pkcs8(private_key_der);
+    private_key_der.zeroize();
+    key.map_err(error)?
+        .prepare_rekor_submission(signed_document)
+        .map_err(error)
 }
 
 /// Verify inclusion of exact signed bytes; this does not establish document authorship.
@@ -74,12 +93,17 @@ pub fn prepare_rekor_submission(signed_document: &[u8]) -> Result<String, JsErro
 pub fn verify_rekor_document_inclusion(
     bundle: &[u8],
     signed_document: &[u8],
+    submission_key_spki: &[u8],
     now_unix_ms: f64,
 ) -> Result<f64, JsError> {
     let now = super::parse_unix_ms(now_unix_ms, "now_unix_ms")?;
-    let time =
-        stogas_offline_sigstore::verify_rekor_document_inclusion(bundle, signed_document, now)
-            .map_err(|error| JsError::new(&error.to_string()))?;
+    let time = stogas_offline_sigstore::verify_rekor_document_inclusion(
+        bundle,
+        signed_document,
+        submission_key_spki,
+        now,
+    )
+    .map_err(|error| JsError::new(&error.to_string()))?;
     // A verified seconds value is bounded by the safe-integer millisecond input above.
     #[allow(clippy::cast_precision_loss)]
     Ok(time as f64)

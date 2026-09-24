@@ -103,15 +103,17 @@ pub fn verify_keyed_dsse(
 
 /// Verify publication of exact artifact bytes through Rekor's SHA-512/Ed25519ph profile.
 ///
-/// The submission key may be temporary. This proves log inclusion and time, **not** the
-/// artifact's author or approval. The caller must separately authenticate the artifact
-/// with its own trusted signing policy, including any post-quantum signature.
+/// The caller supplies the expected submission key from its authenticated policy.
+/// This proves log inclusion, submission identity and time, **not** the artifact's
+/// author or approval. Separately authenticate the artifact with its trusted signing
+/// policy, including any post-quantum signature.
 ///
 /// # Errors
 /// Rejects malformed bundles, substituted artifacts, invalid signatures, log proofs or times.
 pub fn verify_rekor_document_inclusion(
     bundle: &[u8],
     artifact: &[u8],
+    submission_key_spki: &[u8],
     now_unix_ms: i64,
 ) -> Result<i64, Error> {
     if bundle.len() > MAX_BUNDLE_BYTES || artifact.len() > MAX_DOCUMENT_BYTES {
@@ -119,7 +121,8 @@ pub fn verify_rekor_document_inclusion(
     }
     let value =
         strict_json::from_slice(bundle).map_err(|error| Error::InvalidBundle(error.to_string()))?;
-    hashedrekord::verify(&value, artifact, now_unix_ms).map_err(Error::Cryptographic)
+    hashedrekord::verify(&value, artifact, submission_key_spki, now_unix_ms)
+        .map_err(Error::Cryptographic)
 }
 
 /// Offline Sigstore verification failure.

@@ -53,6 +53,7 @@ pub enum Error {
 
 /// An expanded signing key, erased on drop and never implicitly cloned or formatted.
 pub struct SigningKey {
+    seed: Zeroizing<[u8; SEED_BYTES]>,
     secret: Zeroizing<[u8; PRIVATE_KEY_BYTES]>,
     public: [u8; PUBLIC_KEY_BYTES],
 }
@@ -83,6 +84,7 @@ impl SigningKey {
     #[must_use]
     pub fn from_seed(seed: &[u8; SEED_BYTES]) -> Self {
         let mut key = Self {
+            seed: Zeroizing::new(*seed),
             secret: Zeroizing::new([0; PRIVATE_KEY_BYTES]),
             public: [0; PUBLIC_KEY_BYTES],
         };
@@ -111,6 +113,64 @@ impl SigningKey {
         }
         .to_der()
         .map_err(|_| Error::PublicKey)
+    }
+
+    /// The stable Rekor submission public key associated with this signing key.
+    /// Publish this association in authenticated signing metadata before using it
+    /// to discover entries. It does not grant document-signing authority.
+    ///
+    /// # Errors
+    /// Returns an error if derivation or DER encoding fails.
+    pub fn rekor_public_key_spki(&self) -> Result<Vec<u8>, Error> {
+        self.rekor_key()?
+            .verifying_key()
+            .to_public_key_der()
+            .map(|document| document.as_bytes().to_vec())
+            .map_err(|_| Error::PublicKey)
+    }
+
+    /// Prepare an exact Rekor v1 submission over SHA-512 of a complete signed document.
+    ///
+    /// Derives a purpose-separated Ed25519ph key for this operation and erases it
+    /// on drop. The same signing key and document yield the same submission.
+    /// Persist the signed document and submission before the first POST: ML-DSA
+    /// signing uses randomness, so signing the document again changes its digest.
+    ///
+    /// # Errors
+    /// Rejects oversized documents and derivation, encoding or signing failures.
+    pub fn prepare_rekor_submission(&self, signed_document: &[u8]) -> Result<String, Error> {
+        if signed_document.len() > crate::MAX_INPUT_BYTES {
+            return Err(Error::TooLarge);
+        }
+        let key = self.rekor_key()?;
+        let digest = Sha512::new_with_prefix(signed_document);
+        let signature = key
+            .sign_prehashed(digest.clone(), None)
+            .map_err(|_| Error::Signing)?;
+        let spki = key
+            .verifying_key()
+            .to_public_key_der()
+            .map_err(|_| Error::PublicKey)?;
+        let pem = format!(
+            "-----BEGIN PUBLIC KEY-----\n{}\n-----END PUBLIC KEY-----\n",
+            STANDARD.encode(spki)
+        );
+        crate::canonical_json(&serde_json::json!({
+            "apiVersion":"0.0.1", "kind":"hashedrekord", "spec":{
+                "data":{"hash":{"algorithm":"sha512","value":hex::encode(digest.finalize())}},
+                "signature":{"content":STANDARD.encode(signature.to_bytes()),
+                    "publicKey":{"content":STANDARD.encode(pem)}}
+            }
+        }))
+        .map_err(|_| Error::Signing)
+    }
+
+    fn rekor_key(&self) -> Result<ed25519_dalek::SigningKey, Error> {
+        let mut seed = Zeroizing::new([0; 32]);
+        hkdf::Hkdf::<sha2_v11::Sha512>::new(None, self.seed.as_ref())
+            .expand(b"stogas.rekor.ed25519ph.v1", seed.as_mut())
+            .map_err(|_| Error::Signing)?;
+        Ok(ed25519_dalek::SigningKey::from_bytes(&seed))
     }
 
     /// Sign using fresh per-signature randomness and the supplied protocol context.
@@ -175,42 +235,6 @@ const fn check_context(context: &[u8]) -> Result<(), Error> {
         return Err(Error::Context);
     }
     Ok(())
-}
-
-/// Prepare an exact Rekor v1 submission over SHA-512 of a complete signed document.
-///
-/// Persist the returned public bytes before the first POST so retries reuse the entry.
-/// The temporary Ed25519ph key is discarded; it grants no document-signing authority.
-///
-/// # Errors
-/// Rejects oversized documents, unavailable randomness and encoding/signing failures.
-pub fn prepare_rekor_submission(signed_document: &[u8]) -> Result<String, Error> {
-    if signed_document.len() > crate::MAX_INPUT_BYTES {
-        return Err(Error::TooLarge);
-    }
-    let mut seed = Zeroizing::new([0; 32]);
-    getrandom::fill(&mut *seed).map_err(|_| Error::Randomness)?;
-    let key = ed25519_dalek::SigningKey::from_bytes(&seed);
-    let digest = Sha512::new_with_prefix(signed_document);
-    let signature = key
-        .sign_prehashed(digest.clone(), None)
-        .map_err(|_| Error::Signing)?;
-    let spki = key
-        .verifying_key()
-        .to_public_key_der()
-        .map_err(|_| Error::PublicKey)?;
-    let pem = format!(
-        "-----BEGIN PUBLIC KEY-----\n{}\n-----END PUBLIC KEY-----\n",
-        STANDARD.encode(spki)
-    );
-    crate::canonical_json(&serde_json::json!({
-        "apiVersion":"0.0.1", "kind":"hashedrekord", "spec":{
-            "data":{"hash":{"algorithm":"sha512","value":hex::encode(digest.finalize())}},
-            "signature":{"content":STANDARD.encode(signature.to_bytes()),
-                "publicKey":{"content":STANDARD.encode(pem)}}
-        }
-    }))
-    .map_err(|_| Error::Signing)
 }
 
 #[cfg(test)]

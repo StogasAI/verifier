@@ -89,6 +89,10 @@ test('packaged Worker signs locally and never follows evidence, setup or inferen
 		assert.equal((await get('/core')).code, 'invalid_evidence');
 		assert.deepEqual(await get('/sign'), {
 			erased: true,
+			rejected: true,
+			stable: true,
+			rekorPublicKey: signing.rekor_spki,
+			rekorSignature: Buffer.from(signing.rekor_signature, 'hex').toString('base64'),
 			signatureBytes: 3309,
 			hash: {
 				algorithm: 'sha512',

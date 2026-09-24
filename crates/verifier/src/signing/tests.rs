@@ -12,6 +12,8 @@ struct Vector {
     signature: String,
     context: String,
     context_signature: String,
+    rekor_spki: String,
+    rekor_signature: String,
 }
 
 fn vector() -> Vector {
@@ -34,6 +36,15 @@ fn matches_independent_go_keys_signatures_and_standard_spki() {
         key.public_key()
     );
     assert_eq!(key.public_key_spki().unwrap(), bytes(&v.spki));
+    assert_eq!(key.rekor_public_key_spki().unwrap(), bytes(&v.rekor_spki));
+    let submission: serde_json::Value =
+        serde_json::from_str(&key.prepare_rekor_submission(&bytes(&v.message)).unwrap()).unwrap();
+    assert_eq!(
+        STANDARD
+            .decode(submission["spec"]["signature"]["content"].as_str().unwrap())
+            .unwrap(),
+        bytes(&v.rekor_signature)
+    );
     assert_eq!(
         public_key_from_spki(&bytes(&v.spki)).unwrap(),
         key.public_key()
@@ -152,7 +163,7 @@ fn private_keys_accept_only_unambiguous_seed_encoding() {
 }
 
 #[test]
-fn temporary_rekor_key_signs_only_the_complete_document_digest() {
+fn derived_rekor_key_signs_only_the_complete_document_digest() {
     use ed25519_dalek::{Signature, VerifyingKey, pkcs8::DecodePublicKey as _};
     // Exercise the composition with a real Stogas signature, including the exact
     // initial evidence reference. Logging only the quote or signature would lose
@@ -177,7 +188,9 @@ fn temporary_rekor_key_signs_only_the_complete_document_digest() {
     .unwrap();
     let signed = serde_json::json!({"document": payload, "signature": STANDARD.encode(signature)});
     let document = crate::canonical_json(&signed).unwrap();
-    let prepared = prepare_rekor_submission(document.as_bytes()).unwrap();
+    let prepared = author
+        .prepare_rekor_submission(document.as_bytes())
+        .unwrap();
     let value: serde_json::Value = serde_json::from_str(&prepared).unwrap();
     assert_eq!(value["kind"], "hashedrekord");
     assert_eq!(value["spec"]["data"]["hash"]["algorithm"], "sha512");
@@ -244,13 +257,60 @@ fn temporary_rekor_key_signs_only_the_complete_document_digest() {
                 .is_err()
         );
     }
-    // Preparing again creates another key; publication retries must reuse the saved submission.
+}
+
+#[test]
+fn rekor_identity_is_stable_across_restarts_and_changes_only_with_the_author_key() {
+    let author = SigningKey::from_seed(&[17; SEED_BYTES]);
+    let document = "same signed document";
+    let prepared = author
+        .prepare_rekor_submission(document.as_bytes())
+        .unwrap();
+    let value: serde_json::Value = serde_json::from_str(&prepared).unwrap();
+    // Reopening the same key preserves log identity and exact retry bytes.
+    assert_eq!(
+        prepared,
+        SigningKey::from_seed(&[17; SEED_BYTES])
+            .prepare_rekor_submission(document.as_bytes())
+            .unwrap()
+    );
+    let rotated = SigningKey::from_seed(&[18; SEED_BYTES]);
+    assert_ne!(
+        author.rekor_public_key_spki().unwrap(),
+        rotated.rekor_public_key_spki().unwrap()
+    );
     assert_ne!(
         prepared,
-        prepare_rekor_submission(document.as_bytes()).unwrap()
+        rotated
+            .prepare_rekor_submission(document.as_bytes())
+            .unwrap()
+    );
+    // The submission key must not reuse the ML-DSA seed directly as an Ed25519 seed.
+    let unseparated = ed25519_dalek::SigningKey::from_bytes(&[17; SEED_BYTES]);
+    assert_ne!(
+        author.rekor_public_key_spki().unwrap(),
+        unseparated
+            .verifying_key()
+            .to_public_key_der()
+            .unwrap()
+            .as_bytes()
+    );
+    let next: serde_json::Value = serde_json::from_str(
+        &author
+            .prepare_rekor_submission(b"another signed document")
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        value["spec"]["signature"]["publicKey"],
+        next["spec"]["signature"]["publicKey"]
+    );
+    assert_ne!(
+        value["spec"]["signature"]["content"],
+        next["spec"]["signature"]["content"]
     );
     assert!(matches!(
-        prepare_rekor_submission(&vec![0; crate::MAX_INPUT_BYTES + 1]),
+        author.prepare_rekor_submission(&vec![0; crate::MAX_INPUT_BYTES + 1]),
         Err(Error::TooLarge)
     ));
 }

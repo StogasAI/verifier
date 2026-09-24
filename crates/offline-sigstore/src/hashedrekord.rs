@@ -1,4 +1,4 @@
-//! Rekor v1 hashedrekord: a temporary submission key binds SHA-512 of exact artifact bytes.
+//! Rekor v1 hashedrekord: an expected submission key binds SHA-512 of exact artifact bytes.
 
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use ed25519_dalek::{Signature, VerifyingKey, pkcs8::DecodePublicKey as _};
@@ -89,13 +89,25 @@ struct PublicKey {
     content: String,
 }
 
-pub fn verify(value: &serde_json::Value, artifact: &[u8], now_unix_ms: i64) -> Result<i64, String> {
-    verify_with_root(value, artifact, now_unix_ms, &TrustedRoot::production()?)
+pub fn verify(
+    value: &serde_json::Value,
+    artifact: &[u8],
+    submission_key_spki: &[u8],
+    now_unix_ms: i64,
+) -> Result<i64, String> {
+    verify_with_root(
+        value,
+        artifact,
+        submission_key_spki,
+        now_unix_ms,
+        &TrustedRoot::production()?,
+    )
 }
 
 fn verify_with_root(
     value: &serde_json::Value,
     artifact: &[u8],
+    submission_key_spki: &[u8],
     now_unix_ms: i64,
     root: &TrustedRoot,
 ) -> Result<i64, String> {
@@ -107,11 +119,15 @@ fn verify_with_root(
         return Err("unsupported or ambiguous Rekor document bundle".into());
     }
     let entry = &bundle.verification_material.tlog_entries[0];
-    verify_binding(&bundle, artifact)?;
+    verify_binding(&bundle, artifact, submission_key_spki)?;
     tlog::verify_publication(entry, now_unix_ms.div_euclid(1000), root)
 }
 
-fn verify_binding(bundle: &Bundle, artifact: &[u8]) -> Result<(), String> {
+fn verify_binding(
+    bundle: &Bundle,
+    artifact: &[u8],
+    submission_key_spki: &[u8],
+) -> Result<(), String> {
     let entry = &bundle.verification_material.tlog_entries[0];
     if entry.kind_version.kind != "hashedrekord" || entry.kind_version.version != "0.0.1" {
         return Err("only Rekor hashedrekord v0.0.1 is supported for document inclusion".into());
@@ -134,10 +150,11 @@ fn verify_binding(bundle: &Bundle, artifact: &[u8]) -> Result<(), String> {
     let pem = pem::parse(decode(&body.spec.signature.public_key.content)?)
         .map_err(|_| "invalid Rekor submission public key")?;
     if pem.tag() != "PUBLIC KEY"
+        || pem.contents() != submission_key_spki
         || bundle.verification_material.public_key.hint
             != hex::encode(Sha256::digest(pem.contents()))
     {
-        return Err("Rekor submission key hint differs".into());
+        return Err("Rekor submission key differs from the expected key or hint".into());
     }
     let key = VerifyingKey::from_public_key_der(pem.contents())
         .map_err(|_| "Rekor document profile requires an Ed25519 submission key")?;

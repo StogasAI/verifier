@@ -75,9 +75,18 @@ test('ML-DSA publisher bindings verify independent Go signatures and erase key i
 			rejected++;
 		}
 		const failedErased = malformed.every((byte) => byte === 0);
-		const submission = JSON.parse(api.prepare_rekor_submission(message));
+		privateKey.set(bytes(fixture.pkcs8));
+		const rekorPublicKey = api.rekor_public_key(privateKey);
+		const rekorDerivedErased = privateKey.every((byte) => byte === 0);
+		privateKey.set(bytes(fixture.pkcs8));
+		const submission = JSON.parse(api.prepare_rekor_submission(privateKey, message));
+		const rekorSignedErased = privateKey.every((byte) => byte === 0);
 		return {
 			publicKey: hex(derived),
+			rekorPublicKey: hex(rekorPublicKey),
+			rekorSignature: submission.spec.signature.content,
+			rekorDerivedErased,
+			rekorSignedErased,
 			derivedErased,
 			signedErased,
 			failedErased,
@@ -88,6 +97,10 @@ test('ML-DSA publisher bindings verify independent Go signatures and erase key i
 	}, fixture);
 	expect(result).toEqual({
 		publicKey: fixture.spki,
+		rekorPublicKey: fixture.rekor_spki,
+		rekorSignature: Buffer.from(fixture.rekor_signature, 'hex').toString('base64'),
+		rekorDerivedErased: true,
+		rekorSignedErased: true,
 		derivedErased: true,
 		signedErased: true,
 		failedErased: true,

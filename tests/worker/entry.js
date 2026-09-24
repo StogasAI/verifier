@@ -5,6 +5,7 @@ import { sendSessionRequest } from '../../bindings/shared/channel-http.js';
 import {
 	sign_mldsa65,
 	verify_mldsa65,
+	rekor_public_key,
 	prepare_rekor_submission
 } from '../../pkg/browser/stogas_verifier.js';
 import root from './root.js';
@@ -26,9 +27,30 @@ export default {
 			const privateKey = bytes(signing.pkcs8);
 			const signature = sign_mldsa65(privateKey, message, context);
 			verify_mldsa65(publicKey, message, context, signature);
-			const submission = JSON.parse(prepare_rekor_submission(message));
+			const submissionKey = bytes(signing.pkcs8);
+			const submission = JSON.parse(prepare_rekor_submission(submissionKey, message));
+			const publicInput = bytes(signing.pkcs8);
+			const rekorPublicKey = rekor_public_key(publicInput);
+			const retryKey = bytes(signing.pkcs8);
+			const retry = JSON.parse(prepare_rekor_submission(retryKey, message));
+			const badKey = bytes(signing.pkcs8);
+			badKey[0] ^= 1;
+			let rejected = false;
+			try {
+				prepare_rekor_submission(badKey, message);
+			} catch {
+				rejected = true;
+			}
 			return Response.json({
-				erased: privateKey.every((byte) => byte === 0),
+				erased: [privateKey, submissionKey, publicInput, retryKey, badKey].every((key) =>
+					key.every((byte) => byte === 0)
+				),
+				rejected,
+				stable: JSON.stringify(submission) === JSON.stringify(retry),
+				rekorPublicKey: Array.from(rekorPublicKey, (byte) =>
+					byte.toString(16).padStart(2, '0')
+				).join(''),
+				rekorSignature: submission.spec.signature.content,
 				signatureBytes: signature.length,
 				hash: submission.spec.data.hash
 			});

@@ -6,12 +6,13 @@ use stogas_offline_sigstore::{GithubPolicy, Subject, verify_github_attestation};
 
 const FIXTURE: &[u8] = include_bytes!("../../tests/fixtures/gateway-v0.0.1-attestation.jsonl");
 const NOW_UNIX_MS: i64 = 1_784_246_400_000;
-static DOCUMENT: LazyLock<(Vec<u8>, Vec<u8>)> = LazyLock::new(|| {
+static DOCUMENT: LazyLock<(Vec<u8>, Vec<u8>, Vec<u8>)> = LazyLock::new(|| {
     let fixture: serde_json::Value =
         serde_json::from_str(include_str!("../../tests/fixtures/rekor-document-v1.json")).unwrap();
     (
         serde_json::to_vec(&fixture["bundle"]).unwrap(),
         fixture["artifact"].as_str().unwrap().as_bytes().to_vec(),
+        hex::decode(fixture["submission_key_spki"].as_str().unwrap()).unwrap(),
     )
 });
 
@@ -24,6 +25,7 @@ fuzz_target!(|data: &[u8]| {
         let _ = stogas_offline_sigstore::verify_rekor_document_inclusion(
             &candidate,
             &DOCUMENT.1,
+            &DOCUMENT.2,
             NOW_UNIX_MS,
         );
         return;
@@ -48,7 +50,7 @@ fuzz_target!(|data: &[u8]| {
         require_github_hosted: true,
     };
     let _ = verify_github_attestation(&candidate, &subjects, &policy, NOW_UNIX_MS);
-    let _ = stogas_offline_sigstore::verify_rekor_document_inclusion(&candidate, data, NOW_UNIX_MS);
+    let _ = stogas_offline_sigstore::verify_rekor_document_inclusion(&candidate, data, &DOCUMENT.2, NOW_UNIX_MS);
 });
 
 fn mutate_fixture_or_raw(fixture: &[u8], data: &[u8]) -> Vec<u8> {
