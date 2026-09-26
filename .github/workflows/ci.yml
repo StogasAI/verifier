@@ -321,6 +321,7 @@ jobs:
       - name: Qualify the C HTTP example against the public ABI
         if: matrix.os == 'ubuntu-24.04'
         run: |
+          sudo apt-get update
           sudo apt-get install -y --no-install-recommends libcurl4-openssl-dev libjson-c-dev
           cc -std=c11 -Wall -Wextra -Werror -Iinclude examples/c-http/main.c \
             "target/${{ matrix.target }}/debug/libstogas_verifier_ffi.a" \
@@ -372,7 +373,9 @@ jobs:
           toolchain: 1.97.1
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32
       - run: cargo build --locked --package stogas-verifier-ffi --package stogas --features staging
-      - run: sudo apt-get install -y --no-install-recommends libcurl4-openssl-dev
+      - run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libcurl4-openssl-dev
       - name: Qualify the PHP native bridge and OpenAI client
         run: |
           sudo apt-get install -y --no-install-recommends php-cli php-curl php-xml php-mbstring composer
