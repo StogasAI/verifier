@@ -1,22 +1,25 @@
 use super::*;
-use ed25519_dalek::{Signer, SigningKey, pkcs8::EncodePublicKey};
+use crate::signing::SigningKey;
 use serde_json::json;
 
 fn key(seed: u8) -> (OnlineKey, SigningKey) {
-    let signer = SigningKey::from_bytes(&[seed; 32]);
+    let signer = SigningKey::from_seed(&[seed; 32]);
     (
         OnlineKey {
             key_id: format!("key-{seed}"),
-            public_key: STANDARD.encode(
-                signer
-                    .verifying_key()
-                    .to_public_key_der()
-                    .unwrap()
-                    .as_bytes(),
-            ),
+            public_key: STANDARD.encode(signer.public_key_spki().unwrap()),
+            rekor_public_key: STANDARD.encode(signer.rekor_public_key_spki().unwrap()),
         },
         signer,
     )
+}
+
+fn root(seed: u8) -> RootKey {
+    let key = key(seed).0;
+    RootKey {
+        key_id: key.key_id,
+        public_key: key.public_key,
+    }
 }
 
 fn keys(generation: u64, seed: u8, retired: &[u8]) -> KeyManifest {
@@ -26,6 +29,7 @@ fn keys(generation: u64, seed: u8, retired: &[u8]) -> KeyManifest {
         schema: KEY_MANIFEST_SCHEMA.into(),
         environment: Environment::Production,
         generation,
+        expires_at: "2100-01-01T00:00:00Z".into(),
         active_key: key(seed).0,
         retired_keys,
     }
@@ -45,6 +49,7 @@ fn signed(keys: &KeyManifest, revision: u64, seed: u8) -> SignedApprovalManifest
     SignedApprovalManifest {
         manifest,
         signature,
+        inclusion: Value::Null,
     }
 }
 
@@ -54,12 +59,12 @@ fn sign(document: &Value, seed: u8) -> StogasSignature {
     payload.extend_from_slice(&canonical_payload(document).unwrap());
     StogasSignature {
         key_id: key.key_id,
-        signature: URL_SAFE_NO_PAD.encode(signer.sign(&payload).to_bytes()),
+        signature: URL_SAFE_NO_PAD.encode(signer.sign(&payload, &[]).unwrap()),
     }
 }
 
 // Exercises decision installation independently of Rekor's existing cryptographic test suite.
-// Production candidates can only be constructed after verify_candidate checks root DSSE + inclusion.
+// Production candidates can only be constructed after verify_candidate checks root ML-DSA signature + inclusion.
 fn candidate(
     verifier: &ApprovalVerifier,
     generation: u64,
@@ -74,7 +79,7 @@ fn candidate(
 }
 
 fn verifier() -> ApprovalVerifier {
-    ApprovalVerifier::new(Environment::Production, key(1).0).unwrap()
+    ApprovalVerifier::new(Environment::Production, root(1)).unwrap()
 }
 
 #[cfg(feature = "staging")]
@@ -84,7 +89,7 @@ fn actual_logged_root_manifest_verifies_and_rejects_substituted_material() {
         "../../../../tests/fixtures/logged-key-manifest.json"
     ))
     .unwrap();
-    let root: OnlineKey = serde_json::from_value(vector["root"].clone()).unwrap();
+    let root: RootKey = serde_json::from_value(vector["root"].clone()).unwrap();
     let mut verifier = ApprovalVerifier::new(Environment::Staging, root).unwrap();
     let now = vector["verified_at_ms"].as_i64().unwrap();
     let keys = serde_json::to_vec(&vector["keys"]).unwrap();
@@ -94,13 +99,13 @@ fn actual_logged_root_manifest_verifies_and_rejects_substituted_material() {
     verifier.accept(candidate).unwrap();
     for pointer in [
         "/manifest/active_key/public_key",
-        "/sigstore/dsseEnvelope/payload",
-        "/sigstore/dsseEnvelope/signatures/0/sig",
-        "/sigstore/verificationMaterial/publicKey/hint",
-        "/sigstore/verificationMaterial/tlogEntries/0/canonicalizedBody",
-        "/sigstore/verificationMaterial/tlogEntries/0/inclusionPromise/signedEntryTimestamp",
-        "/sigstore/verificationMaterial/tlogEntries/0/inclusionProof/rootHash",
-        "/sigstore/verificationMaterial/tlogEntries/0/inclusionProof/checkpoint/envelope",
+        "/manifest/active_key/rekor_public_key",
+        "/signature/signature",
+        "/inclusion/verificationMaterial/publicKey/hint",
+        "/inclusion/verificationMaterial/tlogEntries/0/canonicalizedBody",
+        "/inclusion/verificationMaterial/tlogEntries/0/inclusionPromise/signedEntryTimestamp",
+        "/inclusion/verificationMaterial/tlogEntries/0/inclusionProof/rootHash",
+        "/inclusion/verificationMaterial/tlogEntries/0/inclusionProof/checkpoint/envelope",
     ] {
         let mut changed = vector["keys"].clone();
         *changed.pointer_mut(pointer).unwrap() = Value::String("invalid".into());
@@ -123,7 +128,7 @@ fn typescript_publisher_vector_verifies_without_representation_changes() {
     let keys: KeyManifest = serde_json::from_value(vector["key_manifest"].clone()).unwrap();
     let approval: SignedApprovalManifest =
         serde_json::from_value(vector["approval"].clone()).unwrap();
-    validate_keys(&keys, Environment::Production, &key(1).0).unwrap();
+    validate_keys(&keys, Environment::Production, &root(1)).unwrap();
     assert_eq!(
         payload_sha256(&keys).unwrap(),
         vector["key_manifest_sha256"]
@@ -169,6 +174,56 @@ fn rotations_keep_current_releases_and_supersede_compromised_max_revision() {
     verifier.accept(rotated).unwrap();
     assert_eq!(verifier.accept(original).unwrap_err(), Error::Rollback);
     assert_eq!(verifier.accepted().unwrap().keys().generation, 2);
+}
+
+#[test]
+fn root_expiry_bounds_online_updates_and_renewal_preserves_the_same_signer() {
+    let mut verifier = verifier();
+    let original = candidate(&verifier, 1, 1, 2, &[]);
+    let deadline = original.keys.expiry_unix_ms().unwrap();
+    assert_eq!(original.valid_until(deadline - 1).unwrap(), deadline);
+    assert_eq!(original.valid_until(deadline), Err(Error::Expired));
+    assert_eq!(original.valid_until(deadline + 1), Err(Error::Expired));
+    let online_update = candidate(&verifier, 1, MAX_REVISION, 2, &[]);
+    assert_eq!(online_update.valid_until(deadline), Err(Error::Expired));
+    verifier.accept(original.clone()).unwrap();
+
+    let mut renewed_keys = original.keys.clone();
+    renewed_keys.expires_at = "2100-02-01T00:00:00Z".into();
+    let approval = signed(&renewed_keys, 1, 2);
+    let conflict =
+        verify_online_approval(verifier.authority, renewed_keys.clone(), approval).unwrap();
+    assert_eq!(verifier.accept(conflict).unwrap_err(), Error::Equivocation);
+
+    renewed_keys.generation += 1;
+    let approval = signed(&renewed_keys, 1, 2);
+    let renewed = verify_online_approval(verifier.authority, renewed_keys, approval).unwrap();
+    renewed.valid_until(deadline).unwrap();
+    assert_eq!(renewed.keys.active_key, original.keys.active_key);
+    assert_eq!(renewed.approvals.gateways, original.approvals.gateways);
+    verifier.accept(renewed).unwrap();
+    assert_eq!(verifier.accept(original).unwrap_err(), Error::Rollback);
+}
+
+#[test]
+fn root_expiry_has_one_unambiguous_timestamp_representation() {
+    let root = root(1);
+    for expiry in [
+        "",
+        "2100-01-01",
+        "2100-01-01T00:00:00.000Z",
+        "2100-01-01T00:00:00+00:00",
+        "2100-01-01T00:00:00+01:00",
+        "2100-02-30T00:00:00Z",
+        "2100-01-01T00:00:60Z",
+    ] {
+        let mut manifest = keys(1, 2, &[]);
+        manifest.expires_at = expiry.into();
+        assert!(
+            validate_keys(&manifest, Environment::Production, &root).is_err(),
+            "{expiry}"
+        );
+    }
 }
 
 #[test]
@@ -262,8 +317,11 @@ fn signatures_are_bound_to_active_key_payload_purpose_and_delegation() {
     wrong_purpose.signature.signature = URL_SAFE_NO_PAD.encode(
         key(3)
             .1
-            .sign(&canonical_payload(&serde_json::to_value(&valid.manifest).unwrap()).unwrap())
-            .to_bytes(),
+            .sign(
+                &canonical_payload(&serde_json::to_value(&valid.manifest).unwrap()).unwrap(),
+                &[],
+            )
+            .unwrap(),
     );
     assert_eq!(
         verify_online_approval([0; 32], keys, wrong_purpose).unwrap_err(),
@@ -273,7 +331,7 @@ fn signatures_are_bound_to_active_key_payload_purpose_and_delegation() {
 
 #[test]
 fn manifests_reject_ambiguous_ids_keys_versions_and_counters() {
-    let root = key(1).0;
+    let root = root(1);
     for generation in [0, MAX_REVISION + 1, u64::MAX] {
         assert!(validate_keys(&keys(generation, 2, &[]), Environment::Production, &root).is_err());
     }
@@ -293,7 +351,7 @@ fn manifests_reject_ambiguous_ids_keys_versions_and_counters() {
     for id in ["", "a b", "../key", "é", &"a".repeat(129)] {
         let mut invalid_key = key(2).0;
         invalid_key.key_id = id.into();
-        assert!(decode_key(&invalid_key).is_err());
+        assert!(decode_key(&invalid_key.key_id, &invalid_key.public_key).is_err());
     }
     let keys = keys(1, 2, &[]);
     for revision in [0, MAX_REVISION + 1, u64::MAX] {
@@ -317,8 +375,9 @@ fn root_inclusion_is_mandatory_and_failure_never_advances_state() {
     let mut verifier = verifier();
     verifier.accept(candidate(&verifier, 1, 1, 2, &[])).unwrap();
     let keys = SignedKeyManifest {
+        signature: sign(&serde_json::to_value(keys(2, 3, &[2])).unwrap(), 1),
         manifest: keys(2, 3, &[2]),
-        sigstore: json!({}),
+        inclusion: json!({}),
     };
     let signed = signed(&keys.manifest, 1, 3);
     let error = verifier
@@ -336,8 +395,9 @@ fn root_inclusion_is_mandatory_and_failure_never_advances_state() {
 fn strict_boundary_rejects_unknown_duplicate_trailing_and_oversized_inputs() {
     let verifier = verifier();
     let keys = SignedKeyManifest {
+        signature: sign(&serde_json::to_value(keys(1, 2, &[])).unwrap(), 1),
         manifest: keys(1, 2, &[]),
-        sigstore: json!({}),
+        inclusion: json!({}),
     };
     let signed = signed(&keys.manifest, 1, 2);
     let valid = serde_json::to_string(&keys).unwrap();
@@ -364,7 +424,7 @@ fn strict_boundary_rejects_unknown_duplicate_trailing_and_oversized_inputs() {
 #[test]
 fn a_candidate_from_another_root_cannot_be_installed() {
     let mut verifier = verifier();
-    let other = ApprovalVerifier::new(Environment::Production, key(5).0).unwrap();
+    let other = ApprovalVerifier::new(Environment::Production, root(5)).unwrap();
     assert_eq!(
         verifier
             .accept(candidate(&other, 1, 1, 2, &[]))
@@ -414,7 +474,7 @@ fn approved_artifacts(
     approval.manifest.gateways = vec![payload_sha256(&gateway.manifest).unwrap()];
     approval.manifest.catalogs = vec![payload_sha256(&catalog.manifest).unwrap()];
     approval.signature = sign(&serde_json::to_value(&approval.manifest).unwrap(), seed);
-    let authority = ApprovalVerifier::new(environment, key(1).0).unwrap();
+    let authority = ApprovalVerifier::new(environment, root(1)).unwrap();
     let verified = verify_online_approval(authority.authority, keys, approval).unwrap();
     (verified, gateway, catalog)
 }
@@ -529,7 +589,7 @@ fn environments_are_signed_and_cannot_share_candidates() {
         verify_online_approval(verifier.authority, manifest, signed).unwrap_err(),
         Error::Authority
     );
-    let mut staging = ApprovalVerifier::new(Environment::Staging, key(1).0).unwrap();
+    let mut staging = ApprovalVerifier::new(Environment::Staging, root(1)).unwrap();
     assert_eq!(
         staging
             .accept(candidate(&verifier, 1, 1, 2, &[]))
@@ -549,7 +609,7 @@ fn production_build_cannot_parse_staging_authorization() {
 fn compiled_staging_root_verifies_actual_logged_operational_delegation() {
     let bytes = include_bytes!("../../../../tests/fixtures/staging-key-manifest.json");
     let value: serde_json::Value = serde_json::from_slice(bytes).unwrap();
-    let now = value["sigstore"]["verificationMaterial"]["tlogEntries"][0]["integratedTime"]
+    let now = value["inclusion"]["verificationMaterial"]["tlogEntries"][0]["integratedTime"]
         .as_str()
         .unwrap()
         .parse::<i64>()
@@ -558,7 +618,7 @@ fn compiled_staging_root_verifies_actual_logged_operational_delegation() {
         + 1000;
     let verifier = crate::evidence::Verifier::stogas(Environment::Staging).unwrap();
     let keys = verifier.verify_key_manifest(bytes, now).unwrap();
-    assert_eq!(keys.active_key.key_id, "stogas-ed25519-staging-v1");
+    assert_eq!(keys.active_key.key_id, "staging-stogas-online-2026-09");
     assert_eq!(keys.generation, 1);
     assert!(keys.retired_keys.is_empty());
     let mut changed = value;

@@ -7,7 +7,7 @@ use std::{
     sync::{Arc, Mutex},
 };
 use stogas_verifier::{
-    approvals::{Environment, OnlineKey},
+    approvals::{Environment, RootKey},
     evidence,
 };
 
@@ -29,7 +29,7 @@ pub struct StogasEvidenceSnapshot {
 struct Configuration {
     environment: Environment,
     /// A caller-owned offline trust seed; never read from downloaded evidence.
-    root: Option<OnlineKey>,
+    root: Option<RootKey>,
 }
 
 /// Construct an offline evidence verifier. Omitting `root` selects the compiled Stogas root.

@@ -7,7 +7,6 @@ use axum::{
     routing::get,
 };
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
-use ed25519_dalek::{Signer as _, SigningKey};
 use serde_json::{Value, json};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -85,14 +84,14 @@ impl Server {
         }
     }
 
-    fn client(&self, root: OnlineKey) -> EvidenceClient {
+    fn client(&self, root: RootKey) -> EvidenceClient {
         let mut client = EvidenceClient::new(Environment::Staging, root).unwrap();
         client.origins.clone_from(&self.origins);
         client
     }
 }
 
-fn fixture() -> (OnlineKey, Value) {
+fn fixture() -> (RootKey, Value) {
     let fixture: Value = serde_json::from_str(include_str!(
         "../../../../tests/fixtures/current-evidence-v1.json"
     ))
@@ -104,15 +103,15 @@ fn fixture() -> (OnlineKey, Value) {
 }
 
 fn signed(mut body: Value) -> Vec<u8> {
-    let approval = &body["approvals"]["manifest"];
-    // This manifest has only ASCII field names and scalar/array values.
-    let sorted: std::collections::BTreeMap<String, Value> =
-        serde_json::from_value(approval.clone()).unwrap();
-    let canonical = serde_json::to_vec(&sorted).unwrap();
-    let mut message = b"stogas signed document v1\n".to_vec();
-    message.extend_from_slice(&canonical);
-    body["approvals"]["signature"]["signature"] =
-        json!(URL_SAFE_NO_PAD.encode(SigningKey::from_bytes(&[242; 32]).sign(&message).to_bytes()));
+    let variants: Value = serde_json::from_str(include_str!(
+        "../../../../tests/fixtures/logged-approval-variants.json"
+    ))
+    .unwrap();
+    let digest =
+        stogas_verifier::approvals::payload_sha256(&body["approvals"]["manifest"]).unwrap();
+    if let Some(approval) = variants["approvals"].get(&digest) {
+        body["approvals"] = approval.clone();
+    }
     serde_json::to_vec(&json!({"schema":"stogas.confidential-bundle-envelope.v1", "body_sha256":stogas_verifier::approvals::payload_sha256(&body).unwrap(),"body":body})).unwrap()
 }
 
@@ -402,9 +401,17 @@ async fn native_pool_never_assigns_an_unattested_connection() {
 }
 
 fn unattested_peer() -> tokio_rustls::TlsAcceptor {
-    use rustls::{ServerConfig, pki_types::PrivatePkcs8KeyDer};
+    use rustls::{
+        ServerConfig,
+        pki_types::{CertificateDer, PrivatePkcs8KeyDer},
+    };
     use tokio_rustls::TlsAcceptor;
-    let cert = rcgen::generate_simple_self_signed(vec!["api.example.test".into()]).unwrap();
+    let cert: Value = serde_json::from_str(include_str!(
+        "../../../../tests/fixtures/native-certificate-v1.json"
+    ))
+    .unwrap();
+    let signer: Value =
+        serde_json::from_str(include_str!("../../../../tests/fixtures/mldsa65-v1.json")).unwrap();
     let mut provider = rustls::crypto::aws_lc_rs::default_provider();
     provider.kx_groups = vec![rustls::crypto::aws_lc_rs::kx_group::X25519MLKEM768];
     let mut config = ServerConfig::builder_with_provider(Arc::new(provider))
@@ -412,8 +419,13 @@ fn unattested_peer() -> tokio_rustls::TlsAcceptor {
         .unwrap()
         .with_no_client_auth()
         .with_single_cert(
-            vec![cert.cert.der().clone()],
-            PrivatePkcs8KeyDer::from(cert.signing_key.serialize_der()).into(),
+            vec![CertificateDer::from(
+                URL_SAFE_NO_PAD
+                    .decode(cert["certificate"].as_str().unwrap())
+                    .unwrap(),
+            )],
+            PrivatePkcs8KeyDer::from(hex::decode(signer["pkcs8"].as_str().unwrap()).unwrap())
+                .into(),
         )
         .unwrap();
     config.alpn_protocols = vec![b"h2".to_vec()];
@@ -479,34 +491,10 @@ async fn warm_appraisal_reuses_context_and_rotation_preserves_inflight_snapshot(
     assert!(Arc::ptr_eq(&original, &reused));
     drop(occupied_cpu);
 
-    let rotation: Value = serde_json::from_str(include_str!(
-        "../../../../tests/fixtures/logged-key-rotation.json"
+    let bundle: Value = serde_json::from_str(include_str!(
+        "../../../../tests/fixtures/hardware-session-rotated-v1.json"
     ))
     .unwrap();
-    let mut body = fixture["bundle"]["body"].clone();
-    body["keys"] = rotation["keys"].clone();
-    body["hardware_policy"] = rotation["hardware_policy"].clone();
-    body["approvals"]["manifest"]["key_manifest_sha256"] =
-        json!(stogas_verifier::approvals::payload_sha256(&body["keys"]["manifest"]).unwrap());
-    let sign = |manifest: &Value| {
-        let canonical = serde_json::to_vec(manifest).unwrap();
-        let message = [
-            b"stogas signed document v1\n".as_slice(),
-            canonical.as_slice(),
-        ]
-        .concat();
-        json!({"key_id":"stogas-fixture-online-20260921", "signature": URL_SAFE_NO_PAD.encode(
-            SigningKey::from_bytes(&[243; 32]).sign(&message).to_bytes()
-        )})
-    };
-    for kind in ["allowed_igvms", "catalogs"] {
-        for artifact in body[kind].as_array_mut().unwrap() {
-            artifact["signature"] = sign(&artifact["manifest"]);
-        }
-    }
-    body["approvals"]["signature"] = sign(&body["approvals"]["manifest"]);
-    let bundle = json!({"schema":"stogas.confidential-bundle-envelope.v1",
-        "body_sha256":stogas_verifier::approvals::payload_sha256(&body).unwrap(), "body":body});
     *server.state.replies.write().unwrap() = [
         reply(serde_json::to_vec(&bundle).unwrap(), "\"rotation\""),
         reply(vec![], "\"unused\""),
@@ -536,7 +524,14 @@ async fn warm_appraisal_reuses_context_and_rotation_preserves_inflight_snapshot(
 #[tokio::test]
 async fn warm_rejection_preserves_cause_and_old_requests_without_reusing_stale_approval() {
     let fixture = hardware_fixture();
-    let now = fixture["verified_at_ms"].as_i64().unwrap();
+    let variants: Value = serde_json::from_str(include_str!(
+        "../../../../tests/fixtures/logged-approval-variants.json"
+    ))
+    .unwrap();
+    let now = fixture["verified_at_ms"]
+        .as_i64()
+        .unwrap()
+        .max(variants["verified_at_ms"].as_i64().unwrap());
     let server = Server::new([
         reply(
             serde_json::to_vec(&fixture["bundle"]).unwrap(),

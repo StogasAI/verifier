@@ -130,6 +130,21 @@ fn certificate_boundary_rejects_missing_extensions_and_trailing_der() {
     der.push(0);
     assert!(ParsedNativeCertificate::parse(&der).is_err());
     der.pop();
+    // Keep the DER framing and key bytes unchanged while substituting the
+    // ML-DSA parameter set. Native attestation accepts only ML-DSA-65.
+    let oid65 = [0x60, 0x86, 0x48, 1, 0x65, 3, 4, 3, 0x12];
+    let (_, certificate) = parse_x509_certificate(&der).unwrap();
+    let spki = certificate.public_key().raw;
+    let spki_at = der.windows(spki.len()).position(|v| v == spki).unwrap();
+    let algorithm_at = spki.windows(oid65.len()).position(|v| v == oid65).unwrap();
+    for other_parameter_set in [0x11, 0x13] {
+        let mut changed = der.clone();
+        changed[spki_at + algorithm_at + oid65.len() - 1] = other_parameter_set;
+        assert!(matches!(
+            ParsedNativeCertificate::parse(&changed),
+            Err(Error::Certificate)
+        ));
+    }
     // The OID's DER body; alter the extension ID without changing certificate shape.
     let oid = [0x2b, 6, 1, 5, 5, 7, 1, 35];
     let at = der.windows(oid.len()).position(|v| v == oid).unwrap();

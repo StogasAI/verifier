@@ -1,7 +1,6 @@
 //! One signature over exact content hashes and the canonical Stogas metadata bag.
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
-use ed25519_dalek::{Signature, VerifyingKey};
 use serde::{Deserialize, Serialize};
 
 use crate::evidence::boot::VerifiedBoot;
@@ -9,9 +8,9 @@ use crate::evidence::boot::VerifiedBoot;
 pub(crate) mod http;
 
 pub const SCHEMA: &str = "stogas.receipt.v1";
-pub const MAX_BYTES: usize = 512;
-pub const MAX_METADATA_BYTES: usize = 8 * 1024;
-pub const MAX_BUFFERED_BYTES: usize = 64 * 1024 * 1024 + 8 * 1024 + 16;
+pub const MAX_BYTES: usize = 5 * 1024;
+pub const MAX_METADATA_BYTES: usize = 16 * 1024;
+pub const MAX_BUFFERED_BYTES: usize = 64 * 1024 * 1024 + MAX_METADATA_BYTES + 16;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -69,7 +68,7 @@ impl Receipt {
         metadata: &serde_json::Value,
     ) -> Result<VerifiedReceipt, Error> {
         self.verify_key(
-            &boot.record().report_data.ed25519_public_key,
+            &boot.record().report_data.signing_public_key,
             boot.document_sha256(),
             request,
             response,
@@ -102,20 +101,18 @@ impl Receipt {
         {
             return Err(Error::Content);
         }
-        let key: [u8; 32] = decode(public_key)?
-            .try_into()
-            .map_err(|_| Error::Identity)?;
-        let key = VerifyingKey::from_bytes(&key).map_err(|_| Error::Identity)?;
-        let signature =
-            Signature::from_slice(&decode(&self.signature)?).map_err(|_| Error::Signature)?;
+        let key = decode(public_key)?;
+        if key.len() != crate::signing::PUBLIC_KEY_BYTES {
+            return Err(Error::Identity);
+        }
+        let signature = decode(&self.signature)?;
         let mut message = Vec::with_capacity(SCHEMA.len() + 1 + 96);
         message.extend_from_slice(SCHEMA.as_bytes());
         message.push(0);
         message.extend_from_slice(request);
         message.extend_from_slice(response);
         message.extend_from_slice(metadata);
-        key.verify_strict(&message, &signature)
-            .map_err(|_| Error::Signature)
+        crate::signing::verify(&key, &message, &[], &signature).map_err(|_| Error::Signature)
     }
 }
 
@@ -349,7 +346,7 @@ mod tests {
 #[cfg(all(test, feature = "staging"))]
 mod http_tests {
     use super::*;
-    use ed25519_dalek::{Signer as _, SigningKey};
+    use crate::signing::SigningKey;
     use serde_json::{Value, json};
     use sha2::{Digest as _, Sha256};
 
@@ -385,15 +382,15 @@ mod http_tests {
         let digest = metadata_digest(&json!({"billed_cost_usd":"0.01"})).unwrap();
         let message = [SCHEMA.as_bytes(), b"\0", &request, &response, &digest].concat();
         // Public deterministic key used only by the isolated diagnostic fixture.
-        let key = SigningKey::from_bytes(&[42; 32]);
+        let key = SigningKey::from_seed(&[42; 32]);
         assert_eq!(
-            URL_SAFE_NO_PAD.encode(key.verifying_key().as_bytes()),
-            boot.record().report_data.ed25519_public_key
+            URL_SAFE_NO_PAD.encode(key.public_key()),
+            boot.record().report_data.signing_public_key
         );
         json!({"receipt": {
             "schema":SCHEMA, "boot_sha256":hex::encode(boot.document_sha256()),
             "request_sha256":hex::encode(request), "response_sha256":hex::encode(response),
-            "signature":URL_SAFE_NO_PAD.encode(key.sign(&message).to_bytes())
+            "signature":URL_SAFE_NO_PAD.encode(key.sign(&message, &[]).unwrap())
         }, "billed_cost_usd":"0.01"})
     }
     #[test]
@@ -443,13 +440,22 @@ mod http_tests {
             ]
             .concat();
             let wire = [keepalive.as_slice(), event, keepalive, &comment, terminal].concat();
+            let response = Sha256::digest([event.as_slice(), terminal].concat());
+            let metadata_bytes = serde_json::to_vec(&bag).unwrap();
             for split in 0..=wire.len() {
                 let mut stream = Stream::new(request);
                 let mut returned = stream.push(&wire[..split]).unwrap().concat();
                 returned.extend(stream.push(&wire[split..]).unwrap().concat());
                 assert_eq!(returned, wire[..wire.len() - 2]);
-                stream.finish(peer.boot()).unwrap();
+                // Every split must produce the same signed bytes. Repeating ML-DSA
+                // verification for each byte boundary adds no cryptographic coverage.
+                let (actual_metadata, actual_response) = stream.body.finish().unwrap();
+                assert_eq!(actual_metadata, metadata_bytes);
+                assert_eq!(actual_response.as_slice(), response.as_slice());
             }
+            let mut stream = Stream::new(request);
+            stream.push(&wire).unwrap();
+            stream.finish(peer.boot()).unwrap();
             for injected in [
                 b": STOGAS PROCESSING\ndata: injected\n\n".as_slice(),
                 b": unrelated\ndata: injected\n\n",

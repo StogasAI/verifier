@@ -105,14 +105,14 @@ mod tests {
             ("/evidence_sha256", json!("0".repeat(64))),
             ("/boot/report_data/tls_spki_sha256", json!("0".repeat(64))),
             (
-                "/inclusion/verificationMaterial/tlogEntries/0/integratedTime",
+                "/inclusion/rekor/verificationMaterial/tlogEntries/0/integratedTime",
                 json!("1"),
             ),
             (
-                "/inclusion/verificationMaterial/tlogEntries/0/inclusionProof/rootHash",
+                "/inclusion/rekor/verificationMaterial/tlogEntries/0/inclusionProof/rootHash",
                 json!("AAAA"),
             ),
-            ("/inclusion/dsseEnvelope/signatures/0/sig", json!("AAAA")),
+            ("/inclusion/signature/signature", json!("AAAA")),
         ] {
             let mut changed = archive.clone();
             *changed.pointer_mut(pointer).unwrap() = replacement;
@@ -200,7 +200,7 @@ impl Verifier {
             crate::strict_json::from_slice(archive).map_err(super::invalid)?,
         )
         .map_err(super::invalid)?;
-        let entries = archive.inclusion["verificationMaterial"]["tlogEntries"]
+        let entries = archive.inclusion["rekor"]["verificationMaterial"]["tlogEntries"]
             .as_array()
             .filter(|entries| entries.len() == 1)
             .ok_or_else(|| super::invalid("boot archive requires one log entry"))?;
@@ -213,7 +213,10 @@ impl Verifier {
             .filter(|value| *value > 0 && *value <= now_unix_ms)
             .ok_or_else(|| super::invalid("invalid boot archive log time"))?;
         let snapshot = self.historical_verifier()?.refresh(evidence, at)?;
-        if snapshot.body_sha256() != archive.evidence_sha256 {
+        if snapshot.body_sha256() != archive.evidence_sha256
+            || archive.inclusion["evidence_sha256"].as_str()
+                != Some(archive.evidence_sha256.as_str())
+        {
             return Err(super::invalid("boot archive evidence digest differs"));
         }
         let document = crate::canonical_json(&archive.boot).map_err(super::invalid)?;

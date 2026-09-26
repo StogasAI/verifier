@@ -4,7 +4,7 @@
 use super::BatchProof;
 use thiserror::Error;
 
-pub const MAX_EVIDENCE_BYTES: usize = 60 * 1024;
+pub const MAX_EVIDENCE_BYTES: usize = 58 * 1024;
 pub(super) const REPORT_BYTES: usize = 1184;
 
 #[derive(Debug, Error)]

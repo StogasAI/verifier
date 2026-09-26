@@ -27,7 +27,7 @@ type BootIdentity struct {
 	ReportedTCB          string `json:"reported_tcb"`
 	BootSHA256           string `json:"boot_sha256"`
 	GatewayReleaseID     string `json:"gateway_release_id"`
-	Ed25519PublicKey     string `json:"ed25519_public_key"`
+	SigningPublicKey     string `json:"signing_public_key"`
 	HPKEPublicKey        string `json:"hpke_public_key"`
 	TLSSPKISHA256        string `json:"tls_spki_sha256"`
 	ValidFromUnixMS      int64  `json:"valid_from_unix_ms"`

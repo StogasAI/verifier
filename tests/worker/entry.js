@@ -5,8 +5,8 @@ import { sendSessionRequest } from '../../bindings/shared/channel-http.js';
 import {
 	sign_mldsa65,
 	verify_mldsa65,
-	rekor_public_key,
-	prepare_rekor_submission
+	rekor_public_key_from_seed,
+	prepare_rekor_submission_with_seed
 } from '../../pkg/browser/stogas_verifier.js';
 import root from './root.js';
 import signing from './signing.js';
@@ -27,17 +27,16 @@ export default {
 			const privateKey = bytes(signing.pkcs8);
 			const signature = sign_mldsa65(privateKey, message, context);
 			verify_mldsa65(publicKey, message, context, signature);
-			const submissionKey = bytes(signing.pkcs8);
-			const submission = JSON.parse(prepare_rekor_submission(submissionKey, message));
-			const publicInput = bytes(signing.pkcs8);
-			const rekorPublicKey = rekor_public_key(publicInput);
-			const retryKey = bytes(signing.pkcs8);
-			const retry = JSON.parse(prepare_rekor_submission(retryKey, message));
-			const badKey = bytes(signing.pkcs8);
-			badKey[0] ^= 1;
+			const submissionKey = bytes(signing.rekor_seed);
+			const submission = JSON.parse(prepare_rekor_submission_with_seed(submissionKey, message));
+			const publicInput = bytes(signing.rekor_seed);
+			const rekorPublicKey = rekor_public_key_from_seed(publicInput);
+			const retryKey = bytes(signing.rekor_seed);
+			const retry = JSON.parse(prepare_rekor_submission_with_seed(retryKey, message));
+			const badKey = new Uint8Array(31).fill(42);
 			let rejected = false;
 			try {
-				prepare_rekor_submission(badKey, message);
+				prepare_rekor_submission_with_seed(badKey, message);
 			} catch {
 				rejected = true;
 			}

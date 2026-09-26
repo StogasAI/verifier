@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use serde_json::json;
 use stogas_verifier::{
-    approvals::OnlineKey,
+    approvals::RootKey,
     evidence::{self, Snapshot},
 };
 use wasm_bindgen::prelude::*;
@@ -17,11 +17,13 @@ pub fn verify_certificate_renewal(
     node_id: &str,
     public_key: &[u8],
 ) -> Result<(), JsValue> {
-    let key = public_key
-        .try_into()
-        .map_err(|_| js_sys::Error::new("node key must be 32 bytes"))?;
-    evidence::boot::verify_certificate_renewal(request, node_id, key, super::wall_clock_ms()?)
-        .map_err(|error| verification_error(&error))
+    evidence::boot::verify_certificate_renewal(
+        request,
+        node_id,
+        public_key,
+        super::wall_clock_ms()?,
+    )
+    .map_err(|error| verification_error(&error))
 }
 
 /// Environment endpoints compiled into this artifact. Unsupported environments fail closed.
@@ -114,7 +116,7 @@ impl EvidenceVerifier {
             .map_err(|_| js_sys::Error::new("unsupported verification environment"))?;
         let core = evidence::Verifier::new(
             environment,
-            OnlineKey {
+            RootKey {
                 key_id: root_key_id,
                 public_key: root_public_key,
             },
@@ -162,11 +164,16 @@ impl EvidenceSnapshot {
     }
 
     /// # Errors
-    /// Rejects a root decision superseded or conflicted by an authenticated refresh.
+    /// Rejects an expired root decision or one superseded by an authenticated refresh.
     pub fn require_current_keys(&self) -> Result<(), JsValue> {
         self.core
             .require_current_keys()
-            .map_err(|error| verification_error(&error))
+            .map_err(|error| verification_error(&error))?;
+        self.core
+            .approvals()
+            .valid_until(super::wall_clock_ms()?)
+            .map_err(|error| verification_error(&evidence::Error::from(error)))?;
+        Ok(())
     }
 
     /// # Errors

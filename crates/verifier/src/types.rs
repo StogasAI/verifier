@@ -6,7 +6,8 @@ use std::collections::BTreeMap;
 #[serde(deny_unknown_fields)]
 pub struct SignedHardwarePolicy {
     pub policy: HardwarePolicy,
-    pub sigstore: Value,
+    pub signature: StogasSignature,
+    pub inclusion: Value,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]

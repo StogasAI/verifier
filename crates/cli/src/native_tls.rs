@@ -180,16 +180,6 @@ where
         return Err(Error::Verification(Arc::clone(error)));
     }
     let stream = result?;
-    handshake
-        .verifier
-        .snapshot
-        .require_current_keys()
-        .map_err(|reason| {
-            Error::Verification(Arc::new(VerificationFailure {
-                reason,
-                certificate: None,
-            }))
-        })?;
     let tls = &stream.get_ref().1;
     if tls.protocol_version() != Some(ProtocolVersion::TLSv1_3)
         || tls
@@ -204,6 +194,16 @@ where
     let session = appraised
         .ok_or(Error::State)?
         .map_err(Error::Verification)?;
+    handshake
+        .verifier
+        .snapshot
+        .check_session(&session, evidence_client::wall_clock_ms()?)
+        .map_err(|reason| {
+            Error::Verification(Arc::new(VerificationFailure {
+                reason,
+                certificate: None,
+            }))
+        })?;
     Ok(Connection {
         stream,
         session,
@@ -311,6 +311,9 @@ impl ServerCertVerifier for CertificateVerifier {
         cert: &CertificateDer<'_>,
         dss: &DigitallySignedStruct,
     ) -> Result<HandshakeSignatureValid, TlsError> {
+        if dss.scheme != SignatureScheme::ML_DSA_65 {
+            return Err(TlsError::General("attested TLS requires ML-DSA-65".into()));
+        }
         rustls::crypto::verify_tls13_signature(
             message,
             cert,
@@ -320,7 +323,7 @@ impl ServerCertVerifier for CertificateVerifier {
     }
 
     fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
-        vec![SignatureScheme::ECDSA_NISTP256_SHA256]
+        vec![SignatureScheme::ML_DSA_65]
     }
 }
 

@@ -1,8 +1,8 @@
 use super::*;
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
-use ed25519_dalek::{Signer as _, SigningKey};
 use serde_json::{Value, json};
 use stogas_verifier::attestation::certificate::ParsedNativeCertificate;
+use stogas_verifier::signing::SigningKey;
 
 struct Files {
     directory: PathBuf,
@@ -72,7 +72,7 @@ impl Files {
             "boot_sha256": self.boot_hash,
             "request_sha256": hex::encode(request),
             "response_sha256": hex::encode(response),
-            "signature": URL_SAFE_NO_PAD.encode(SigningKey::from_bytes(&[42; 32]).sign(&message).to_bytes())
+            "signature": URL_SAFE_NO_PAD.encode(SigningKey::from_seed(&[42; 32]).sign(&message, &[]).unwrap())
         })
     }
 

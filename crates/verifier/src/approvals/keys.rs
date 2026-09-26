@@ -51,7 +51,17 @@ impl KeyState {
             return Err(Error::Equivocation);
         }
         if keys.generation != learned.keys.manifest.generation {
-            return Err(Error::Rollback);
+            let current = &learned.keys.manifest;
+            // A root renewal with unchanged keys may arrive before its complete
+            // approval package. Keep existing work eligible until its original
+            // deadline; never accept the older manifest as a new candidate.
+            if keys.generation > current.generation
+                || keys.active_key != current.active_key
+                || keys.retired_keys != current.retired_keys
+                || keys.expires_at >= current.expires_at
+            {
+                return Err(Error::Rollback);
+            }
         }
         drop(state);
         Ok(())
@@ -83,6 +93,37 @@ fn check(previous: &Learned, keys: &KeyManifest, digest: &str) -> Result<(), Err
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn renewal_keeps_old_snapshots_usable_but_cannot_restore_them_as_current() {
+        let vector: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../../tests/fixtures/approval-decisions.json"
+        ))
+        .unwrap();
+        let original = VerifiedKeys {
+            manifest: serde_json::from_value(vector["key_manifest"].clone()).unwrap(),
+            digest: vector["key_manifest_sha256"].as_str().unwrap().into(),
+        };
+        let state = KeyState::default();
+        state.learn(original.clone()).unwrap();
+        let mut renewal = original.clone();
+        renewal.manifest.generation += 1;
+        renewal.manifest.expires_at = "2100-02-01T00:00:00Z".into();
+        renewal.digest = "authenticated renewal".into();
+        state.learn(renewal.clone()).unwrap();
+        state.require_current(&original.manifest).unwrap();
+        assert_eq!(state.learn(original.clone()).unwrap_err(), Error::Rollback);
+
+        let mut shortened = renewal;
+        shortened.manifest.generation += 1;
+        shortened.manifest.expires_at = "2099-12-31T00:00:00Z".into();
+        shortened.digest = "authenticated earlier deadline".into();
+        state.learn(shortened).unwrap();
+        assert_eq!(
+            state.require_current(&original.manifest).unwrap_err(),
+            Error::Rollback
+        );
+    }
 
     #[test]
     fn authenticated_conflict_blocks_old_snapshots_until_a_later_root_decision() {

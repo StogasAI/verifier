@@ -270,7 +270,7 @@ test('compiled staging authority verifies logged key decisions without network a
 			core.free();
 		}
 	}, signed);
-	expect(result).toEqual({ key: 'stogas-ed25519-staging-v1', rejected: true });
+	expect(result).toEqual({ key: signed.manifest.active_key.key_id, rejected: true });
 	expect(requests).toEqual([]);
 });
 

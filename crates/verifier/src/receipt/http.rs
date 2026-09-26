@@ -3,7 +3,7 @@ use crate::Error;
 use sha2::{Digest as _, Sha256};
 const BUFFERED_STOGAS_FIELD: &[u8] = b",\"stogas\":";
 const BUFFERED_ONLY_STOGAS_FIELD: &[u8] = b"{\"stogas\":";
-const MAX_PROOF_BYTES: usize = 8 * 1024;
+const MAX_PROOF_BYTES: usize = super::MAX_METADATA_BYTES;
 const SSE_RECEIPT_PREFIX: &[u8] = b": stogas ";
 const SSE_CHAT_TERMINAL_PREFIX: &[u8] = b"data: [DONE]";
 const SSE_RESPONSES_TERMINAL_PREFIX: &[u8] = b"event: response.completed\n";

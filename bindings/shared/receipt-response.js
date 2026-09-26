@@ -1,6 +1,6 @@
 import { abortableReader, readBoundedBody, TransportError } from './http.js';
 
-const MAX_BUFFERED_RESPONSE = 64 * 1024 * 1024 + 8 * 1024 + 16;
+const MAX_BUFFERED_RESPONSE = 64 * 1024 * 1024 + 16 * 1024 + 16;
 const TERMINAL_DELIMITER = new Uint8Array([10, 10]);
 
 // This only verifies the already-executed response. It never sends a request or

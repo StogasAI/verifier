@@ -8,7 +8,7 @@ use std::{collections::VecDeque, sync::Arc};
 use stogas_verifier::{evidence::VerifiedSession, receipt};
 use tokio::time::{Instant, timeout_at};
 
-const MAX_RESPONSE_BYTES: usize = 64 * 1024 * 1024 + 8 * 1024 + 16;
+const MAX_RESPONSE_BYTES: usize = stogas_verifier::receipt::MAX_BUFFERED_BYTES;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {

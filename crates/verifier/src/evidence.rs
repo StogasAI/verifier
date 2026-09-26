@@ -10,7 +10,7 @@ use crate::{
     AllowedCatalog, AllowedIgvm, HardwarePolicy, SignedHardwarePolicy, VerifiedCatalogRelease,
     VerifiedHardwarePolicy, VerifiedRelease,
     approvals::{
-        self, ApprovalVerifier, Environment, OnlineKey, SignedApprovalManifest, SignedKeyManifest,
+        self, ApprovalVerifier, Environment, RootKey, SignedApprovalManifest, SignedKeyManifest,
         VerifiedApprovals, payload_sha256,
     },
 };
@@ -96,6 +96,7 @@ impl Error {
                 "key_rejected"
             }
             Self::Approval(approvals::Error::Authority) => "wrong_authority",
+            Self::Approval(approvals::Error::Expired) => "expired_key_authorization",
             Self::Attestation(_) => "invalid_attestation",
             Self::Invalid(_)
             | Self::Collateral(_)
@@ -130,8 +131,7 @@ pub struct Snapshot {
     gateways: BTreeMap<String, Cached<VerifiedRelease>>,
     catalogs: BTreeMap<String, Cached<VerifiedCatalogRelease>>,
     hardware: Cached<VerifiedHardwarePolicy>,
-    policy: HardwarePolicy,
-    hardware_sigstore: Value,
+    hardware_evidence: SignedHardwarePolicy,
     collateral: collateral::Store,
 }
 
@@ -169,7 +169,7 @@ impl Snapshot {
             "keys": self.approvals.keys(), "approvals": self.approvals.manifest(),
             "keys_evidence": self.keys_evidence, "approvals_evidence": self.approvals_evidence,
             "gateways": gateways, "catalogs": catalogs, "hardware_policy": self.hardware_policy(),
-            "hardware_policy_evidence": {"policy": self.policy, "sigstore": self.hardware_sigstore}
+            "hardware_policy_evidence": self.hardware_evidence
         })
     }
 
@@ -221,10 +221,11 @@ impl Snapshot {
 
     #[must_use]
     pub const fn hardware_rules(&self) -> &HardwarePolicy {
-        &self.policy
+        &self.hardware_evidence.policy
     }
 
-    /// The actual vendor-signed interval for one chip/TCB, independent of fetch timestamps.
+    /// The vendor-signed interval for one chip/TCB, capped by the root authorization deadline.
+    /// Fetch timestamps never extend either limit.
     ///
     /// # Errors
     /// Missing or expired material blocks only operations requiring that platform.
@@ -243,7 +244,12 @@ impl Snapshot {
     ) -> Result<Validity, Error> {
         #[cfg(feature = "snp")]
         {
-            self.collateral.validity(chip_id, reported_tcb, now_unix_ms)
+            let expires = self.approvals.valid_until(now_unix_ms)?;
+            let mut validity = self
+                .collateral
+                .validity(chip_id, reported_tcb, now_unix_ms)?;
+            validity.not_after_unix_ms = validity.not_after_unix_ms.min(expires);
+            Ok(validity)
         }
         #[cfg(not(feature = "snp"))]
         {
@@ -281,7 +287,7 @@ impl Verifier {
 
     /// # Errors
     /// Rejects an invalid locally configured trust root.
-    pub fn new(environment: Environment, root: OnlineKey) -> Result<Self, Error> {
+    pub fn new(environment: Environment, root: RootKey) -> Result<Self, Error> {
         Ok(Self {
             approvals: ApprovalVerifier::new(environment, root)?,
             current: None,
@@ -316,9 +322,11 @@ impl Verifier {
         vendor?;
         let envelope = parse_envelope(value)?;
         let body = envelope.body;
-        let approvals = self
-            .approvals
-            .verify_with_keys(keys, &serde_json::to_vec(&body.approvals).map_err(invalid)?)?;
+        let approvals = self.approvals.verify_with_keys(
+            keys,
+            &serde_json::to_vec(&body.approvals).map_err(invalid)?,
+            now_unix_ms,
+        )?;
         // Exact evidence bytes alone are not a trust-cache key after a signing-key change.
         let reusable = self
             .current
@@ -392,8 +400,7 @@ impl Verifier {
             gateways,
             catalogs,
             hardware,
-            policy: body.hardware_policy.policy,
-            hardware_sigstore: body.hardware_policy.sigstore,
+            hardware_evidence: body.hardware_policy,
             collateral,
         });
         self.approvals.accept(snapshot.approvals.clone())?;

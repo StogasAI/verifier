@@ -73,6 +73,11 @@ The networkless verifier checks root-authorized online keys, approved releases/c
 policy, build proofs, vendor collateral and CRLs. Each connection verifies its fresh challenge,
 logged boot identity and bound session keys before releasing credentials or request content.
 
+Stogas document, receipt and native TLS signatures use ML-DSA-65. Logged documents also require
+Rekor inclusion of their exact signed bytes. The root-signed online-key authorization expires;
+cached evidence cannot extend that deadline. Vendor, GitHub, Rekor and ordinary WebPKI signatures
+retain their own algorithms.
+
 There is no SDK background polling. Explicit refresh and one bounded setup recovery reuse verified
 objects. A lagging successful CDN response does not prevent trying the replica. Invalid signatures,
 revocation and missing evidence retain distinct failure reasons. Verification does not fetch from

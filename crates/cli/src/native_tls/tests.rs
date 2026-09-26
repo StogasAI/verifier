@@ -57,7 +57,7 @@ fn every_attempt_has_a_fresh_nonce_and_only_the_hybrid_tls13_profile() {
         );
         assert_eq!(
             handshake.verifier.supported_verify_schemes(),
-            [SignatureScheme::ECDSA_NISTP256_SHA256]
+            [SignatureScheme::ML_DSA_65]
         );
     }
 }
@@ -103,12 +103,25 @@ impl ResolvesServerCert for CertificateResolver {
 async fn real_tls_rejects_classical_negotiation_and_unattested_certificates_before_any_application_data()
  {
     let snapshot = snapshot();
-    let certificate = rcgen::generate_simple_self_signed(vec!["api.example.test".into()]).unwrap();
+    let certificate: serde_json::Value = serde_json::from_str(include_str!(
+        "../../../../tests/fixtures/native-certificate-v1.json"
+    ))
+    .unwrap();
+    let signer: serde_json::Value =
+        serde_json::from_str(include_str!("../../../../tests/fixtures/mldsa65-v1.json")).unwrap();
+    // A genuine ML-DSA certificate/key pair, but deliberately synthetic boot
+    // evidence. The wire handshake must reach and fail hardware appraisal.
     let key = Arc::new(CertifiedKey::new(
-        vec![certificate.cert.der().clone()],
+        vec![CertificateDer::from(
+            URL_SAFE_NO_PAD
+                .decode(certificate["certificate"].as_str().unwrap())
+                .unwrap(),
+        )],
         rustls::crypto::aws_lc_rs::sign::any_supported_type(
-            &rustls::pki_types::PrivatePkcs8KeyDer::from(certificate.signing_key.serialize_der())
-                .into(),
+            &rustls::pki_types::PrivatePkcs8KeyDer::from(
+                hex::decode(signer["pkcs8"].as_str().unwrap()).unwrap(),
+            )
+            .into(),
         )
         .unwrap(),
     ));

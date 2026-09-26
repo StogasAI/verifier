@@ -206,8 +206,6 @@ fn genuine_hardware_boot_and_fresh_native_evidence_verify_as_one_guest() {
 
 #[test]
 fn online_key_rotation_keeps_the_same_hardware_boot_and_release_verifiable() {
-    use ed25519_dalek::{Signer as _, SigningKey};
-    use serde_json::json;
     let (mut verifier, mut bundle, certificate, challenge, now) = fixture();
     let before = verifier
         .refresh(&serde_json::to_vec(&bundle).unwrap(), now)
@@ -215,31 +213,10 @@ fn online_key_rotation_keeps_the_same_hardware_boot_and_release_verifiable() {
     let original = before
         .verify_native_certificate(&certificate, challenge, now)
         .unwrap();
-    let rotation: Value = serde_json::from_str(include_str!(
-        "../../../../../tests/fixtures/logged-key-rotation.json"
+    bundle = serde_json::from_str(include_str!(
+        "../../../../../tests/fixtures/hardware-session-rotated-v1.json"
     ))
     .unwrap();
-    let body = &mut bundle["body"];
-    body["keys"] = rotation["keys"].clone();
-    body["hardware_policy"] = rotation["hardware_policy"].clone();
-    body["approvals"]["manifest"]["key_manifest_sha256"] =
-        json!(crate::approvals::payload_sha256(&body["keys"]["manifest"]).unwrap());
-    let sign = |value: &Value| {
-        let canonical = crate::canonical_json(value).unwrap();
-        let message = [
-            crate::STOGAS_SIGNATURE_DOMAIN,
-            canonical.trim_end_matches('\n').as_bytes(),
-        ]
-        .concat();
-        json!({"key_id":"stogas-fixture-online-20260921","signature":URL_SAFE_NO_PAD.encode(SigningKey::from_bytes(&[243;32]).sign(&message).to_bytes())})
-    };
-    for kind in ["allowed_igvms", "catalogs"] {
-        for artifact in body[kind].as_array_mut().unwrap() {
-            artifact["signature"] = sign(&artifact["manifest"]);
-        }
-    }
-    body["approvals"]["signature"] = sign(&body["approvals"]["manifest"]);
-    bundle["body_sha256"] = json!(crate::approvals::payload_sha256(&bundle["body"]).unwrap());
     let after = verifier
         .refresh(&serde_json::to_vec(&bundle).unwrap(), now)
         .unwrap();
@@ -265,7 +242,7 @@ fn online_key_rotation_keeps_the_same_hardware_boot_and_release_verifiable() {
 
 #[test]
 fn learned_release_withdrawal_blocks_warm_reappraisal_but_keeps_owned_request_evidence() {
-    use ed25519_dalek::{Signer as _, SigningKey};
+    use crate::signing::SigningKey;
     use serde_json::json;
     let (mut verifier, mut bundle, certificate, challenge, now) = fixture();
     let original = verifier
@@ -277,18 +254,17 @@ fn learned_release_withdrawal_blocks_warm_reappraisal_but_keeps_owned_request_ev
     let approval = &mut bundle["body"]["approvals"]["manifest"];
     approval["revision"] = json!(approval["revision"].as_u64().unwrap() + 1);
     approval["gateways"] = json!([]);
-    let canonical = crate::canonical_json(approval).unwrap();
-    let message = [
-        crate::STOGAS_SIGNATURE_DOMAIN,
-        canonical.trim_end_matches('\n').as_bytes(),
-    ]
-    .concat();
-    bundle["body"]["approvals"]["signature"]["signature"] =
-        json!(URL_SAFE_NO_PAD.encode(SigningKey::from_bytes(&[242; 32]).sign(&message).to_bytes()));
+    let variants: Value = serde_json::from_str(include_str!(
+        "../../../../../tests/fixtures/logged-approval-variants.json"
+    ))
+    .unwrap();
+    let digest = crate::approvals::payload_sha256(approval).unwrap();
+    bundle["body"]["approvals"] = variants["approvals"][digest].clone();
+    let refresh_time = now.max(variants["verified_at_ms"].as_i64().unwrap());
     bundle["body"]["allowed_igvms"] = json!([]);
     bundle["body_sha256"] = json!(crate::approvals::payload_sha256(&bundle["body"]).unwrap());
     let current = verifier
-        .refresh(&serde_json::to_vec(&bundle).unwrap(), now)
+        .refresh(&serde_json::to_vec(&bundle).unwrap(), refresh_time)
         .unwrap();
     assert!(matches!(
         current.reappraise_session(&session, now),
@@ -321,8 +297,11 @@ fn learned_release_withdrawal_blocks_warm_reappraisal_but_keeps_owned_request_ev
         boot_sha256: hex::encode(session.boot().document_sha256()),
         request_sha256: hex::encode(request),
         response_sha256: hex::encode(response),
-        signature: URL_SAFE_NO_PAD
-            .encode(SigningKey::from_bytes(&[42; 32]).sign(&message).to_bytes()),
+        signature: URL_SAFE_NO_PAD.encode(
+            SigningKey::from_seed(&[42; 32])
+                .sign(&message, &[])
+                .unwrap(),
+        ),
     };
     receipt
         .verify(session.boot(), &request, &response, &metadata)

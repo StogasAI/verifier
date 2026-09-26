@@ -19,7 +19,6 @@ use base64::{
 };
 #[cfg(any(feature = "snp", all(test, feature = "staging")))]
 use chrono::{DateTime, Utc};
-use ed25519_dalek::{Signature as Ed25519Signature, VerifyingKey, pkcs8::DecodePublicKey};
 #[cfg(feature = "snp")]
 use p256::ecdsa::{
     Signature as P256Signature, VerifyingKey as P256VerifyingKey, signature::Verifier as _,
@@ -31,9 +30,7 @@ use sha2::{Digest, Sha256};
 #[cfg(any(feature = "snp", feature = "staging"))]
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
-use stogas_offline_sigstore::{
-    GithubPolicy, Subject, verify_github_attestation, verify_keyed_dsse,
-};
+use stogas_offline_sigstore::{GithubPolicy, Subject, verify_github_attestation};
 use thiserror::Error;
 #[cfg(feature = "snp")]
 use x509_parser::{
@@ -68,7 +65,6 @@ const STAGING_PROVENANCE_TYPE: &str = "https://stogas.ai/attestations/staging-de
 const STOGAS_SIGNATURE_DOMAIN: &[u8] = b"stogas signed document v1\n";
 const RELEASE_EVIDENCE_SCHEMA: &str = "stogas.release-evidence.v1";
 const BUNDLE_ENVELOPE_SCHEMA: &str = "stogas.confidential-bundle-envelope.v1";
-const HARDWARE_POLICY_DSSE_PAYLOAD_TYPE: &str = "application/vnd.stogas.hardware-policies.v1+json";
 const SNP_PLATFORM_INFO_KNOWN_MASK: u64 = 0xbf;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -500,30 +496,28 @@ fn verify_raw_snp_report_signature(
 
 fn verify_signed_hardware_policy_with_key(
     signed: &SignedHardwarePolicy,
-    key_id: &str,
-    key: &str,
+    key: &approvals::OnlineKey,
     now_unix_ms: i64,
 ) -> Result<VerifiedHardwarePolicy, Error> {
     let canonical = validate_hardware_policy(&signed.policy)?;
-    let public_key_spki = STANDARD.decode(key).map_err(|error| {
-        Error::InvalidBundle(format!("hardware policy public key encoding: {error}"))
-    })?;
-    let integrated_time = verify_keyed_dsse(
-        &signed.sigstore,
-        canonical.as_bytes(),
-        HARDWARE_POLICY_DSSE_PAYLOAD_TYPE,
-        key_id,
-        &public_key_spki,
+    let document = serde_json::to_value(&signed.policy)
+        .map_err(|error| Error::InvalidBundle(error.to_string()))?;
+    approvals::verify_signature(&document, &signed.signature, &key.key_id, &key.public_key)
+        .map_err(|error| Error::InvalidBundle(error.to_string()))?;
+    let integrated_time = approvals::verify_document_inclusion(
+        &document,
+        &signed.signature,
+        &signed.inclusion,
+        key,
         now_unix_ms,
     )
     .map_err(|error| Error::InvalidBundle(format!("hardware policy transparency: {error}")))?;
-    let integrated_time_unix_ms = rekor_seconds_to_millis(integrated_time)?;
     Ok(verified_hardware_policy(
         &signed.policy,
         &canonical,
         HardwarePolicySource::StogasBundle,
-        Some(key_id.to_owned()),
-        Some(integrated_time_unix_ms),
+        Some(key.key_id.clone()),
+        Some(rekor_seconds_to_millis(integrated_time)?),
     ))
 }
 
@@ -947,7 +941,7 @@ fn verify_catalog_with_key(
     let manifest_digest = hex::encode(Sha256::digest(canonical.as_bytes()));
     let mut payload = STOGAS_SIGNATURE_DOMAIN.to_vec();
     payload.extend_from_slice(signed_canonical.as_bytes());
-    verify_ed25519(key, &payload, &signed.signature.signature).map_err(Error::Release)?;
+    verify_mldsa65(key, &payload, &signed.signature.signature).map_err(Error::Release)?;
 
     let attestation = catalog
         .attested_builds
@@ -1038,7 +1032,7 @@ fn verify_release_with_key(
     let canonical = canonical_json(&manifest_value)?;
     let mut payload = STOGAS_SIGNATURE_DOMAIN.to_vec();
     payload.extend_from_slice(canonical.trim_end_matches('\n').as_bytes());
-    verify_ed25519(key, &payload, &signature.signature).map_err(Error::Release)?;
+    verify_mldsa65(key, &payload, &signature.signature).map_err(Error::Release)?;
 
     let attestation_value = release
         .attested_builds
@@ -1940,23 +1934,27 @@ fn parse_time(value: &str) -> Result<i64, Error> {
         .map_err(|_| Error::InvalidBundle(format!("invalid timestamp: {value}")))
 }
 
-fn verify_ed25519(
+fn verify_mldsa65(
     public_der_b64: &str,
     payload: &[u8],
     signature_b64url: &str,
 ) -> Result<(), String> {
-    use ed25519_dalek::Verifier as _;
     let der = STANDARD
         .decode(public_der_b64)
         .map_err(|error| error.to_string())?;
-    let key = VerifyingKey::from_public_key_der(&der).map_err(|error| error.to_string())?;
-    let signature_bytes = URL_SAFE_NO_PAD
+    if STANDARD.encode(&der) != public_der_b64 {
+        return Err("non-canonical ML-DSA public key".into());
+    }
+    let key = signing::public_key_from_spki(&der).map_err(|error| error.to_string())?;
+    let signature = URL_SAFE_NO_PAD
         .decode(signature_b64url)
         .map_err(|error| error.to_string())?;
-    let signature =
-        Ed25519Signature::from_slice(&signature_bytes).map_err(|error| error.to_string())?;
-    key.verify(payload, &signature)
-        .map_err(|error| error.to_string())
+    if signature.len() != signing::SIGNATURE_BYTES
+        || URL_SAFE_NO_PAD.encode(&signature) != signature_b64url
+    {
+        return Err("invalid ML-DSA signature encoding".into());
+    }
+    signing::verify(key, payload, &[], &signature).map_err(|error| error.to_string())
 }
 
 fn canonical_json(value: &Value) -> Result<String, Error> {
@@ -2203,7 +2201,7 @@ mod tests {
             },
             "signature": {
                 "key_id": "test",
-                "signature": URL_SAFE_NO_PAD.encode([0_u8; 64]),
+                "signature": URL_SAFE_NO_PAD.encode([0_u8; signing::SIGNATURE_BYTES]),
             }
         }))
         .unwrap()
@@ -2227,7 +2225,7 @@ mod tests {
                     "tree": "44".repeat(20)
                 }
             },
-            "signature": { "key_id": "test", "signature": URL_SAFE_NO_PAD.encode([0_u8; 64]) }
+            "signature": { "key_id": "test", "signature": URL_SAFE_NO_PAD.encode([0_u8; signing::SIGNATURE_BYTES]) }
         }))
         .unwrap()
     }
@@ -2280,40 +2278,30 @@ mod tests {
     }
 
     fn resign_release(release: &mut AllowedIgvm) -> String {
-        use ed25519_dalek::{Signer as _, SigningKey, pkcs8::EncodePublicKey as _};
+        use crate::signing::SigningKey;
 
-        let signing_key = SigningKey::from_bytes(&[0x42; 32]);
+        let signing_key = SigningKey::from_seed(&[0x42; 32]);
         let canonical = canonical_json(&serde_json::to_value(&release.manifest).unwrap()).unwrap();
         let mut payload = STOGAS_SIGNATURE_DOMAIN.to_vec();
         payload.extend_from_slice(canonical.trim_end_matches('\n').as_bytes());
         release.signature.key_id = "test-release-key".into();
-        release.signature.signature = URL_SAFE_NO_PAD.encode(signing_key.sign(&payload).to_bytes());
-        STANDARD.encode(
-            signing_key
-                .verifying_key()
-                .to_public_key_der()
-                .unwrap()
-                .as_bytes(),
-        )
+        release.signature.signature =
+            URL_SAFE_NO_PAD.encode(signing_key.sign(&payload, &[]).unwrap());
+        STANDARD.encode(signing_key.public_key_spki().unwrap())
     }
 
     fn resign_catalog(catalog: &mut AllowedCatalog) -> String {
-        use ed25519_dalek::{Signer as _, SigningKey, pkcs8::EncodePublicKey as _};
+        use crate::signing::SigningKey;
 
-        let signing_key = SigningKey::from_bytes(&[0x42; 32]);
+        let signing_key = SigningKey::from_seed(&[0x42; 32]);
         let canonical = canonical_json(&serde_json::to_value(&catalog.manifest).unwrap()).unwrap();
         let canonical = canonical.strip_suffix('\n').unwrap();
         let mut payload = STOGAS_SIGNATURE_DOMAIN.to_vec();
         payload.extend_from_slice(canonical.trim_end_matches('\n').as_bytes());
         catalog.signature.key_id = "test-release-key".into();
-        catalog.signature.signature = URL_SAFE_NO_PAD.encode(signing_key.sign(&payload).to_bytes());
-        STANDARD.encode(
-            signing_key
-                .verifying_key()
-                .to_public_key_der()
-                .unwrap()
-                .as_bytes(),
-        )
+        catalog.signature.signature =
+            URL_SAFE_NO_PAD.encode(signing_key.sign(&payload, &[]).unwrap());
+        STANDARD.encode(signing_key.public_key_spki().unwrap())
     }
 
     #[test]

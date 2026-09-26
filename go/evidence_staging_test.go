@@ -3,12 +3,10 @@
 package verifier
 
 import (
-	"crypto/ed25519"
 	"crypto/sha256"
 	"crypto/x509"
 	"encoding/base64"
 	"encoding/binary"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"os"
@@ -106,23 +104,27 @@ func TestOfflineReceiptUsesLoggedHardwareKeyAndExactContentHashes(t *testing.T) 
 	}
 	defer snapshot.Close()
 	boot, inclusion := fixtureBoot(t, fixture.Certificate)
-	bootHash := sha256.Sum256(boot)
-	request := sha256.Sum256([]byte("exact request bytes\n"))
-	response := sha256.Sum256([]byte("exact response bytes\n"))
-	message := append([]byte("stogas.receipt.v1\x00"), request[:]...)
-	message = append(message, response[:]...)
-	metadataHash := sha256.Sum256([]byte(`{}`))
-	message = append(message, metadataHash[:]...)
-	seed := make([]byte, ed25519.SeedSize)
-	for i := range seed {
-		seed[i] = 42
+	vectorBytes, err := os.ReadFile("../tests/fixtures/content-receipt-v1.json")
+	if err != nil {
+		t.Fatal(err)
 	}
-	receipt := map[string]string{
-		"schema": "stogas.receipt.v1", "boot_sha256": hex.EncodeToString(bootHash[:]),
-		"request_sha256": hex.EncodeToString(request[:]), "response_sha256": hex.EncodeToString(response[:]),
-		"signature": base64.RawURLEncoding.EncodeToString(ed25519.Sign(ed25519.NewKeyFromSeed(seed), message)),
+	var vector struct {
+		Request  string            `json:"request"`
+		Response string            `json:"response"`
+		Metadata map[string]any    `json:"metadata"`
+		Receipt  map[string]string `json:"hardware_receipt"`
 	}
-	encoded, _ := json.Marshal(map[string]any{"receipt": receipt})
+	if err := json.Unmarshal(vectorBytes, &vector); err != nil {
+		t.Fatal(err)
+	}
+	request := sha256.Sum256([]byte(vector.Request))
+	response := sha256.Sum256([]byte(vector.Response))
+	receipt := vector.Receipt
+	vector.Metadata["receipt"] = receipt
+	encoded, err := json.Marshal(vector.Metadata)
+	if err != nil {
+		t.Fatal(err)
+	}
 	now := time.UnixMilli(fixture.Now)
 	verified, err := snapshot.VerifyReceiptAt(boot, inclusion, encoded, request, response, now)
 	if err != nil || verified.BootSHA256 != receipt["boot_sha256"] || verified.RequestSHA256 != receipt["request_sha256"] || verified.ResponseSHA256 != receipt["response_sha256"] || verified.NodeID == "" {
@@ -177,7 +179,7 @@ func TestOfflineReceiptUsesLoggedHardwareKeyAndExactContentHashes(t *testing.T) 
 	for _, field := range []string{"signature", "boot_sha256"} {
 		original := receipt[field]
 		receipt[field] = "invalid"
-		changed, _ := json.Marshal(map[string]any{"receipt": receipt})
+		changed, _ := json.Marshal(vector.Metadata)
 		if _, err := snapshot.VerifyReceiptAt(boot, inclusion, changed, request, response, now); err == nil {
 			t.Fatalf("accepted changed %s", field)
 		}

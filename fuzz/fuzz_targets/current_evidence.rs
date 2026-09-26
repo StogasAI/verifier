@@ -3,12 +3,12 @@
 use libfuzzer_sys::fuzz_target;
 use std::sync::OnceLock;
 use stogas_verifier::{
-    approvals::{Environment, OnlineKey},
+    approvals::{Environment, RootKey},
     evidence::Verifier,
 };
 
 fuzz_target!(|data: &[u8]| {
-    static FIXTURE: OnceLock<(OnlineKey, Vec<u8>, i64)> = OnceLock::new();
+    static FIXTURE: OnceLock<(RootKey, Vec<u8>, i64)> = OnceLock::new();
     let (root, bundle, now) = FIXTURE.get_or_init(|| {
         let fixture: serde_json::Value = serde_json::from_str(include_str!(
             "../../tests/fixtures/current-evidence-v1.json"

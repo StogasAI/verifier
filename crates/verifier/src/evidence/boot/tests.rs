@@ -5,14 +5,12 @@ use serde_json::{Value, json};
 fn certificate_renewal_matches_independent_vector_and_rejects_replay_outside_its_window() {
     let vector = fixture();
     let request = &vector["certificate_renewal"];
-    let key: [u8; 32] = URL_SAFE_NO_PAD
+    let key = URL_SAFE_NO_PAD
         .decode(
-            vector["record"]["report_data"]["ed25519_public_key"]
+            vector["record"]["report_data"]["signing_public_key"]
                 .as_str()
                 .unwrap(),
         )
-        .unwrap()
-        .try_into()
         .unwrap();
     let node = request["node_id"].as_str().unwrap();
     let now = request["issued_at_ms"].as_i64().unwrap();
@@ -25,6 +23,9 @@ fn certificate_renewal_matches_independent_vector_and_rejects_replay_outside_its
     }
     assert!(verify_certificate_renewal(&bytes, "another-node", &key, now).is_err());
     assert!(verify_certificate_renewal(&bytes, node, &[0; 32], now).is_err());
+    let mut another_key = key.clone();
+    another_key[0] ^= 1;
+    assert!(verify_certificate_renewal(&bytes, node, &another_key, now).is_err());
     for (field, value) in [
         ("node_id", json!("other")),
         ("issued_at_ms", json!(now + 1)),
@@ -38,7 +39,7 @@ fn certificate_renewal_matches_independent_vector_and_rejects_replay_outside_its
                 .is_err()
         );
     }
-    assert!(verify_certificate_renewal(&vec![b' '; 513], node, &key, now).is_err());
+    assert!(verify_certificate_renewal(&vec![b' '; 5 * 1024 + 1], node, &key, now).is_err());
 }
 
 #[test]
@@ -102,7 +103,7 @@ fn canonical_boot_document_and_commitment_match_independent_and_go_vectors() {
     for pointer in [
         "/registration_challenge",
         "/tls_spki_sha256",
-        "/ed25519_public_key",
+        "/signing_public_key",
         "/hpke_public_key",
         "/schema",
     ] {
@@ -117,7 +118,7 @@ fn canonical_boot_document_and_commitment_match_independent_and_go_vectors() {
         );
     }
     let mut weak = record.report_data;
-    weak.ed25519_public_key = URL_SAFE_NO_PAD.encode([0_u8; 32]);
+    weak.signing_public_key = URL_SAFE_NO_PAD.encode([0_u8; 32]);
     assert!(weak.commitment().is_err());
 }
 

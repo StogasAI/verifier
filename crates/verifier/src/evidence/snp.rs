@@ -66,8 +66,8 @@ impl Snapshot {
         let reported_tcb = hex::encode(&report[0x180..0x188]);
         let launch = crate::compatible_launch_policy(&release.launch_policies, &chip_id)
             .map_err(attestation_error)?;
-        let hardware =
-            crate::compatible_hardware(&self.policy, &chip_id).map_err(attestation_error)?;
+        let hardware = crate::compatible_hardware(&self.hardware_evidence.policy, &chip_id)
+            .map_err(attestation_error)?;
         crate::check_raw_report_bindings(
             crate::ExpectedSnpReport {
                 node_id: &node_id,

@@ -3,7 +3,7 @@ import { verifyReceiptResponse } from './receipt-response.js';
 
 // HTTP owns delivery; the Rust core owns verification, record keys and counters.
 export const SESSION_CONTENT_TYPE = 'application/vnd.stogas.session';
-export const MAX_SETUP_RESPONSE_BYTES = 62_638;
+export const MAX_SETUP_RESPONSE_BYTES = 60_590;
 const MAX_RECORD_PAYLOAD = 65_515;
 const MAX_METADATA_BYTES = 16 * 1024;
 const MAX_REQUEST_BYTES = 128 * 1024 * 1024;

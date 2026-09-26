@@ -55,6 +55,23 @@ pub fn verify_mldsa65(
     signing::verify(key, message, context, signature).map_err(error)
 }
 
+/// Compute FIPS 204's message representative for a remote ML-DSA-65 signer.
+/// Callers must independently verify the returned signature on the original bytes.
+///
+/// # Errors
+/// Rejects malformed public keys, oversized messages and contexts.
+#[wasm_bindgen]
+pub fn mldsa65_message_representative(
+    public_key_spki: &[u8],
+    message: &[u8],
+    context: &[u8],
+) -> Result<Vec<u8>, JsError> {
+    let key = signing::public_key_from_spki(public_key_spki).map_err(error)?;
+    signing::message_representative(key, message, context)
+        .map(|mu| mu.to_vec())
+        .map_err(error)
+}
+
 /// Derive the stable Rekor submission public key, erasing the mutable input DER.
 /// Its authenticated association with the ML-DSA key enables independent log searches.
 ///
@@ -82,6 +99,36 @@ pub fn prepare_rekor_submission(
     private_key_der.zeroize();
     key.map_err(error)?
         .prepare_rekor_submission(signed_document)
+        .map_err(error)
+}
+
+/// Read the public identity of a separate Rekor submission seed. This supports
+/// non-exportable document signers without exporting their ML-DSA private key.
+/// The input seed is erased on success and failure.
+///
+/// # Errors
+/// Rejects seeds other than 32 bytes or public-key encoding failures.
+#[wasm_bindgen]
+pub fn rekor_public_key_from_seed(seed: &mut [u8]) -> Result<Vec<u8>, JsError> {
+    let key = signing::RekorSubmissionKey::from_seed(seed);
+    seed.zeroize();
+    key.map_err(error)?.public_key_spki().map_err(error)
+}
+
+/// Prepare Rekor v1 inclusion using a separate submission seed, erasing the input.
+/// The signed document's ML-DSA signature remains independently mandatory.
+///
+/// # Errors
+/// Rejects malformed seeds, oversized input and signing failures.
+#[wasm_bindgen]
+pub fn prepare_rekor_submission_with_seed(
+    seed: &mut [u8],
+    signed_document: &[u8],
+) -> Result<String, JsError> {
+    let key = signing::RekorSubmissionKey::from_seed(seed);
+    seed.zeroize();
+    key.map_err(error)?
+        .prepare_submission(signed_document)
         .map_err(error)
 }
 

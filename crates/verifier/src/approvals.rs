@@ -3,11 +3,10 @@
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
-use base64::{
-    Engine as _,
-    engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
-};
-use ed25519_dalek::{Signature, VerifyingKey, pkcs8::DecodePublicKey};
+#[cfg(test)]
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use base64::{Engine as _, engine::general_purpose::STANDARD};
+use ed25519_dalek::{VerifyingKey, pkcs8::DecodePublicKey};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -20,7 +19,6 @@ use crate::{
 };
 
 pub const KEY_MANIFEST_SCHEMA: &str = "stogas.keys.v1";
-pub const KEY_MANIFEST_PAYLOAD_TYPE: &str = "application/vnd.stogas.keys.v1+json";
 pub const APPROVAL_MANIFEST_SCHEMA: &str = "stogas.approvals.v1";
 const MAX_REVISION: u64 = (1 << 53) - 1;
 
@@ -75,25 +73,33 @@ impl Environment {
     /// Compiled Stogas trust seed; evidence cannot select or replace this authority.
     ///
     /// # Errors
-    /// Production remains unavailable until its independent offline root is provisioned.
-    pub fn stogas_root(self) -> Result<OnlineKey, Error> {
+    /// Production remains unavailable until its independent root is provisioned.
+    pub fn stogas_root(self) -> Result<RootKey, Error> {
         match self {
             Self::Production => Err(invalid("production evidence root is not provisioned")),
             #[cfg(feature = "staging")]
-            Self::Staging => Ok(OnlineKey {
-                key_id: "stogas-root-staging-v1".into(),
-                public_key: "MCowBQYDK2VwAyEAzLbKFJboWdiCQt4n8Zj50x+pg22KIq7vpD4UhWXiHks=".into(),
-            }),
+            Self::Staging => {
+                serde_json::from_str(include_str!("staging-root.json")).map_err(invalid)
+            }
         }
     }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
 #[serde(deny_unknown_fields)]
+pub struct RootKey {
+    pub key_id: String,
+    pub public_key: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct OnlineKey {
     pub key_id: String,
-    /// Canonical standard-base64 Ed25519 `SubjectPublicKeyInfo` DER.
+    /// Canonical standard-base64 ML-DSA-65 `SubjectPublicKeyInfo` DER.
     pub public_key: String,
+    /// Root-authenticated Ed25519 key for Rekor v1 submission only.
+    pub rekor_public_key: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -102,16 +108,34 @@ pub struct KeyManifest {
     pub schema: String,
     pub environment: Environment,
     pub generation: u64,
+    /// Root-authorized deadline for live use; historical appraisal uses the logged time.
+    pub expires_at: String,
     pub active_key: OnlineKey,
     pub retired_keys: Vec<OnlineKey>,
+}
+
+impl KeyManifest {
+    fn expiry_unix_ms(&self) -> Result<i64, Error> {
+        if self.expires_at.len() != 20 {
+            return Err(invalid("key manifest expiry must use whole UTC seconds"));
+        }
+        let expiry = chrono::DateTime::parse_from_rfc3339(&self.expires_at)
+            .map_err(|_| invalid("key manifest expiry is not a UTC timestamp"))?;
+        if expiry.timestamp_subsec_nanos() != 0
+            || expiry.format("%Y-%m-%dT%H:%M:%SZ").to_string() != self.expires_at
+        {
+            return Err(invalid("key manifest expiry must use whole UTC seconds"));
+        }
+        Ok(expiry.timestamp_millis())
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct SignedKeyManifest {
     pub manifest: KeyManifest,
-    /// Root-signed DSSE and its verified Rekor inclusion, using the existing Sigstore format.
-    pub sigstore: Value,
+    pub signature: StogasSignature,
+    pub inclusion: Value,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -132,6 +156,7 @@ pub struct ApprovalManifest {
 pub struct SignedApprovalManifest {
     pub manifest: ApprovalManifest,
     pub signature: StogasSignature,
+    pub inclusion: Value,
 }
 
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -146,6 +171,8 @@ pub enum Error {
     Transparency(String),
     #[error("approval signing key is not active")]
     InactiveKey,
+    #[error("root key authorization has expired")]
+    Expired,
     #[error("approval signature is invalid")]
     Signature,
     #[error("approval evidence rolls back an accepted decision")]
@@ -168,9 +195,22 @@ pub struct VerifiedApprovals {
     approvals: ApprovalManifest,
     keys_digest: String,
     approvals_digest: String,
+    expires_unix_ms: i64,
 }
 
 impl VerifiedApprovals {
+    /// Check the root deadline without redoing immutable signature verification.
+    ///
+    /// # Errors
+    /// Rejects use at or after expiry. Refreshing delivery bytes cannot extend it.
+    pub const fn valid_until(&self, now_unix_ms: i64) -> Result<i64, Error> {
+        if now_unix_ms >= self.expires_unix_ms {
+            Err(Error::Expired)
+        } else {
+            Ok(self.expires_unix_ms)
+        }
+    }
+
     #[must_use]
     pub const fn keys(&self) -> &KeyManifest {
         &self.keys
@@ -206,6 +246,7 @@ impl VerifiedApprovals {
         release: &AllowedIgvm,
         now_unix_ms: i64,
     ) -> Result<VerifiedRelease, Error> {
+        self.valid_until(now_unix_ms)?;
         if !self.allows_gateway(&payload_sha256(&release.manifest)?) {
             return Err(Error::NotApproved("gateway"));
         }
@@ -228,6 +269,7 @@ impl VerifiedApprovals {
         catalog: &AllowedCatalog,
         now_unix_ms: i64,
     ) -> Result<VerifiedCatalogRelease, Error> {
+        self.valid_until(now_unix_ms)?;
         if !self.allows_catalog(&payload_sha256(&catalog.manifest)?) {
             return Err(Error::NotApproved("catalog"));
         }
@@ -241,7 +283,7 @@ impl VerifiedApprovals {
         Ok(verified)
     }
 
-    /// Verify the selected hardware policy, its active-key DSSE signature and Rekor inclusion.
+    /// Verify the selected hardware policy, its active-key ML-DSA signature and Rekor inclusion.
     ///
     /// # Errors
     /// Rejects a different policy, invalid hardware rules, untrusted signer or invalid log proof.
@@ -250,16 +292,12 @@ impl VerifiedApprovals {
         signed: &SignedHardwarePolicy,
         now_unix_ms: i64,
     ) -> Result<VerifiedHardwarePolicy, Error> {
+        self.valid_until(now_unix_ms)?;
         if payload_sha256(&signed.policy)? != self.approvals.hardware_policy_sha256 {
             return Err(Error::NotApproved("hardware policy"));
         }
-        crate::verify_signed_hardware_policy_with_key(
-            signed,
-            &self.keys.active_key.key_id,
-            &self.keys.active_key.public_key,
-            now_unix_ms,
-        )
-        .map_err(|error| Error::Evidence(error.to_string()))
+        crate::verify_signed_hardware_policy_with_key(signed, &self.keys.active_key, now_unix_ms)
+            .map_err(|error| Error::Evidence(error.to_string()))
     }
 
     fn require_active_key(&self, key_id: &str) -> Result<(), Error> {
@@ -285,8 +323,7 @@ impl VerifiedApprovals {
 /// A candidate does not replace learned decisions until every referenced evidence object passes.
 pub struct ApprovalVerifier {
     environment: Environment,
-    root: OnlineKey,
-    root_der: Vec<u8>,
+    root: RootKey,
     authority: [u8; 32],
     accepted: Option<VerifiedApprovals>,
     key_state: Arc<KeyState>,
@@ -308,18 +345,21 @@ impl ApprovalVerifier {
         bytes: &[u8],
         now_unix_ms: i64,
     ) -> Result<KeyManifest, Error> {
-        Ok(self.observe_keys(bytes, now_unix_ms)?.manifest)
+        let keys = self.observe_keys(bytes, now_unix_ms)?.manifest;
+        if now_unix_ms >= keys.expiry_unix_ms()? {
+            return Err(Error::Expired);
+        }
+        Ok(keys)
     }
 
     /// # Errors
     /// Rejects malformed or weak root keys and ambiguous key identifiers.
-    pub fn new(environment: Environment, root: OnlineKey) -> Result<Self, Error> {
-        let root_der = decode_key(&root)?;
+    pub fn new(environment: Environment, root: RootKey) -> Result<Self, Error> {
+        let root_der = decode_key(&root.key_id, &root.public_key)?;
         let authority = Sha256::digest(&root_der).into();
         Ok(Self {
             environment,
             root,
-            root_der,
             authority,
             accepted: None,
             key_state: Arc::default(),
@@ -341,7 +381,7 @@ impl ApprovalVerifier {
             return Err(Error::TooLarge);
         }
         let keys = self.verify_keys(keys_bytes, now_unix_ms)?;
-        self.verify_with_keys(keys, approvals_bytes)
+        self.verify_with_keys(keys, approvals_bytes, now_unix_ms)
     }
 
     fn verify_keys(&self, bytes: &[u8], now_unix_ms: i64) -> Result<VerifiedKeys, Error> {
@@ -350,17 +390,28 @@ impl ApprovalVerifier {
         }
         let keys: SignedKeyManifest = parse(bytes)?;
         validate_keys(&keys.manifest, self.environment, &self.root)?;
-        let canonical = canonical_json(&serde_json::to_value(&keys.manifest).map_err(invalid)?)
-            .map_err(invalid)?;
-        stogas_offline_sigstore::verify_keyed_dsse(
-            &keys.sigstore,
-            canonical.as_bytes(),
-            KEY_MANIFEST_PAYLOAD_TYPE,
+        let document = serde_json::to_value(&keys.manifest).map_err(invalid)?;
+        verify_signature(
+            &document,
+            &keys.signature,
             &self.root.key_id,
-            &self.root_der,
+            &self.root.public_key,
+        )?;
+        // The root authenticates the active submission identity. The online signer
+        // can log this document but cannot change its root authorization.
+        let published = verify_document_inclusion(
+            &document,
+            &keys.signature,
+            &keys.inclusion,
+            &keys.manifest.active_key,
             now_unix_ms,
-        )
-        .map_err(|error| Error::Transparency(error.to_string()))?;
+        )?;
+        let published = published
+            .checked_mul(1000)
+            .ok_or_else(|| invalid("log time overflow"))?;
+        if keys.manifest.expiry_unix_ms()? <= published {
+            return Err(invalid("key authorization expired before publication"));
+        }
         Ok(VerifiedKeys {
             digest: payload_sha256(&keys.manifest)?,
             manifest: keys.manifest,
@@ -385,12 +436,21 @@ impl ApprovalVerifier {
         &self,
         keys: VerifiedKeys,
         approvals_bytes: &[u8],
+        now_unix_ms: i64,
     ) -> Result<VerifiedApprovals, Error> {
         if approvals_bytes.len() > MAX_INPUT_BYTES {
             return Err(Error::TooLarge);
         }
         let approvals: SignedApprovalManifest = parse(approvals_bytes)?;
+        verify_document_inclusion(
+            &serde_json::to_value(&approvals.manifest).map_err(invalid)?,
+            &approvals.signature,
+            &approvals.inclusion,
+            &keys.manifest.active_key,
+            now_unix_ms,
+        )?;
         let candidate = verify_online_approval(self.authority, keys.manifest, approvals)?;
+        candidate.valid_until(now_unix_ms)?;
         self.check_update(&candidate)?;
         Ok(candidate)
     }
@@ -480,22 +540,25 @@ fn verify_online_approval(
     verify_signature(
         &serde_json::to_value(&approvals).map_err(invalid)?,
         &signed.signature,
-        &keys.active_key,
+        &keys.active_key.key_id,
+        &keys.active_key.public_key,
     )?;
     let approvals_digest = payload_sha256(&approvals)?;
+    let expires_unix_ms = keys.expiry_unix_ms()?;
     Ok(VerifiedApprovals {
         authority,
         keys,
         approvals,
         keys_digest,
         approvals_digest,
+        expires_unix_ms,
     })
 }
 
 fn validate_keys(
     keys: &KeyManifest,
     environment: Environment,
-    root: &OnlineKey,
+    root: &RootKey,
 ) -> Result<(), Error> {
     if keys.schema != KEY_MANIFEST_SCHEMA || !valid_revision(keys.generation) {
         return Err(Error::Invalid("key manifest schema or generation".into()));
@@ -503,6 +566,7 @@ fn validate_keys(
     if keys.environment != environment {
         return Err(Error::Authority);
     }
+    keys.expiry_unix_ms()?;
     if keys
         .retired_keys
         .windows(2)
@@ -514,55 +578,78 @@ fn validate_keys(
     }
     let mut ids = BTreeSet::from([root.key_id.as_str()]);
     let mut public_keys = BTreeSet::from([root.public_key.as_str()]);
+    let mut rekor_keys = BTreeSet::new();
     for key in std::iter::once(&keys.active_key).chain(&keys.retired_keys) {
-        decode_key(key)?;
-        if !ids.insert(&key.key_id) || !public_keys.insert(&key.public_key) {
+        decode_key(&key.key_id, &key.public_key)?;
+        decode_rekor_key(key)?;
+        if !ids.insert(&key.key_id)
+            || !public_keys.insert(&key.public_key)
+            || !rekor_keys.insert(&key.rekor_public_key)
+        {
             return Err(Error::Invalid("duplicate or root operational key".into()));
         }
     }
     Ok(())
 }
 
-fn verify_signature(
+pub(crate) fn verify_signature(
     document: &Value,
     signature: &StogasSignature,
-    key: &OnlineKey,
+    key_id: &str,
+    public_key: &str,
 ) -> Result<(), Error> {
-    if signature.key_id != key.key_id {
+    if signature.key_id != key_id {
         return Err(Error::InactiveKey);
     }
-    let public = VerifyingKey::from_public_key_der(&decode_key(key)?).map_err(invalid)?;
-    let bytes = URL_SAFE_NO_PAD
-        .decode(&signature.signature)
-        .map_err(|_| Error::Signature)?;
-    if bytes.len() != 64 || URL_SAFE_NO_PAD.encode(&bytes) != signature.signature {
-        return Err(Error::Signature);
-    }
-    let signature = Signature::from_slice(&bytes).map_err(|_| Error::Signature)?;
+    decode_key(key_id, public_key)?;
     let mut payload = STOGAS_SIGNATURE_DOMAIN.to_vec();
     payload.extend_from_slice(&canonical_payload(document)?);
-    public
-        .verify_strict(&payload, &signature)
-        .map_err(|_| Error::Signature)
+    crate::verify_mldsa65(public_key, &payload, &signature.signature).map_err(|_| Error::Signature)
 }
 
-fn decode_key(key: &OnlineKey) -> Result<Vec<u8>, Error> {
-    if key.key_id.is_empty()
-        || key.key_id.len() > 128
-        || !key
-            .key_id
+pub(crate) fn verify_document_inclusion(
+    document: &Value,
+    signature: &StogasSignature,
+    inclusion: &Value,
+    publisher: &OnlineKey,
+    now_unix_ms: i64,
+) -> Result<i64, Error> {
+    let artifact = canonical_json(&serde_json::json!({"document":document, "signature":signature}))
+        .map_err(invalid)?;
+    stogas_offline_sigstore::verify_rekor_document_inclusion(
+        &serde_json::to_vec(inclusion).map_err(invalid)?,
+        artifact.as_bytes(),
+        &decode_rekor_key(publisher)?,
+        now_unix_ms,
+    )
+    .map_err(|error| Error::Transparency(error.to_string()))
+}
+
+fn decode_key(key_id: &str, public_key: &str) -> Result<Vec<u8>, Error> {
+    if key_id.is_empty()
+        || key_id.len() > 128
+        || !key_id
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
     {
         return Err(Error::Invalid("key identifier".into()));
     }
-    let bytes = STANDARD.decode(&key.public_key).map_err(invalid)?;
-    if bytes.len() != 44 || STANDARD.encode(&bytes) != key.public_key {
+    let bytes = STANDARD.decode(public_key).map_err(invalid)?;
+    if STANDARD.encode(&bytes) != public_key {
         return Err(Error::Invalid("public key encoding".into()));
+    }
+    crate::signing::public_key_from_spki(&bytes).map_err(invalid)?;
+    Ok(bytes)
+}
+
+fn decode_rekor_key(key: &OnlineKey) -> Result<Vec<u8>, Error> {
+    let bytes = STANDARD.decode(&key.rekor_public_key).map_err(invalid)?;
+    if bytes.len() != 44 || STANDARD.encode(&bytes) != key.rekor_public_key {
+        return Err(Error::Invalid("Rekor public key encoding".into()));
     }
     let public = VerifyingKey::from_public_key_der(&bytes).map_err(invalid)?;
     if public.is_weak() {
-        return Err(Error::Invalid("weak public key".into()));
+        return Err(Error::Invalid("weak Rekor public key".into()));
     }
     Ok(bytes)
 }

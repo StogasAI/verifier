@@ -14,6 +14,7 @@ struct Vector {
     context_signature: String,
     rekor_spki: String,
     rekor_signature: String,
+    rekor_seed: String,
 }
 
 fn vector() -> Vector {
@@ -22,6 +23,42 @@ fn vector() -> Vector {
 
 fn bytes(value: &str) -> Vec<u8> {
     hex::decode(value).unwrap()
+}
+
+#[test]
+fn remote_message_representative_matches_independently_signed_vectors() {
+    let fixture: serde_json::Value = serde_json::from_str(include_str!(
+        "../../../../tests/fixtures/mldsa65-remote-v1.json"
+    ))
+    .unwrap();
+    let spki = STANDARD
+        .decode(fixture["public_key"].as_str().unwrap())
+        .unwrap();
+    let key = public_key_from_spki(&spki).unwrap();
+    for vector in fixture["vectors"].as_array().unwrap() {
+        let read = |name: &str| STANDARD.decode(vector[name].as_str().unwrap()).unwrap();
+        let message = read("message");
+        let context = read("context");
+        assert_eq!(
+            message_representative(key, &message, &context)
+                .unwrap()
+                .as_slice(),
+            read("mu")
+        );
+        verify(key, &message, &context, &read("signature")).unwrap();
+    }
+    assert!(matches!(
+        message_representative(&key[..key.len() - 1], b"", b""),
+        Err(Error::Length)
+    ));
+    assert!(matches!(
+        message_representative(key, b"", &[0; 256]),
+        Err(Error::Context)
+    ));
+    assert!(matches!(
+        message_representative(key, &vec![0; crate::MAX_INPUT_BYTES + 1], b""),
+        Err(Error::TooLarge)
+    ));
 }
 
 #[test]
@@ -37,6 +74,12 @@ fn matches_independent_go_keys_signatures_and_standard_spki() {
     );
     assert_eq!(key.public_key_spki().unwrap(), bytes(&v.spki));
     assert_eq!(key.rekor_public_key_spki().unwrap(), bytes(&v.rekor_spki));
+    let separate = RekorSubmissionKey::from_seed(&bytes(&v.rekor_seed)).unwrap();
+    assert_eq!(separate.public_key_spki().unwrap(), bytes(&v.rekor_spki));
+    assert_eq!(
+        separate.prepare_submission(&bytes(&v.message)).unwrap(),
+        key.prepare_rekor_submission(&bytes(&v.message)).unwrap()
+    );
     let submission: serde_json::Value =
         serde_json::from_str(&key.prepare_rekor_submission(&bytes(&v.message)).unwrap()).unwrap();
     assert_eq!(
@@ -60,6 +103,21 @@ fn matches_independent_go_keys_signatures_and_standard_spki() {
         assert_eq!(signature.as_slice(), bytes(expected));
         verify(key.public_key(), &message, context.as_bytes(), &signature).unwrap();
     }
+}
+
+#[test]
+fn separate_rekor_seed_rejects_wrong_lengths_and_bounds_documents() {
+    for seed in [&[][..], &[0; 31][..], &[0; 33][..]] {
+        assert!(matches!(
+            RekorSubmissionKey::from_seed(seed),
+            Err(Error::SubmissionKey)
+        ));
+    }
+    let key = RekorSubmissionKey::from_seed(&[42; 32]).unwrap();
+    assert!(matches!(
+        key.prepare_submission(&vec![0; crate::MAX_INPUT_BYTES + 1]),
+        Err(Error::TooLarge)
+    ));
 }
 
 #[test]

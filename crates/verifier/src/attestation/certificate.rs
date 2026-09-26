@@ -2,10 +2,7 @@
 
 use sha2::{Digest as _, Sha256};
 use thiserror::Error;
-use x509_parser::{
-    oid_registry::{OID_EC_P256, OID_KEY_TYPE_EC_PUBLIC_KEY},
-    parse_x509_certificate,
-};
+use x509_parser::parse_x509_certificate;
 
 pub use super::evidence::MAX_EVIDENCE_BYTES;
 use super::{Binding, evidence::SessionEvidence};
@@ -113,7 +110,7 @@ pub struct ParsedNativeCertificate<'a> {
 
 impl<'a> ParsedNativeCertificate<'a> {
     /// # Errors
-    /// Rejects malformed/oversized certificates, non-P-256 keys and missing or
+    /// Rejects malformed/oversized certificates, non-ML-DSA-65 keys and missing or
     /// duplicate evidence. The TLS stack must still verify `CertificateVerify`.
     pub fn parse(der: &'a [u8]) -> Result<Self, Error> {
         if der.len() > MAX_CERTIFICATE_BYTES {
@@ -125,19 +122,7 @@ impl<'a> ParsedNativeCertificate<'a> {
             return Err(Error::Certificate);
         }
         let key = certificate.public_key();
-        if key.algorithm.algorithm != OID_KEY_TYPE_EC_PUBLIC_KEY
-            || key
-                .algorithm
-                .parameters
-                .as_ref()
-                .and_then(|p| p.as_oid().ok())
-                .as_ref()
-                != Some(&OID_EC_P256)
-            || key.subject_public_key.unused_bits != 0
-            || p256::ecdsa::VerifyingKey::from_sec1_bytes(&key.subject_public_key.data).is_err()
-        {
-            return Err(Error::Certificate);
-        }
+        crate::signing::public_key_from_spki(key.raw).map_err(|_| Error::Certificate)?;
         let mut extensions = certificate
             .extensions()
             .iter()

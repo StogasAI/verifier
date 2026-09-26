@@ -27,6 +27,7 @@ hex.workspace = true
 hkdf = "0.13.0"
 hpke = { version = "=0.14.0", default-features = false, features = ["alloc", "getrandom", "aes", "x25519", "mlkem"] }
 libcrux-ml-dsa = { version = "=0.0.10", default-features = false, features = ["mldsa65"] }
+libcrux-sha3 = { version = "=0.0.10", default-features = false }
 p256 = { version = "0.13.2", default-features = false, features = ["ecdsa", "pkcs8"] }
 p384 = { version = "0.13.1", default-features = false, features = ["ecdsa", "pkcs8"], optional = true }
 pkcs8 = { version = "0.10.2", features = ["alloc"] }

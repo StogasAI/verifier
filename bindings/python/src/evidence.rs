@@ -3,7 +3,7 @@
 use pyo3::{exceptions::PyValueError, prelude::*, types::PyBytes};
 use std::sync::Arc;
 use stogas_verifier::{
-    approvals::{Environment, OnlineKey},
+    approvals::{Environment, RootKey},
     evidence::{self, boot::VerifiedBoot},
     receipt,
 };
@@ -40,7 +40,7 @@ impl EvidenceVerifier {
         let core = match (root_key_id, root_public_key) {
             (None, None) => evidence::Verifier::stogas(environment),
             (Some(key_id), Some(public_key)) => {
-                evidence::Verifier::new(environment, OnlineKey { key_id, public_key })
+                evidence::Verifier::new(environment, RootKey { key_id, public_key })
             }
             _ => {
                 return Err(PyValueError::new_err(
@@ -116,7 +116,12 @@ impl EvidenceSnapshot {
     fn require_current_keys(&self, py: Python<'_>) -> PyResult<()> {
         self.core
             .require_current_keys()
-            .map_err(|error| evidence_error(py, &error))
+            .map_err(|error| evidence_error(py, &error))?;
+        self.core
+            .approvals()
+            .valid_until(super::wall_clock_ms()?)
+            .map_err(|error| evidence_error(py, &evidence::Error::from(error)))?;
+        Ok(())
     }
 
     fn collateral_validity<'py>(

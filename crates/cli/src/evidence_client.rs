@@ -9,7 +9,7 @@ use reqwest::{
 };
 use stogas_verifier::{
     MAX_INPUT_BYTES,
-    approvals::{Environment, OnlineKey},
+    approvals::{Environment, RootKey},
     evidence::{self, Snapshot, VerifiedSession},
 };
 use tokio::{
@@ -86,7 +86,7 @@ impl EvidenceClient {
     ///
     /// # Errors
     /// Rejects a malformed root or unavailable maintained HTTPS configuration.
-    pub fn new(environment: Environment, root: OnlineKey) -> Result<Self, Error> {
+    pub fn new(environment: Environment, root: RootKey) -> Result<Self, Error> {
         let origins = environment.evidence_origins();
         let mut tls = rustls::ClientConfig::builder_with_provider(Arc::new(
             rustls::crypto::aws_lc_rs::default_provider(),
@@ -113,7 +113,7 @@ impl EvidenceClient {
         client: Client,
         origins: [Url; 2],
         environment: Environment,
-        root: OnlineKey,
+        root: RootKey,
     ) -> Result<Self, Error> {
         Ok(Self {
             client,
@@ -219,6 +219,10 @@ impl EvidenceClient {
             let check = Arc::clone(check);
             let checked = run_cpu(Arc::clone(&self.cpu), move || {
                 current.require_current_keys()?;
+                current
+                    .approvals()
+                    .valid_until(wall_clock_ms()?)
+                    .map_err(evidence::Error::from)?;
                 check(&current)?;
                 Ok(current)
             })
@@ -259,6 +263,10 @@ impl EvidenceClient {
                     let owned = Arc::clone(&snapshot);
                     run_cpu(Arc::clone(&self.cpu), move || {
                         owned.require_current_keys()?;
+                        owned
+                            .approvals()
+                            .valid_until(wall_clock_ms()?)
+                            .map_err(evidence::Error::from)?;
                         check(&owned)?;
                         Ok(())
                     })

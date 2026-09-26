@@ -1,10 +1,6 @@
 //! Immutable boot identity. Registration freshness and public log inclusion are separate checks.
 
-use base64::{
-    Engine as _,
-    engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
-};
-use ed25519_dalek::VerifyingKey;
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use hpke::{Deserializable as _, kem::XWing};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256, Sha512};
@@ -13,7 +9,7 @@ use super::{Error, Snapshot, VerifiedSnpReport};
 use crate::approvals::Environment;
 
 pub const BOOT_SCHEMA: &str = "stogas.node-boot.v1";
-pub const BOOT_PAYLOAD_TYPE: &str = "application/vnd.stogas.node-boot.v1+json";
+pub const BOOT_PUBLICATION_SCHEMA: &str = "stogas.node-registration.v1";
 pub const REPORT_DATA_SCHEMA: &str = "stogas.node-report.v1";
 const RENEWAL_DOMAIN: &[u8] = b"stogas.certificate-renewal.v1\0";
 
@@ -33,10 +29,10 @@ struct CertificateRenewal {
 pub fn verify_certificate_renewal(
     request: &[u8],
     expected_node_id: &str,
-    public_key: &[u8; 32],
+    public_key: &[u8],
     now_unix_ms: i64,
 ) -> Result<(), Error> {
-    if request.len() > 512 {
+    if request.len() > 5 * 1024 {
         return Err(Error::TooLarge);
     }
     let request: CertificateRenewal =
@@ -48,9 +44,7 @@ pub fn verify_certificate_renewal(
     {
         return Err(invalid("certificate renewal identity or time differs"));
     }
-    let key = VerifyingKey::from_bytes(public_key).map_err(invalid)?;
-    let signature =
-        ed25519_dalek::Signature::from_slice(&decode(&request.signature, 64)?).map_err(invalid)?;
+    let signature = decode(&request.signature, crate::signing::SIGNATURE_BYTES)?;
     let message = [
         RENEWAL_DOMAIN,
         request.node_id.as_bytes(),
@@ -58,7 +52,7 @@ pub fn verify_certificate_renewal(
         &request.issued_at_ms.to_be_bytes(),
     ]
     .concat();
-    key.verify_strict(&message, &signature).map_err(invalid)
+    crate::signing::verify(public_key, &message, &[], &signature).map_err(invalid)
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -66,7 +60,7 @@ pub fn verify_certificate_renewal(
 pub struct BootReportData {
     pub schema: String,
     pub environment: Environment,
-    pub ed25519_public_key: String,
+    pub signing_public_key: String,
     pub hpke_public_key: String,
     pub tls_spki_sha256: String,
     pub registration_challenge: String,
@@ -81,6 +75,14 @@ pub struct BootRecord {
     /// Canonical unpadded base64url of the raw 1184-byte SNP report.
     pub report: String,
     pub report_data: BootReportData,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BootInclusion {
+    evidence_sha256: String,
+    signature: crate::StogasSignature,
+    rekor: serde_json::Value,
 }
 
 /// Hardware and registration checks passed. The Control transaction must still consume its
@@ -127,7 +129,7 @@ impl VerifiedRegistration {
             "reported_tcb": self.hardware.reported_tcb(),
             "boot_sha256": hex::encode(self.document_sha256),
             "gateway_release_id": self.record.gateway_release_id,
-            "ed25519_public_key": self.record.report_data.ed25519_public_key,
+            "signing_public_key": self.record.report_data.signing_public_key,
             "hpke_public_key": self.record.report_data.hpke_public_key,
             "tls_spki_sha256": self.record.report_data.tls_spki_sha256,
             "valid_from_unix_ms": self.hardware.validity().not_before_unix_ms,
@@ -199,15 +201,7 @@ impl BootReportData {
         }
         lower_hex::<32>(&self.tls_spki_sha256)?;
         lower_hex::<32>(&self.registration_challenge)?;
-        let node_key: [u8; 32] = decode(&self.ed25519_public_key, 32)?
-            .try_into()
-            .map_err(|_| invalid("node public key length"))?;
-        if VerifyingKey::from_bytes(&node_key)
-            .map_err(invalid)?
-            .is_weak()
-        {
-            return Err(invalid("weak node signing key"));
-        }
+        decode(&self.signing_public_key, crate::signing::PUBLIC_KEY_BYTES)?;
         let recipient = decode(&self.hpke_public_key, 1216)?;
         <XWing as hpke::Kem>::PublicKey::from_bytes(&recipient).map_err(invalid)?;
         let canonical = crate::canonical_json(&serde_json::to_value(self).map_err(invalid)?)
@@ -281,24 +275,36 @@ impl Snapshot {
         {
             return Err(Error::TooLarge);
         }
-        let proof = crate::strict_json::from_slice(inclusion).map_err(invalid)?;
-        let signer_id = proof["verificationMaterial"]["publicKey"]["hint"]
-            .as_str()
-            .ok_or_else(|| invalid("boot signer absent"))?;
+        let proof: BootInclusion =
+            serde_json::from_value(crate::strict_json::from_slice(inclusion).map_err(invalid)?)
+                .map_err(invalid)?;
+        if proof.evidence_sha256.len() != 64
+            || !proof
+                .evidence_sha256
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        {
+            return Err(invalid("invalid initial evidence identity"));
+        }
         let keys = self.approvals.keys();
         let signer = std::iter::once(&keys.active_key)
             .chain(&keys.retired_keys)
-            .find(|key| key.key_id == signer_id)
+            .find(|key| key.key_id == proof.signature.key_id)
             .ok_or(Error::Approval(crate::approvals::Error::InactiveKey))?;
-        let integrated = stogas_offline_sigstore::verify_keyed_dsse(
-            &proof,
-            document,
-            BOOT_PAYLOAD_TYPE,
+        let publication = serde_json::json!({"schema":BOOT_PUBLICATION_SCHEMA, "boot":record, "evidence_sha256":proof.evidence_sha256});
+        crate::approvals::verify_signature(
+            &publication,
+            &proof.signature,
             &signer.key_id,
-            &STANDARD.decode(&signer.public_key).map_err(invalid)?,
+            &signer.public_key,
+        )?;
+        let integrated = crate::approvals::verify_document_inclusion(
+            &publication,
+            &proof.signature,
+            &proof.rekor,
+            signer,
             now_unix_ms,
-        )
-        .map_err(invalid)?;
+        )?;
         let identity = self.verify_boot_report(document, record, now_unix_ms)?;
         Ok(VerifiedBoot {
             identity,

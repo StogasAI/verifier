@@ -2981,6 +2981,7 @@ dependencies = [
  "hkdf 0.13.0",
  "hpke",
  "libcrux-ml-dsa",
+ "libcrux-sha3",
  "p256",
  "p384",
  "pkcs8",

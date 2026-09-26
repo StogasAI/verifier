@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
 import * as publicAPI from '@stogas/verifier';
 import { EvidenceVerifier, StogasTransport } from '@stogas/verifier';
 
@@ -10,11 +11,8 @@ for (const retired of [
 ])
 	assert.equal(retired in publicAPI, false);
 
-const verifier = new EvidenceVerifier(
-	'prod',
-	'stogas-fixture-root-20260920',
-	'MCowBQYDK2VwAyEA3L5P2vQ8YUaIm4Kw5pD8iMEoZgUuo+oEKx95iLylrgg='
-);
+const { root } = JSON.parse(readFileSync(new URL('../fixtures/logged-key-manifest.json', import.meta.url), 'utf8'));
+const verifier = new EvidenceVerifier('prod', root.key_id, root.public_key);
 try {
 	assert.throws(() => verifier.refresh(new TextEncoder().encode('{"body":')));
 } finally {

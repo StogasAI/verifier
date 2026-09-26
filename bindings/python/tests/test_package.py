@@ -1,6 +1,8 @@
 """Tests against the installed wheel, with no service or network dependency."""
 
 import unittest
+import json
+from pathlib import Path
 
 from stogas_verifier import (
     EvidenceSnapshot,
@@ -11,10 +13,8 @@ from stogas_verifier import (
 )
 
 # Local offline trust configuration, never accepted by the managed transport.
-ROOT = {
-    "root_key_id": "test-root",
-    "root_public_key": "MCowBQYDK2VwAyEAzLbKFJboWdiCQt4n8Zj50x+pg22KIq7vpD4UhWXiHks=",
-}
+_root = json.loads((Path(__file__).resolve().parents[3] / "tests/fixtures/logged-key-manifest.json").read_text())["root"]
+ROOT = {"root_key_id": _root["key_id"], "root_public_key": _root["public_key"]}
 
 
 class PackageTests(unittest.TestCase):
