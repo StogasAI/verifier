@@ -1,0 +1,14 @@
+<project xmlns="http://maven.apache.org/POM/4.0.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+  <modelVersion>4.0.0</modelVersion>
+  <groupId>example</groupId><artifactId>stogas-scala-openai</artifactId><version>1.0.0</version>
+  <properties><scala.version>3.9.0</scala.version><project.build.sourceEncoding>UTF-8</project.build.sourceEncoding></properties>
+  <dependencies>
+    <dependency><groupId>org.scala-lang</groupId><artifactId>scala3-library_3</artifactId><version>${scala.version}</version></dependency>
+    <dependency><groupId>ai.stogas</groupId><artifactId>verifier</artifactId><version>0.1.0-alpha.1</version></dependency>
+    <dependency><groupId>com.openai</groupId><artifactId>openai-java</artifactId><version>4.68.0</version></dependency>
+  </dependencies>
+  <build><plugins>
+    <plugin><groupId>net.alchim31.maven</groupId><artifactId>scala-maven-plugin</artifactId><version>4.9.10</version><executions><execution><goals><goal>compile</goal></goals></execution></executions><configuration><release>17</release></configuration></plugin>
+    <plugin><groupId>org.codehaus.mojo</groupId><artifactId>exec-maven-plugin</artifactId><version>3.6.3</version><configuration><mainClass>example.Main</mainClass></configuration></plugin>
+  </plugins></build>
+</project>

@@ -1,6 +1,7 @@
 //! Offline verification of the narrow GitHub Actions Sigstore profile used by Stogas.
 
 mod crypto;
+mod hashedrekord;
 mod sct;
 mod sigstore;
 pub mod strict_json;
@@ -15,6 +16,8 @@ use thiserror::Error;
 
 /// Maximum accepted serialized Sigstore bundle size.
 pub const MAX_BUNDLE_BYTES: usize = 1_048_576;
+/// Maximum document bytes hashed by the public document-inclusion verifier.
+pub const MAX_DOCUMENT_BYTES: usize = 16 * 1024 * 1024;
 const MAX_SUBJECTS: usize = 16;
 const DSSE_PAYLOAD_TYPE: &str = "application/vnd.in-toto+json";
 const SIGSTORE_BUNDLE_MEDIA_TYPE: &str = "application/vnd.dev.sigstore.bundle.v0.3+json";
@@ -96,6 +99,30 @@ pub fn verify_keyed_dsse(
         now_unix_ms,
     )
     .map_err(Error::Cryptographic)
+}
+
+/// Verify publication of exact artifact bytes through Rekor's SHA-512/Ed25519ph profile.
+///
+/// The caller supplies the expected submission key from its authenticated policy.
+/// This proves log inclusion, submission identity and time, **not** the artifact's
+/// author or approval. Separately authenticate the artifact with its trusted signing
+/// policy, including any post-quantum signature.
+///
+/// # Errors
+/// Rejects malformed bundles, substituted artifacts, invalid signatures, log proofs or times.
+pub fn verify_rekor_document_inclusion(
+    bundle: &[u8],
+    artifact: &[u8],
+    submission_key_spki: &[u8],
+    now_unix_ms: i64,
+) -> Result<i64, Error> {
+    if bundle.len() > MAX_BUNDLE_BYTES || artifact.len() > MAX_DOCUMENT_BYTES {
+        return Err(Error::TooLarge);
+    }
+    let value =
+        strict_json::from_slice(bundle).map_err(|error| Error::InvalidBundle(error.to_string()))?;
+    hashedrekord::verify(&value, artifact, submission_key_spki, now_unix_ms)
+        .map_err(Error::Cryptographic)
 }
 
 /// Offline Sigstore verification failure.

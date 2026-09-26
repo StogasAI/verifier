@@ -1,0 +1,15 @@
+{
+	"name": "stogas/php-openai-example",
+	"description": "OpenAI PHP through the native Stogas transport",
+	"type": "project",
+	"require": {
+		"php": ">=8.2",
+		"ext-ffi": "*",
+		"openai-php/client": "^0.21.0",
+		"symfony/http-client": "^7.4",
+		"nyholm/psr7": "^1.8"
+	},
+	"config": {
+		"allow-plugins": false
+	}
+}

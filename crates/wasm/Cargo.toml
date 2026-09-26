@@ -26,6 +26,7 @@ sha2.workspace = true
 stogas-offline-sigstore = { path = "../offline-sigstore" }
 stogas-verifier = { path = "../verifier" }
 wasm-bindgen = "0.2.101"
+zeroize.workspace = true
 
 [lints]
 workspace = true

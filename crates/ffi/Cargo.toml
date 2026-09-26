@@ -10,11 +10,20 @@ repository.workspace = true
 [lib]
 crate-type = ["cdylib", "staticlib", "rlib"]
 
+[features]
+default = ["transport"]
+transport = ["dep:stogas-sdk"]
+staging = ["stogas-verifier/staging", "stogas-sdk?/staging"]
+
 [dependencies]
 serde.workspace = true
 serde_json.workspace = true
-stogas-sdk = { package = "stogas", path = "../cli" }
+stogas-sdk = { package = "stogas", path = "../cli", optional = true }
 stogas-verifier = { path = "../verifier" }
+
+[dev-dependencies]
+base64.workspace = true
+hex.workspace = true
 
 [lints.rust]
 missing_docs = "allow"

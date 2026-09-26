@@ -21,22 +21,27 @@ snp = ["dep:p384", "dep:rsa", "dep:sev", "dep:signature"]
 aes-gcm = { version = "=0.11.0", default-features = false, features = ["aes", "alloc", "zeroize"] }
 base64.workspace = true
 chrono.workspace = true
-drand-verify = { version = "0.6.2", default-features = false }
-ed25519-dalek.workspace = true
+ed25519-dalek = { workspace = true, features = ["digest"] }
 getrandom = "0.4.3"
 hex.workspace = true
 hkdf = "0.13.0"
 hpke = { version = "=0.14.0", default-features = false, features = ["alloc", "getrandom", "aes", "x25519", "mlkem"] }
+libcrux-ml-dsa = { version = "=0.0.10", default-features = false, features = ["mldsa65"] }
+libcrux-sha3 = { version = "=0.0.10", default-features = false }
 p256 = { version = "0.13.2", default-features = false, features = ["ecdsa", "pkcs8"] }
 p384 = { version = "0.13.1", default-features = false, features = ["ecdsa", "pkcs8"], optional = true }
+pkcs8 = { version = "0.10.2", features = ["alloc"] }
 serde.workspace = true
 serde_json = { workspace = true, features = ["raw_value"] }
+serde_json_canonicalizer = "=0.3.2"
 sev = { version = "8.0.0", default-features = false, features = ["crypto_nossl", "snp"], optional = true }
 sha2.workspace = true
 sha2-v11 = { package = "sha2", version = "0.11.0" }
+spki = "0.7.3"
 signature = { version = "2.2.0", optional = true }
 rsa = { version = "0.9.10", default-features = false, features = ["sha2", "std"], optional = true }
 stogas-offline-sigstore = { path = "../offline-sigstore", version = "0.1.0-alpha.1" }
+subtle = { version = "2.6.1", default-features = false }
 thiserror.workspace = true
 x509-parser = { version = "0.18.0" }
 zeroize.workspace = true

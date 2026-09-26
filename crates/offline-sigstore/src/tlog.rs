@@ -52,6 +52,17 @@ pub fn verify_keyed(
     if entry.kind_version.kind != "dsse" || entry.kind_version.version != "0.0.1" {
         return Err("only Rekor DSSE v0.0.1 is supported for hardware policies".into());
     }
+    let integrated_time = verify_publication(entry, now_seconds, root)?;
+    verify_keyed_body_binding(entry, envelope, public_key_spki)?;
+    Ok(integrated_time)
+}
+
+/// Verify log signatures, time and inclusion. The caller binds the entry body to its artifact.
+pub fn verify_publication(
+    entry: &TransparencyLogEntry,
+    now_seconds: i64,
+    root: &TrustedRoot,
+) -> Result<i64, String> {
     let integrated_time = parse_i64(&entry.integrated_time, "integrated time")?;
     if integrated_time <= 0 || integrated_time > now_seconds + 60 {
         return Err("Rekor integrated time is invalid or in the future".into());
@@ -60,7 +71,6 @@ pub fn verify_keyed(
     let log_key = root.rekor_key_at(&log_id, integrated_time)?;
     verify_set(entry, &log_id, &log_key.spki)?;
     verify_inclusion(entry, &log_id, &log_key.spki)?;
-    verify_keyed_body_binding(entry, envelope, public_key_spki)?;
     Ok(integrated_time)
 }
 

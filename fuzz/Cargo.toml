@@ -8,10 +8,11 @@ edition = "2024"
 cargo-fuzz = true
 
 [dependencies]
-hpke = { version = "=0.14.0", default-features = false, features = ["alloc", "getrandom", "aes", "x25519", "mlkem"] }
+hex = "0.4"
+serde_json = "1"
 libfuzzer-sys = "0.4.13"
 stogas-offline-sigstore = { path = "../crates/offline-sigstore" }
-stogas-verifier = { path = "../crates/verifier" }
+stogas-verifier = { path = "../crates/verifier", features = ["staging"] }
 stogas-verifier-ffi = { path = "../crates/ffi" }
 
 [[bin]]
@@ -22,15 +23,15 @@ doc = false
 bench = false
 
 [[bin]]
-name = "bundle_x509_snp_drand"
-path = "fuzz_targets/bundle_x509_snp_drand.rs"
+name = "current_evidence"
+path = "fuzz_targets/current_evidence.rs"
 test = false
 doc = false
 bench = false
 
 [[bin]]
-name = "heartbeat_admission"
-path = "fuzz_targets/heartbeat_admission.rs"
+name = "session_evidence"
+path = "fuzz_targets/session_evidence.rs"
 test = false
 doc = false
 bench = false
@@ -43,8 +44,15 @@ doc = false
 bench = false
 
 [[bin]]
-name = "e2ee_client"
-path = "fuzz_targets/e2ee_client.rs"
+name = "encrypted_setup"
+path = "fuzz_targets/encrypted_setup.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "signatures"
+path = "fuzz_targets/signatures.rs"
 test = false
 doc = false
 bench = false

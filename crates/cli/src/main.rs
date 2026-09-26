@@ -4,17 +4,15 @@ use sha2::{Digest as _, Sha256};
 use std::{
     io::Read as _,
     path::PathBuf,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{SystemTime, UNIX_EPOCH},
 };
 use stogas::SecurityMode;
 use stogas_verifier::{
-    MAX_INPUT_BYTES, VerificationOutput, Verifier,
-    response_proof::{MAX_BODY_BYTES, MAX_PROOF_BYTES},
+    MAX_INPUT_BYTES,
+    evidence::Verifier,
+    receipt::{self, VerifiedReceipt},
 };
 use tokio::io::AsyncReadExt as _;
-
-const PRODUCTION_BUNDLE_URL: &str = "https://evidence.stogas.ai/bundles/latest.json";
-const MAX_BUFFERED_RESPONSE_BYTES: usize = MAX_BODY_BYTES + MAX_PROOF_BYTES + 16;
 
 #[derive(Parser)]
 #[command(name = "stogas-verify", version, about)]
@@ -25,32 +23,35 @@ struct Cli {
 
 struct ProofCommandInput {
     proof: Option<PathBuf>,
+    stream: bool,
     request: PathBuf,
     response: PathBuf,
-    bundle: Option<PathBuf>,
-    ledger: Option<PathBuf>,
-    catalog: Option<PathBuf>,
-    e2ee_transcript_sha256: Option<String>,
-    json: bool,
+    bundle: PathBuf,
+    boot: PathBuf,
+    environment: stogas::Environment,
     now_unix_ms: Option<i64>,
-    policy: Option<PathBuf>,
 }
 
 struct VerifyCommandInput {
     bundle: PathBuf,
-    policy: Option<PathBuf>,
+    environment: stogas::Environment,
     json: bool,
     now_unix_ms: Option<i64>,
 }
 
 struct ServeCommandInput {
-    bundle_url: String,
-    upstream: String,
+    environment: stogas::Environment,
+    upstream: Option<String>,
     listen: String,
-    bundle_refresh_seconds: u64,
-    security: Option<SecurityMode>,
+    max_connections: usize,
+    security: SecurityMode,
     browser_origin: Option<String>,
-    policy: Option<PathBuf>,
+    exit_on_stdin_close: bool,
+}
+
+fn parse_environment(value: &str) -> Result<stogas::Environment, String> {
+    serde_json::from_value(serde_json::Value::String(value.to_owned()))
+        .map_err(|_| "environment is unsupported by this build".into())
 }
 
 #[derive(Subcommand)]
@@ -59,9 +60,8 @@ enum Command {
     Verify {
         /// Bundle path, or `-` for stdin.
         bundle: PathBuf,
-        /// Caller-owned hardware appraisal policy. This replaces only mutable AMD security rules.
-        #[arg(long)]
-        policy: Option<PathBuf>,
+        #[arg(long, default_value = "prod", value_parser = parse_environment)]
+        environment: stogas::Environment,
         /// Emit stable JSON.
         #[arg(long)]
         json: bool,
@@ -69,59 +69,55 @@ enum Command {
         #[arg(long, hide = true)]
         now_unix_ms: Option<i64>,
     },
-    /// Verify a compact post-facto response receipt.
+    /// Verify an exact-content receipt without network access.
     Proof {
-        /// Raw receipt JSON for a stream. Omit for a buffered response.
-        #[arg(long)]
+        /// Detached final Stogas metadata JSON; --response then contains only the exact signed bytes.
+        #[arg(long, conflicts_with = "stream")]
         proof: Option<PathBuf>,
+        /// Read a complete SSE response, including its metadata and terminal event.
+        #[arg(long)]
+        stream: bool,
         /// Exact plaintext request body sent to the inference endpoint.
         #[arg(long)]
         request: PathBuf,
-        /// Complete buffered JSON, or exact SSE bytes excluding the final `stogas` comment.
+        /// Buffered JSON with metadata, complete SSE, or detached signed response bytes.
         #[arg(long)]
         response: PathBuf,
-        /// Currently valid bundle used for the request.
-        #[arg(long, required_unless_present = "ledger", conflicts_with = "ledger")]
-        bundle: Option<PathBuf>,
-        /// Caller-owned hardware appraisal policy for current-bundle verification.
-        #[arg(long, conflicts_with = "ledger")]
-        policy: Option<PathBuf>,
-        /// Historical node evidence returned by the transparency API.
-        #[arg(long, required_unless_present = "bundle", conflicts_with = "bundle")]
-        ledger: Option<PathBuf>,
-        /// Immutable catalog approval selected by the signed catalog sequence.
-        #[arg(long, required_unless_present = "bundle", conflicts_with = "bundle")]
-        catalog: Option<PathBuf>,
-        /// Exact E2EE transcript SHA-256 for an encrypted exchange.
+        /// Archived evidence bundle identified by the boot archive.
         #[arg(long)]
-        e2ee_transcript_sha256: Option<String>,
-        /// Emit stable JSON.
+        bundle: PathBuf,
+        /// Immutable boot archive containing its quote, inclusion and evidence digest.
+        #[arg(long)]
+        boot: PathBuf,
+        #[arg(long, default_value = "prod", value_parser = parse_environment)]
+        environment: stogas::Environment,
+        /// Emit stable JSON containing the verified content commitment.
         #[arg(long)]
         json: bool,
-        /// Exact Unix time in milliseconds, for tests and auditing only.
+        /// Exact appraisal time in milliseconds, for tests and historical audits only.
         #[arg(long, hide = true)]
         now_unix_ms: Option<i64>,
     },
     /// Run the verified loopback proxy.
     Serve {
-        #[arg(long, default_value = PRODUCTION_BUNDLE_URL)]
-        bundle_url: String,
-        #[arg(long, default_value = "https://api.stogas.ai")]
-        upstream: String,
+        #[arg(long, default_value = "prod", value_parser = parse_environment)]
+        environment: stogas::Environment,
+        /// Optional HTTPS API origin; the environment's evidence roots remain fixed.
+        #[arg(long)]
+        upstream: Option<String>,
         #[arg(long, default_value = "127.0.0.1:8787")]
         listen: String,
-        /// Bundle refresh target in seconds. Scheduled attempts use ±10% jitter.
-        #[arg(long, default_value_t = 300, value_parser = clap::value_parser!(u64).range(1..))]
-        bundle_refresh_seconds: u64,
-        /// Protect inference with verified TLS, application E2EE, or both.
-        #[arg(long, value_enum)]
-        security: Option<SecurityMode>,
-        /// Allow one browser origin and print a capability-protected browser base URL.
+        /// Maximum reusable channels, opened lazily.
+        #[arg(long, default_value_t = 4)]
+        max_connections: usize,
+        #[arg(long, value_enum, default_value = "tls")]
+        security: SecurityMode,
+        /// Allow one browser origin to use the capability-protected local endpoint.
         #[arg(long)]
         browser_origin: Option<String>,
-        /// Caller-owned hardware appraisal policy.
+        /// Close when the parent closes stdin; intended for supervised child processes.
         #[arg(long)]
-        policy: Option<PathBuf>,
+        exit_on_stdin_close: bool,
     },
 }
 
@@ -130,13 +126,13 @@ async fn main() -> Result<()> {
     match Cli::parse().command {
         Command::Verify {
             bundle,
-            policy,
+            environment,
             json,
             now_unix_ms,
         } => {
             run_verify(VerifyCommandInput {
                 bundle,
-                policy,
+                environment,
                 json,
                 now_unix_ms,
             })
@@ -144,47 +140,45 @@ async fn main() -> Result<()> {
         }
         Command::Proof {
             proof,
+            stream,
             request,
             response,
             bundle,
-            policy,
-            ledger,
-            catalog,
-            e2ee_transcript_sha256,
+            boot,
+            environment,
             json,
             now_unix_ms,
         } => {
-            run_proof(ProofCommandInput {
+            let output = run_proof(ProofCommandInput {
                 proof,
+                stream,
                 request,
                 response,
                 bundle,
-                ledger,
-                catalog,
-                e2ee_transcript_sha256,
-                json,
+                boot,
+                environment,
                 now_unix_ms,
-                policy,
             })
             .await?;
+            print_proof_output(&output, json)?;
         }
         Command::Serve {
-            bundle_url,
+            environment,
             upstream,
             listen,
-            bundle_refresh_seconds,
+            max_connections,
             security,
             browser_origin,
-            policy,
+            exit_on_stdin_close,
         } => {
             run_serve(ServeCommandInput {
-                bundle_url,
+                environment,
                 upstream,
                 listen,
-                bundle_refresh_seconds,
+                max_connections,
                 security,
                 browser_origin,
-                policy,
+                exit_on_stdin_close,
             })
             .await?;
         }
@@ -205,143 +199,82 @@ async fn run_verify(input: VerifyCommandInput) -> Result<()> {
     } else {
         read_bounded_file(&input.bundle, MAX_INPUT_BYTES, "bundle").await?
     };
-    let policy = match input.policy {
-        Some(path) => Some(read_bounded_file(&path, MAX_INPUT_BYTES, "hardware policy").await?),
-        None => None,
-    };
-    let mut verifier = Verifier::default();
+    let mut verifier = stogas_verifier::evidence::Verifier::stogas(input.environment)?;
     let now = input.now_unix_ms.unwrap_or_else(wall_clock_ms);
-    let output = match policy.as_deref() {
-        Some(policy) => verifier.verify_bundle_with_policy(&bytes, policy, now)?,
-        None => verifier.verify_bundle(&bytes, now)?,
-    };
-    print_output(&output, input.json)
+    let output = verifier.refresh(&bytes, now)?;
+    print_output(&output, input.json, now);
+    Ok(())
 }
 
 async fn run_serve(input: ServeCommandInput) -> Result<()> {
-    let hardware_policy = match input.policy {
-        Some(path) => Some(read_bounded_file(&path, MAX_INPUT_BYTES, "hardware policy").await?),
-        None => None,
-    };
-    let security = resolved_security(input.security, input.browser_origin.as_deref());
     stogas::serve(stogas::ServeOptions {
-        bundle_url: input.bundle_url,
-        upstream: input.upstream,
+        transport: stogas::TransportOptions {
+            environment: input.environment,
+            security: input.security,
+            max_connections: input.max_connections,
+            base_url: input.upstream,
+        },
         listen: input.listen,
-        bundle_refresh_interval: Duration::from_secs(input.bundle_refresh_seconds),
-        security,
         browser_origin: input.browser_origin,
-        hardware_policy,
+        exit_on_stdin_close: input.exit_on_stdin_close,
     })
     .await
 }
 
-async fn run_proof(input: ProofCommandInput) -> Result<()> {
-    let streaming = if let Some(path) = input.proof.as_ref() {
-        Some((
-            read_proof(path).await?,
-            hash_file(&input.request, "request body").await?,
-            hash_file(&input.response, "response body").await?,
-        ))
-    } else {
-        None
-    };
-    let buffered = if streaming.is_none() {
-        Some((
-            read_bounded_file(&input.request, MAX_BODY_BYTES, "request body").await?,
-            read_bounded_file(
-                &input.response,
-                MAX_BUFFERED_RESPONSE_BYTES,
-                "buffered response",
-            )
-            .await?,
-        ))
-    } else {
-        None
-    };
-    let now = input.now_unix_ms.unwrap_or_else(wall_clock_ms);
-    let mut verifier = Verifier::default();
-    let output = if let Some(bundle) = input.bundle {
-        let bundle = read_bounded_file(&bundle, MAX_INPUT_BYTES, "bundle").await?;
-        match input.policy {
-            Some(policy) => {
-                let policy = read_bounded_file(&policy, MAX_INPUT_BYTES, "hardware policy").await?;
-                verifier.verify_bundle_with_policy(&bundle, &policy, now)?;
-            }
-            None => {
-                verifier.verify_bundle(&bundle, now)?;
-            }
-        }
-        match (streaming.as_ref(), buffered.as_ref()) {
-            (Some((proof, request_sha256, response_sha256)), None) => verifier
-                .verify_response_proof_hashes(
-                    proof,
-                    request_sha256,
-                    response_sha256,
-                    input.e2ee_transcript_sha256.as_deref(),
-                    now,
-                )?,
-            (None, Some((request, response))) => verifier.verify_response_proof(
-                request,
-                response,
-                input.e2ee_transcript_sha256.as_deref(),
-                now,
-            )?,
-            _ => unreachable!(),
-        }
-    } else {
-        let ledger = input
-            .ledger
-            .context("a bundle or historical ledger is required")?;
-        let ledger = read_bounded_file(&ledger, MAX_INPUT_BYTES, "ledger record").await?;
-        let catalog = input
-            .catalog
-            .context("a historical catalog approval is required with a ledger")?;
-        let catalog = read_bounded_file(&catalog, MAX_INPUT_BYTES, "catalog approval").await?;
-        match (streaming.as_ref(), buffered.as_ref()) {
-            (Some((proof, request_sha256, response_sha256)), None) => verifier
-                .verify_historical_response_proof_hashes(
-                    &stogas_verifier::HistoricalResponseProofHashInput {
-                        proof_bytes: proof,
-                        request_sha256,
-                        response_sha256,
-                        expected_e2ee_transcript_sha256: input.e2ee_transcript_sha256.as_deref(),
-                        now_unix_ms: now,
-                        ledger_bytes: &ledger,
-                        catalog_approval_bytes: &catalog,
-                    },
-                )?,
-            (None, Some((request, response))) => verifier.verify_historical_response_proof(
-                &stogas_verifier::HistoricalResponseProofInput {
-                    request_body: request,
-                    response_body: response,
-                    expected_e2ee_transcript_sha256: input.e2ee_transcript_sha256.as_deref(),
-                    now_unix_ms: now,
-                    ledger_bytes: &ledger,
-                    catalog_approval_bytes: &catalog,
-                },
-            )?,
-            _ => unreachable!(),
-        }
-    };
-    print_proof_output(&output, input.json)
+async fn run_proof(input: ProofCommandInput) -> Result<VerifiedReceipt> {
+    let verifier = Verifier::stogas(input.environment)?;
+    verify_proof_files(&input, &verifier).await
 }
 
-fn print_proof_output(
-    output: &stogas_verifier::response_proof::VerifiedResponseProof,
-    json: bool,
-) -> Result<()> {
+async fn verify_proof_files(
+    input: &ProofCommandInput,
+    verifier: &Verifier,
+) -> Result<VerifiedReceipt> {
+    let now = input.now_unix_ms.unwrap_or_else(wall_clock_ms);
+    let bundle = read_bounded_file(&input.bundle, MAX_INPUT_BYTES, "bundle").await?;
+    let archive = read_bounded_file(&input.boot, 64 * 1024, "boot archive").await?;
+    let boot = verifier.verify_boot_archive(&archive, &bundle, now)?;
+    let request = hash_file(&input.request, "request body").await?;
+    if let Some(path) = &input.proof {
+        let proof = read_bounded_file(path, receipt::MAX_METADATA_BYTES, "Stogas metadata").await?;
+        let response = hash_file(&input.response, "response body").await?;
+        return Ok(receipt::verify_metadata(&proof, &boot, &request, &response)?.receipt);
+    }
+    if input.stream {
+        let mut response = tokio::fs::File::open(&input.response).await?;
+        let mut stream = receipt::Stream::new(request);
+        let mut buffer = vec![0; 64 * 1024].into_boxed_slice();
+        loop {
+            let count = response.read(&mut buffer).await?;
+            if count == 0 {
+                break;
+            }
+            stream.push(&buffer[..count])?;
+        }
+        return Ok(stream.finish(&boot)?.receipt);
+    }
+    let response = read_bounded_file(
+        &input.response,
+        receipt::MAX_BUFFERED_BYTES,
+        "buffered response",
+    )
+    .await?;
+    Ok(receipt::verify_buffered(&boot, &request, &response)?.receipt)
+}
+
+fn print_proof_output(output: &VerifiedReceipt, json: bool) -> Result<()> {
     if json {
         println!("{}", serde_json::to_string(&output)?);
     } else {
         println!("Verified response");
         println!("  node: {}", output.node_id);
-        println!("  catalog: {}", output.catalog.digest);
+        println!("  request SHA-256: {}", output.request_sha256);
+        println!("  response SHA-256: {}", output.response_sha256);
     }
     Ok(())
 }
 
-async fn hash_file(path: &PathBuf, label: &str) -> Result<String> {
+async fn hash_file(path: &PathBuf, label: &str) -> Result<[u8; 32]> {
     let mut file = tokio::fs::File::open(path)
         .await
         .with_context(|| format!("could not read {}", path.display()))?;
@@ -357,18 +290,7 @@ async fn hash_file(path: &PathBuf, label: &str) -> Result<String> {
         }
         hasher.update(&buffer[..read]);
     }
-    Ok(hex::encode(hasher.finalize()))
-}
-
-async fn read_proof(path: &PathBuf) -> Result<Vec<u8>> {
-    let bytes = read_bounded_file(path, MAX_PROOF_BYTES, "response proof").await?;
-    let trimmed = std::str::from_utf8(&bytes)
-        .context("response proof must be UTF-8 JSON")?
-        .trim();
-    if !trimmed.starts_with('{') || !trimmed.ends_with('}') {
-        bail!("response proof must be a JSON object");
-    }
-    Ok(trimmed.as_bytes().to_vec())
+    Ok(hasher.finalize().into())
 }
 
 async fn read_bounded_file(path: &PathBuf, maximum: usize, label: &str) -> Result<Vec<u8>> {
@@ -386,30 +308,18 @@ async fn read_bounded_file(path: &PathBuf, maximum: usize, label: &str) -> Resul
     Ok(bytes)
 }
 
-fn resolved_security(
-    requested: Option<SecurityMode>,
-    browser_origin: Option<&str>,
-) -> SecurityMode {
-    requested.unwrap_or_else(|| {
-        if browser_origin.is_some() {
-            SecurityMode::E2ee
-        } else {
-            SecurityMode::Tls
-        }
-    })
-}
-
-fn print_output(output: &VerificationOutput, json: bool) -> Result<()> {
+fn print_output(output: &stogas_verifier::evidence::Snapshot, json: bool, now: i64) {
     if json {
-        println!("{}", serde_json::to_string(output)?);
-        return Ok(());
+        let mut summary = output.summary();
+        summary["body_sha256"] = serde_json::json!(output.body_sha256());
+        summary["collateral"] = serde_json::json!(output.collateral_summary(now));
+        println!("{summary}");
+        return;
     }
-    println!("Verified bundle {}", output.bundle.sequence);
-    println!("  releases: {}", output.bundle.releases.len());
-    println!("  nodes: {}", output.bundle.nodes.len());
-    println!("  excluded nodes: {}", output.bundle.excluded_nodes.len());
-    println!("  bundle expires: {}", output.bundle.expires_at_unix_ms);
-    Ok(())
+    let approvals = output.approvals().manifest();
+    println!("Verified approval revision {}", approvals.revision);
+    println!("  gateway releases: {}", approvals.gateways.len());
+    println!("  catalogs: {}", approvals.catalogs.len());
 }
 
 fn wall_clock_ms() -> i64 {
@@ -427,99 +337,115 @@ mod tests {
     use super::*;
 
     #[test]
-    fn serve_refresh_interval_defaults_to_five_minutes() {
+    fn serve_uses_explicit_environment_and_transport_profile() {
         let cli = Cli::try_parse_from(["stogas-verify", "serve"]).unwrap();
         let Command::Serve {
-            bundle_refresh_seconds,
+            environment,
+            security,
+            max_connections,
+            upstream,
             ..
         } = cli.command
         else {
-            panic!("serve command was not parsed");
+            panic!("wrong command")
         };
-        assert_eq!(bundle_refresh_seconds, 300);
-    }
-
-    #[test]
-    fn serve_refresh_interval_accepts_any_positive_whole_seconds() {
-        for seconds in ["1", "841", "86400"] {
-            assert!(
-                Cli::try_parse_from([
-                    "stogas-verify",
-                    "serve",
-                    "--bundle-refresh-seconds",
-                    seconds,
-                ])
-                .is_ok()
-            );
-        }
-        for seconds in ["0", "-1"] {
-            assert!(
-                Cli::try_parse_from([
-                    "stogas-verify",
-                    "serve",
-                    "--bundle-refresh-seconds",
-                    seconds,
-                ])
+        assert_eq!(environment, stogas::Environment::Production);
+        assert_eq!(security, SecurityMode::Tls);
+        assert_eq!(max_connections, 4);
+        assert!(upstream.is_none());
+        assert!(Cli::try_parse_from(["stogas-verify", "serve", "--security", "both"]).is_err());
+        assert!(
+            Cli::try_parse_from(["stogas-verify", "serve", "--bundle-refresh-seconds", "300"])
                 .is_err()
-            );
-        }
+        );
+        assert!(
+            Cli::try_parse_from([
+                "stogas-verify",
+                "serve",
+                "--bundle-url",
+                "https://untrusted.example"
+            ])
+            .is_err()
+        );
+        assert_eq!(
+            Cli::try_parse_from(["stogas-verify", "serve", "--environment", "staging"]).is_ok(),
+            cfg!(feature = "staging")
+        );
+        assert_eq!(
+            Cli::try_parse_from([
+                "stogas-verify",
+                "verify",
+                "bundle.json",
+                "--environment",
+                "staging"
+            ])
+            .is_ok(),
+            cfg!(feature = "staging")
+        );
+        assert!(
+            Cli::try_parse_from([
+                "stogas-verify",
+                "verify",
+                "bundle.json",
+                "--policy",
+                "unsigned-policy.json"
+            ])
+            .is_err()
+        );
     }
 
     #[test]
-    fn native_and_browser_defaults_are_safe_and_explicit_overrides_win() {
-        assert_eq!(resolved_security(None, None), SecurityMode::Tls);
-        assert_eq!(
-            resolved_security(None, Some("https://client.example")),
-            SecurityMode::E2ee
-        );
-        assert_eq!(
-            resolved_security(Some(SecurityMode::Both), Some("https://client.example")),
-            SecurityMode::Both
-        );
-    }
-
-    #[test]
-    fn proof_accepts_buffered_or_stream_input_and_requires_one_trust_source() {
+    fn proof_requires_complete_boot_evidence_and_unambiguous_response_framing() {
         let base = [
             "stogas-verify",
             "proof",
             "--request",
             "request.json",
             "--response",
-            "response.json",
+            "response",
         ];
-        assert!(Cli::try_parse_from(base.into_iter().chain(["--bundle", "bundle.json"])).is_ok());
+        let evidence = ["--bundle", "bundle.json", "--boot", "boot.json"];
+        assert!(Cli::try_parse_from(base.into_iter().chain(evidence)).is_ok());
+        for framing in [vec!["--stream"], vec!["--proof", "receipt.json"]] {
+            assert!(Cli::try_parse_from(base.into_iter().chain(evidence).chain(framing)).is_ok());
+        }
         assert!(
-            Cli::try_parse_from(base.into_iter().chain([
+            Cli::try_parse_from(base.into_iter().chain(evidence).chain([
+                "--stream",
                 "--proof",
-                "proof.json",
-                "--bundle",
-                "bundle.json"
-            ]))
-            .is_ok()
-        );
-        assert!(
-            Cli::try_parse_from(base.into_iter().chain([
-                "--ledger",
-                "ledger.json",
-                "--catalog",
-                "catalog.json"
-            ]))
-            .is_ok()
-        );
-        assert!(Cli::try_parse_from(base.into_iter().chain(["--ledger", "ledger.json"])).is_err());
-        assert!(
-            Cli::try_parse_from(base.into_iter().chain(["--catalog", "catalog.json"])).is_err()
-        );
-        assert!(Cli::try_parse_from(base).is_err());
-        assert!(
-            Cli::try_parse_from(base.into_iter().chain([
-                "--bundle",
-                "bundle.json",
-                "--ledger",
-                "ledger.json"
+                "receipt.json"
             ]))
             .is_err()
         );
+        for missing in 0..evidence.len() / 2 {
+            let mut incomplete = evidence.to_vec();
+            incomplete.drain(missing * 2..missing * 2 + 2);
+            assert!(Cli::try_parse_from(base.into_iter().chain(incomplete)).is_err());
+        }
+        for obsolete in [
+            "--inclusion",
+            "--ledger",
+            "--catalog",
+            "--policy",
+            "--e2ee-transcript-sha256",
+        ] {
+            assert!(
+                Cli::try_parse_from(base.into_iter().chain(evidence).chain([obsolete, "value"]))
+                    .is_err()
+            );
+        }
+        assert_eq!(
+            Cli::try_parse_from(
+                base.into_iter()
+                    .chain(evidence)
+                    .chain(["--environment", "staging"])
+            )
+            .is_ok(),
+            cfg!(feature = "staging")
+        );
     }
 }
+
+#[cfg(all(test, feature = "staging"))]
+#[path = "proof_tests.rs"]
+mod proof_tests;

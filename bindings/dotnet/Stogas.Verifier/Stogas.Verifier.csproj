@@ -1,0 +1,18 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <Version>0.1.0-alpha.1</Version>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
+    <PackageId>Stogas.Verifier</PackageId>
+    <Description>Verified confidential HTTP transport backed by the Stogas Rust verifier.</Description>
+    <PackageLicenseExpression>Apache-2.0</PackageLicenseExpression>
+    <RepositoryUrl>https://github.com/StogasAI/verifier</RepositoryUrl>
+  </PropertyGroup>
+  <ItemGroup>
+    <None Include="README.md" Pack="true" PackagePath="/" />
+    <None Include="runtimes/**/native/*" Pack="true" PackagePath="%(Identity)" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+</Project>

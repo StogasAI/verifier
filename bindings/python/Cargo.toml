@@ -11,6 +11,9 @@ repository.workspace = true
 name = "_stogas_verifier"
 crate-type = ["cdylib"]
 
+[features]
+staging = ["stogas-verifier/staging", "stogas-sdk/staging"]
+
 [dependencies]
 pyo3 = { version = "0.29.0", features = ["abi3-py310", "extension-module"] }
 serde_json.workspace = true

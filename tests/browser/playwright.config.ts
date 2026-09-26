@@ -1,7 +1,7 @@
 import { defineConfig } from '@playwright/test';
 
 export default defineConfig({
-	fullyParallel: false,
+	fullyParallel: true,
 	forbidOnly: true,
 	reporter: 'line',
 	retries: 0,
@@ -9,6 +9,5 @@ export default defineConfig({
 	use: {
 		browserName: 'chromium',
 		headless: true
-	},
-	workers: 1
+	}
 });
