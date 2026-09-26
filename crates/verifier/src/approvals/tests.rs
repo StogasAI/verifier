@@ -618,7 +618,7 @@ fn compiled_staging_root_verifies_actual_logged_operational_delegation() {
         + 1000;
     let verifier = crate::evidence::Verifier::stogas(Environment::Staging).unwrap();
     let keys = verifier.verify_key_manifest(bytes, now).unwrap();
-    assert_eq!(keys.active_key.key_id, "staging-stogas-online-2026-09");
+    assert_eq!(keys.active_key.key_id, "staging-stogas-online-2026-09-26-01");
     assert_eq!(keys.generation, 1);
     assert!(keys.retired_keys.is_empty());
     let mut changed = value;
