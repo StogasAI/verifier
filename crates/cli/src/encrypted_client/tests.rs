@@ -79,7 +79,8 @@ async fn pool_respects_acknowledgement_capacity_idle_hints_and_setup_cancellatio
     let mut requests: Vec<_> = (0..4096).map(|_| ready(&client)).collect();
     assert!(matches!(client.select().unwrap(), Selection::Wait));
     // An authenticated response acknowledges the first start before inference ends.
-    let mut peer = Records::new(&root, &id, 0, 2);
+    let mut peer = Records::new(&root, &id);
+    peer.open(&requests[0].1.seal(Kind::Metadata, b"{}").unwrap());
     requests[0]
         .1
         .open(&mut peer.seal(Kind::Keepalive, &[]), 0)
@@ -156,7 +157,8 @@ async fn graceful_close_authenticates_one_terminal_exchange_and_is_idempotent() 
                 assert!(!request.headers().contains_key("authorization"));
                 let wire = to_bytes(request.into_body(), 65536).await.unwrap();
                 let number = u64::from_be_bytes(wire[38..46].try_into().unwrap());
-                let mut peer = Records::new(&root, &id, number, 1);
+                assert_eq!(number, 0);
+                let mut peer = Records::new(&root, &id);
                 let first = channel::record_size(&wire[46..50]).unwrap();
                 let (kind, metadata) = peer.open(&wire[46..46 + first]);
                 assert_eq!(kind, Kind::Metadata);
@@ -164,7 +166,6 @@ async fn graceful_close_authenticates_one_terminal_exchange_and_is_idempotent() 
                 assert_eq!(metadata["method"], "DELETE");
                 assert_eq!(metadata["path"], "/v1/session");
                 assert_eq!(peer.open(&wire[46 + first..]), (Kind::Finished, vec![]));
-                let mut peer = Records::new(&root, &id, number, 2);
                 let wire = [
                     peer.seal(Kind::Metadata, br#"{"status":204,"headers":{}}"#),
                     peer.seal(Kind::Finished, &[]),
@@ -198,7 +199,8 @@ async fn graceful_close_authenticates_one_terminal_exchange_and_is_idempotent() 
 async fn cancelled_start_gap_renews_without_cutting_off_an_admitted_response() {
     let (client, owner, root, id, _) = fixture(1);
     let (lease, mut active) = ready(&client);
-    let mut peer = Records::new(&root, &id, 0, 2);
+    let mut peer = Records::new(&root, &id);
+    peer.open(&active.seal(Kind::Metadata, b"{}").unwrap());
     active
         .open(&mut peer.seal(Kind::Keepalive, &[]), 0)
         .unwrap();
