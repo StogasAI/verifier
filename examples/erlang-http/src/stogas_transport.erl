@@ -10,7 +10,7 @@ close(Pid) -> gen_server:stop(Pid).
 
 init(Options) ->
     process_flag(trap_exit, true),
-    Executable = maps:get(executable, Options, os:find_executable("stogas-verify")),
+    Executable = maps:get(executable, Options, os:find_executable("stogas")),
     false =:= Executable andalso error(verifier_not_installed),
     Args = ["serve", "--listen", "127.0.0.1:0", "--exit-on-stdin-close"] ++
         maps:get(args, Options, []),

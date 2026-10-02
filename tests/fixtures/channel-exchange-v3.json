@@ -1,0 +1,41 @@
+{
+  "description": "Independent Python cryptography 46.0.5 Triple Ratchet epoch-zero request. Response plaintext is checked with independently derived Go X25519/HMAC/HKDF/AES-GCM keys from the fresh server header; no ML-KEM update is sent by this test peer.",
+  "root_hex": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+  "session_id_hex": "202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f",
+  "request_number": 0,
+  "request": [
+    {
+      "kind": 1,
+      "plaintext_hex": "72657175657374206d65746164617461",
+      "encoded_hex": "00000070004913be4feaeaf204c7fd3358fc9c00721881d174278128227ec674f37f7fe97b6d0000000000000000000000000000000000000000000000000000000000000001000000000000000100012fff4928442e1d1b9a78f6fb6c1daf05364e0a596cfbbafaf66b3b83796d6487"
+    },
+    {
+      "kind": 2,
+      "plaintext_hex": "75706c6f6164",
+      "encoded_hex": "0000001bf9ae77cb78d8492eee2927cd376c5255b9148f43f90f7d"
+    },
+    {
+      "kind": 3,
+      "plaintext_hex": "",
+      "encoded_hex": "00000015f8cf7f5200868114c9d9257451b337cdb7"
+    }
+  ],
+  "response": [
+    {
+      "kind": 1,
+      "plaintext_hex": "726573706f6e7365206d65746164617461"
+    },
+    {
+      "kind": 2,
+      "plaintext_hex": "646f776e6c6f6164"
+    },
+    {
+      "kind": 3,
+      "plaintext_hex": ""
+    }
+  ],
+  "initial_private_hex": "0303030303030303030303030303030303030303030303030303030303030303",
+  "alice_private_hex": "0707070707070707070707070707070707070707070707070707070707070707",
+  "classical_after_request_root_hex": "53e269c821f3fb2adb61e5a29e5d4fb3068d6a9b3aa2d77a51b8f2f3ff9ca071",
+  "quantum_response_message_hex": "d38c66b640bc4c9625cfcff00000aa221af5aef1d813f3b55662286f97661606"
+}

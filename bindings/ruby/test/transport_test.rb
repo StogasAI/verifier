@@ -1,5 +1,5 @@
 require 'minitest/autorun'
-require 'stogas_verifier'
+require 'stogas'
 
 class TransportTest < Minitest::Test
   def test_invalid_options_preserve_native_error_codes

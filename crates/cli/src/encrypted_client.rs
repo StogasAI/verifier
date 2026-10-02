@@ -82,6 +82,7 @@ struct Inner {
     endpoint: Url,
     environment: Environment,
     maximum: NonZeroUsize,
+    chunk_size: channel::ratchet::ChunkSize,
     state: Mutex<State>,
     changed: Arc<Notify>,
     closing: Notify,
@@ -202,6 +203,7 @@ impl Client {
         endpoint: Url,
         environment: Environment,
         maximum: NonZeroUsize,
+        chunk_size: channel::ratchet::ChunkSize,
     ) -> Self {
         Self {
             inner: Arc::new(Inner {
@@ -210,6 +212,7 @@ impl Client {
                 endpoint,
                 environment,
                 maximum,
+                chunk_size,
                 state: Mutex::new(State {
                     owners: Vec::new(),
                     opening: false,
@@ -314,7 +317,7 @@ impl Client {
                         let connection = tokio::select! {
                             biased;
                             () = &mut closing => return Err(Error::Closed),
-                            result = encrypted_setup::connect(&self.inner.evidence, &self.inner.http, self.inner.endpoint.clone(), self.inner.environment, setup_deadline) => result?,
+                            result = encrypted_setup::connect(&self.inner.evidence, &self.inner.http, self.inner.endpoint.clone(), self.inner.environment, self.inner.chunk_size, setup_deadline) => result?,
                         };
                         let owner = Arc::new(Owner::new(connection, Arc::clone(&self.inner.changed)));
                         let mut state = self.inner.state.lock().map_err(|_| Error::State)?;
@@ -342,6 +345,7 @@ impl Client {
                     >= Duration::from_secs(u64::from(session.core.idle_seconds()))
             {
                 session.retired = true;
+                session.core.close();
             }
             !(session.retired && session.active == 0)
         });
@@ -357,6 +361,10 @@ impl Client {
             if session.retired {
                 continue;
             }
+            session
+                .core
+                .expire(crate::encrypted_http::elapsed_ms())
+                .map_err(|_| Error::State)?;
             match session.core.request() {
                 Ok(request) => {
                     session.active += 1;
@@ -368,7 +376,10 @@ impl Client {
                     ))));
                 }
                 Err(channel::Error::Pending) => {}
-                Err(channel::Error::Limit | channel::Error::Closed) => session.retired = true,
+                Err(channel::Error::Limit | channel::Error::Closed) => {
+                    session.retired = true;
+                    session.core.close();
+                }
                 Err(error) => return Err(error.into()),
             }
         }

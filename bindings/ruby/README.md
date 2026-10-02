@@ -1,7 +1,7 @@
 # Stogas transport for Ruby
 
 ```ruby
-require 'stogas_verifier'
+require 'stogas'
 require 'openai'
 
 Stogas::Transport.open do |transport|

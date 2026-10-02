@@ -5,7 +5,7 @@ open System.ClientModel
 open System.ClientModel.Primitives
 open OpenAI
 open OpenAI.Chat
-open Stogas.Verifier
+open Stogas
 
 let run () = task {
     // An explicit URL can use a separately managed verifier CLI.

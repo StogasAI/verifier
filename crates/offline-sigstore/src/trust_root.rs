@@ -4,7 +4,7 @@ use base64::{Engine as _, engine::general_purpose::STANDARD};
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
 use sha2::{Digest as _, Sha256};
-use std::collections::HashSet;
+use std::{collections::HashSet, sync::LazyLock};
 
 const MEDIA_TYPE: &str = "application/vnd.dev.sigstore.trustedroot+json;version=0.1";
 
@@ -113,12 +113,17 @@ pub struct TrustedRoot {
 }
 
 impl TrustedRoot {
-    pub fn production() -> Result<Self, String> {
-        let root = Self::from_json(include_str!("trusted_root.json"))?;
-        if root.fulcio.is_empty() || root.rekor.is_empty() || root.ct.is_empty() {
-            return Err("embedded Sigstore trusted root is incomplete".into());
-        }
-        Ok(root)
+    pub fn production() -> Result<&'static Self, String> {
+        // Only decoding of the compiled trust seed is shared. Each proof still selects
+        // keys and authorities at its own authenticated time and verifies every signature.
+        static ROOT: LazyLock<Result<TrustedRoot, String>> = LazyLock::new(|| {
+            let root = TrustedRoot::from_json(include_str!("trusted_root.json"))?;
+            if root.fulcio.is_empty() || root.rekor.is_empty() || root.ct.is_empty() {
+                return Err("embedded Sigstore trusted root is incomplete".into());
+            }
+            Ok(root)
+        });
+        ROOT.as_ref().map_err(Clone::clone)
     }
 
     fn from_json(json: &str) -> Result<Self, String> {

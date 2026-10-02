@@ -1,8 +1,9 @@
-use sha2::{Digest as _, Sha256};
+mod request;
+pub use request::EncryptedRequest;
 use std::sync::Arc;
 
 use stogas_verifier::{
-    channel::{ClientRequest, ClientSession, Error, Kind, ResponseDecoder, setup::PendingSetup},
+    channel::{ClientSession, Error, ratchet::ChunkSize, setup::PendingSetup},
     evidence::{Snapshot, VerifiedSession},
 };
 use wasm_bindgen::prelude::*;
@@ -20,11 +21,14 @@ impl EncryptedSetup {
     /// # Errors
     /// Rejects unsupported environments or unavailable secure randomness.
     #[wasm_bindgen(constructor)]
-    pub fn new(environment: &str) -> Result<Self, JsError> {
+    pub fn new(environment: &str, ratchet_bytes: Option<u16>) -> Result<Self, JsError> {
         let environment = serde_json::from_value(serde_json::json!(environment))
             .map_err(|_| JsError::new("unsupported verification environment"))?;
         Ok(Self {
-            core: PendingSetup::new(environment)?,
+            core: PendingSetup::with_chunk_size(
+                environment,
+                ChunkSize::new(ratchet_bytes.unwrap_or(ChunkSize::FULL.get()))?,
+            )?,
         })
     }
 
@@ -105,172 +109,25 @@ impl EncryptedSession {
             self.appraisal = Arc::new(appraisal);
             self.snapshot = Arc::clone(&snapshot.core);
         }
-        let request = self.core.request().map_err(|error| channel_error(&error))?;
-        Ok(EncryptedRequest {
-            prefix: request.prefix().to_vec(),
-            request: Some(request),
-            decoder: None,
-            snapshot: Arc::clone(&self.snapshot),
-            appraisal: Arc::clone(&self.appraisal),
-            request_hasher: receipt.then(Sha256::new),
-            request_finished: false,
-        })
+        self.core
+            .expire(elapsed_ms()?)
+            .map_err(|error| channel_error(&error))?;
+        let request = self
+            .core
+            .request_with::<crate::host_cipher::HostCipher>()
+            .map_err(|error| channel_error(&error))?;
+        Ok(EncryptedRequest::new(
+            request,
+            Arc::clone(&self.snapshot),
+            Arc::clone(&self.appraisal),
+            receipt,
+        ))
     }
 
     /// Local disposal. The HTTP transport sends an authenticated close request first
     /// when possible; lost close messages are handled by the server's idle expiry.
     pub fn close(&mut self) {
         self.core.close();
-    }
-}
-
-/// One HTTP exchange. Its verification snapshot outlives any later evidence refresh.
-#[wasm_bindgen(js_name = EncryptedRequest)]
-pub struct EncryptedRequest {
-    prefix: Vec<u8>,
-    request: Option<ClientRequest>,
-    decoder: Option<ResponseDecoder>,
-    snapshot: Arc<Snapshot>,
-    appraisal: Arc<VerifiedSession>,
-    request_hasher: Option<Sha256>,
-    request_finished: bool,
-}
-
-#[wasm_bindgen(js_class = EncryptedRequest)]
-impl EncryptedRequest {
-    /// Guard SSE completion independently of optional receipt verification.
-    /// # Errors
-    /// Requires the complete request before creating its response guard.
-    pub fn response_completion(&self) -> Result<ResponseCompletion, JsError> {
-        if !self.request_finished {
-            return Err(JsError::new("request content is incomplete"));
-        }
-        Ok(ResponseCompletion {
-            core: Some(stogas_verifier::receipt::StreamCompletion::default()),
-        })
-    }
-    #[wasm_bindgen(getter)]
-    pub fn prefix(&self) -> Vec<u8> {
-        self.prefix.clone()
-    }
-
-    /// Retain this request's original evidence when checking its terminal receipt.
-    pub fn evidence(&self) -> EvidenceSnapshot {
-        EvidenceSnapshot {
-            core: Arc::clone(&self.snapshot),
-        }
-    }
-
-    /// Verify terminal content under this request's original appraised boot key.
-    /// Current catalog changes do not change the request's signing identity.
-    ///
-    /// # Errors
-    /// Rejects malformed receipts, changed content and signatures from another boot.
-    pub fn verify_receipt(
-        &self,
-        receipt: &[u8],
-        request_sha256: &[u8],
-        response_sha256: &[u8],
-    ) -> Result<JsValue, JsError> {
-        let request = request_sha256
-            .try_into()
-            .map_err(|_| JsError::new("request digest must be 32 bytes"))?;
-        let response = response_sha256
-            .try_into()
-            .map_err(|_| JsError::new("response digest must be 32 bytes"))?;
-        let verified = stogas_verifier::receipt::verify_metadata(
-            receipt,
-            self.appraisal.boot(),
-            request,
-            response,
-        )?
-        .receipt;
-        super::to_js_value(&verified)
-    }
-
-    /// # Errors
-    /// Rejects record ordering/usage errors and writes after response decoding starts.
-    pub fn seal(&mut self, kind: u8, content: &[u8]) -> Result<Vec<u8>, JsValue> {
-        let kind = Kind::try_from(kind).map_err(|error| channel_error(&error))?;
-        let record = self
-            .request
-            .as_mut()
-            .ok_or_else(|| channel_error(&Error::Closed))?
-            .seal(kind, content)
-            .map_err(|error| channel_error(&error))?;
-        if kind == Kind::Data
-            && let Some(hasher) = &mut self.request_hasher
-        {
-            hasher.update(content);
-        }
-        if kind == Kind::Finished {
-            self.request_finished = true;
-        }
-        Ok(record)
-    }
-
-    /// Own the original boot appraisal beyond transport completion, without retaining keys.
-    ///
-    /// # Errors
-    /// Requires all request content to have been sealed before taking its exact digest.
-    pub fn response_receipt(&self) -> Result<ResponseReceipt, JsError> {
-        if !self.request_finished {
-            return Err(JsError::new("request content is incomplete"));
-        }
-        Ok(ResponseReceipt {
-            appraisal: Arc::clone(&self.appraisal),
-            request: self
-                .request_hasher
-                .clone()
-                .ok_or_else(|| JsError::new("receipt was not requested"))?
-                .finalize()
-                .into(),
-            stream: None,
-            finished: false,
-        })
-    }
-
-    /// Emit authenticated records one at a time without retaining a whole HTTP chunk's
-    /// plaintext. The callback receives `(kind, Uint8Array)` and must not re-enter this object.
-    ///
-    /// # Errors
-    /// Invalid framing/authentication or a throwing callback permanently closes decoding.
-    pub fn push(&mut self, input: &[u8], emit: &js_sys::Function) -> Result<(), JsValue> {
-        if let Some(request) = self.request.take() {
-            self.decoder = Some(ResponseDecoder::new(request));
-        }
-        let decoder = self
-            .decoder
-            .as_mut()
-            .ok_or_else(|| channel_error(&Error::Closed))?;
-        let mut callback_error = None;
-        let result = decoder.push(input, |kind, content| {
-            emit.call2(
-                &JsValue::UNDEFINED,
-                &JsValue::from(kind as u8),
-                &js_sys::Uint8Array::from(content),
-            )
-            .map(|_| ())
-            .map_err(|error| {
-                callback_error = Some(error);
-                Error::Closed
-            })
-        });
-        if let Some(error) = callback_error {
-            return Err(error);
-        }
-        result.map_err(|error| channel_error(&error))
-    }
-
-    /// # Errors
-    /// Rejects missing authenticated completion, a partial final record or prior failure.
-    pub fn finish(&mut self) -> Result<(), JsValue> {
-        self.request = None;
-        self.decoder
-            .take()
-            .ok_or_else(|| channel_error(&Error::Truncated))?
-            .finish()
-            .map_err(|error| channel_error(&error))
     }
 }
 
@@ -390,4 +247,23 @@ fn channel_error(error: &Error) -> JsValue {
     };
     let _ = js_sys::Reflect::set(&value, &JsValue::from_str("code"), &JsValue::from_str(code));
     value.into()
+}
+
+#[wasm_bindgen]
+extern "C" {
+    #[wasm_bindgen(js_namespace = performance, js_name = now)]
+    fn monotonic_now() -> f64;
+}
+
+fn elapsed_ms() -> Result<u64, JsValue> {
+    let now = monotonic_now();
+    if !(0.0..=9_007_199_254_740_991.0).contains(&now) {
+        return Err(js_sys::Error::new("monotonic clock is unavailable").into());
+    }
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "finite nonnegative safe integer range checked above"
+    )]
+    Ok(now as u64)
 }

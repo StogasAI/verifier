@@ -1,0 +1,822 @@
+{
+  "repository": "https://github.com/signalapp/SparsePostQuantumRatchet",
+  "revision": "06959b4708f9b7b1e94d0f8cc835f3958c077e94",
+  "cases": [
+    {
+      "path": "src/authenticator/serialize.rs",
+      "name": "round_trip",
+      "status": "not_applicable",
+      "reason": "Secret state is never serialized or restored. The fixed binary wire grammar is separately covered; no Protobuf or varint codec is used."
+    },
+    {
+      "path": "src/chain.rs",
+      "name": "directions_match",
+      "status": "covered_behavior",
+      "tests": [
+        "crates/verifier/src/channel/ratchet/peer/tests.rs::full_updates_derive_unique_keys_and_delete_finished_chains_in_both_directions",
+        "crates/verifier/src/channel/ratchet/peer/tests.rs::initialization_epoch_and_directional_chains_match_independent_hkdf_vectors"
+      ]
+    },
+    {
+      "path": "src/chain.rs",
+      "name": "rejects_malformed_next_key_in_serialized_state",
+      "status": "not_applicable",
+      "reason": "Secret state is never serialized or restored. The fixed binary wire grammar is separately covered; no Protobuf or varint codec is used."
+    },
+    {
+      "path": "src/chain.rs",
+      "name": "previously_returned_key",
+      "status": "covered_behavior",
+      "tests": [
+        "crates/verifier/src/channel/ratchet/peer/tests.rs::delayed_messages_remain_independent_after_multiple_epochs_and_replay_fails",
+        "crates/verifier/src/channel/ratchet/peer/tests.rs::failed_authentication_never_consumes_current_skipped_or_new_epoch_keys"
+      ]
+    },
+    {
+      "path": "src/chain.rs",
+      "name": "very_old_keys_are_trimmed",
+      "status": "covered_behavior",
+      "tests": [
+        "crates/verifier/src/channel/ratchet/peer/tests.rs::cache_limits_are_global_and_expiry_is_not_extended_by_clock_regression_or_bad_input",
+        "crates/verifier/src/channel/ratchet/peer/tests.rs::full_updates_derive_unique_keys_and_delete_finished_chains_in_both_directions"
+      ],
+      "scope": "Uses the published previous-chain-length alternative: erase old chain roots and retain only individually bounded delayed-message keys."
+    },
+    {
+      "path": "src/chain.rs",
+      "name": "out_of_order_keys",
+      "status": "covered_behavior",
+      "tests": [
+        "crates/verifier/src/channel/ratchet/peer/tests.rs::delayed_messages_remain_independent_after_multiple_epochs_and_replay_fails",
+        "crates/verifier/src/channel/ratchet/peer/tests.rs::failed_authentication_never_consumes_current_skipped_or_new_epoch_keys"
+      ]
+    },
+    {
+      "path": "src/chain.rs",
+      "name": "clear_old_send_keys",
+      "status": "covered_behavior",
+      "tests": [
+        "crates/verifier/src/channel/ratchet/peer/tests.rs::cache_limits_are_global_and_expiry_is_not_extended_by_clock_regression_or_bad_input",
+        "crates/verifier/src/channel/ratchet/peer/tests.rs::full_updates_derive_unique_keys_and_delete_finished_chains_in_both_directions"
+      ],
+      "scope": "Uses the published previous-chain-length alternative: erase old chain roots and retain only individually bounded delayed-message keys."
+    },
+    {
+      "path": "src/chain.rs",
+      "name": "key_history_prop_test",
+      "status": "covered_behavior",
+      "tests": [
+        "crates/verifier/src/channel/ratchet/peer/tests.rs::delayed_messages_remain_independent_after_multiple_epochs_and_replay_fails",
+        "crates/verifier/src/channel/ratchet/peer/tests.rs::failed_authentication_never_consumes_current_skipped_or_new_epoch_keys"
+      ]
+    },
+    {
+      "path": "src/chain.rs",
+      "name": "ced_prop_test",
+      "status": "covered_behavior",
+      "tests": [
+        "crates/verifier/src/channel/ratchet/peer/tests.rs::cache_limits_are_global_and_expiry_is_not_extended_by_clock_regression_or_bad_input",
+        "crates/verifier/src/channel/ratchet/peer/tests.rs::full_updates_derive_unique_keys_and_delete_finished_chains_in_both_directions"
+      ],
+      "scope": "Uses the published previous-chain-length alternative: erase old chain roots and retain only individually bounded delayed-message keys."
+    },
+    {
+      "path": "src/encoding/gf.rs",
+      "name": "add",
+      "status": "covered_behavior",
+      "tests": [
+        "crates/verifier/src/channel/ratchet/erasure/tests.rs::field_matches_polynomial_reference_and_every_nonzero_element_has_an_inverse"
+      ]
+    },
+    {
+      "path": "src/encoding/gf.rs",
+      "name": "mul",
+      "status": "covered_behavior",
+      "tests": [
+        "crates/verifier/src/channel/ratchet/erasure/tests.rs::field_matches_polynomial_reference_and_every_nonzero_element_has_an_inverse"
+      ]
+    },
+    {
+      "path": "src/encoding/gf.rs",
+      "name": "div",
+      "status": "covered_behavior",
+      "tests": [
+        "crates/verifier/src/channel/ratchet/erasure/tests.rs::field_matches_polynomial_reference_and_every_nonzero_element_has_an_inverse"
+      ]
+    },
+    {
+      "path": "src/encoding/gf.rs",
+      "name": "x86_barrett_reduction",
+      "status": "not_applicable",
+      "reason": "The public-data erasure field uses scalar polynomial reduction; no SIMD Barrett implementation exists."
+    },
+    {
+      "path": "src/encoding/polynomial.rs",
+      "name": "encode_and_decode_small",
+      "status": "covered_behavior",
+      "tests": [
+        "crates/verifier/src/channel/ratchet/erasure/tests.rs::any_distinct_chunks_recover_full_compact_and_uneven_pieces",
+        "crates/verifier/src/channel/ratchet/erasure/tests.rs::erasure_input_is_bounded_and_conflicting_duplicates_are_rejected",
+        "crates/verifier/src/channel/ratchet/braid/tests.rs::public_messages_have_one_bounded_canonical_encoding"
+      ]
+    },
+    {
+      "path": "src/encoding/polynomial.rs",
+      "name": "encode_and_decode_large",
+      "status": "covered_behavior",
+      "tests": [
+        "crates/verifier/src/channel/ratchet/erasure/tests.rs::any_distinct_chunks_recover_full_compact_and_uneven_pieces",
+        "crates/verifier/src/channel/ratchet/erasure/tests.rs::erasure_input_is_bounded_and_conflicting_duplicates_are_rejected",
+        "crates/verifier/src/channel/ratchet/braid/tests.rs::public_messages_have_one_bounded_canonical_encoding"
+      ]
+    },
+    {
+      "path": "src/encoding/polynomial.rs",
+      "name": "poly_lagrange_interpolate",
+      "status": "covered_behavior",
+      "tests": [
+        "crates/verifier/src/channel/ratchet/erasure/tests.rs::any_distinct_chunks_recover_full_compact_and_uneven_pieces",
+        "crates/verifier/src/channel/ratchet/erasure/tests.rs::erasure_input_is_bounded_and_conflicting_duplicates_are_rejected",
+        "crates/verifier/src/channel/ratchet/braid/tests.rs::public_messages_have_one_bounded_canonical_encoding"
+      ]
+    },
+    {
+      "path": "src/encoding/polynomial.rs",
+      "name": "point_serialize_deserialize",
+      "status": "covered_behavior",
+      "tests": [
+        "crates/verifier/src/channel/ratchet/erasure/tests.rs::any_distinct_chunks_recover_full_compact_and_uneven_pieces",
+        "crates/verifier/src/channel/ratchet/erasure/tests.rs::erasure_input_is_bounded_and_conflicting_duplicates_are_rejected",
+        "crates/verifier/src/channel/ratchet/braid/tests.rs::public_messages_have_one_bounded_canonical_encoding"
+      ]
+    },
+    {
+      "path": "src/encoding/polynomial.rs",
+      "name": "to_and_from_pb",
+      "status": "not_applicable",
+      "reason": "Secret state is never serialized or restored. The fixed binary wire grammar is separately covered; no Protobuf or varint codec is used."
+    },
+    {
+      "path": "src/encoding/polynomial.rs",
+      "name": "const_polys",
+      "status": "covered_behavior",
+      "tests": [
+        "crates/verifier/src/channel/ratchet/erasure/tests.rs::any_distinct_chunks_recover_full_compact_and_uneven_pieces",
+        "crates/verifier/src/channel/ratchet/erasure/tests.rs::erasure_input_is_bounded_and_conflicting_duplicates_are_rejected",
+        "crates/verifier/src/channel/ratchet/braid/tests.rs::public_messages_have_one_bounded_canonical_encoding"
+      ]
+    },
+    {
+      "path": "src/incremental_mlkem768.rs",
+      "name": "incremental_mlkem768_round_trip",
+      "status": "covered_behavior",
+      "tests": [
+        "crates/verifier/src/channel/ratchet/kem/tests.rs::incremental_mlkem_matches_independent_fips_implementation"
+      ]
+    },
+    {
+      "path": "src/lib.rs",
+      "name": "ratchet",
+      "status": "covered_behavior",
+      "tests": [
+        "crates/verifier/src/channel/ratchet/braid/tests.rs::loss_reordering_replay_asymmetric_bursts_and_offline_periods_preserve_epoch_agreement",
+        "crates/verifier/src/channel/ratchet/peer/tests.rs::loss_reordering_asymmetric_batches_and_different_chunk_sizes_make_progress",
+        "fuzz/fuzz_targets/ratchet.rs"
+      ]
+    },
+    {
+      "path": "src/lib.rs",
+      "name": "ratchet_v0_empty_states",
+      "status": "not_applicable",
+      "reason": "No version negotiation, empty initialization or legacy v0 exists. Setup authenticates the required v3 profile and rejects retired profiles."
+    },
+    {
+      "path": "src/lib.rs",
+      "name": "empty_constructor_for_state",
+      "status": "not_applicable",
+      "reason": "No version negotiation, empty initialization or legacy v0 exists. Setup authenticates the required v3 profile and rejects retired profiles."
+    },
+    {
+      "path": "src/lib.rs",
+      "name": "empty_key_until_version_negotiation",
+      "status": "not_applicable",
+      "reason": "No version negotiation, empty initialization or legacy v0 exists. Setup authenticates the required v3 profile and rejects retired profiles."
+    },
+    {
+      "path": "src/lib.rs",
+      "name": "min_version_v1_always_creates_keys_a2b",
+      "status": "covered_behavior",
+      "tests": [
+        "crates/verifier/src/channel/ratchet/peer/tests.rs::full_updates_derive_unique_keys_and_delete_finished_chains_in_both_directions",
+        "crates/verifier/src/channel/ratchet/peer/tests.rs::initialization_epoch_and_directional_chains_match_independent_hkdf_vectors"
+      ]
+    },
+    {
+      "path": "src/lib.rs",
+      "name": "min_version_v1_always_creates_keys_b2a",
+      "status": "covered_behavior",
+      "tests": [
+        "crates/verifier/src/channel/ratchet/peer/tests.rs::full_updates_derive_unique_keys_and_delete_finished_chains_in_both_directions",
+        "crates/verifier/src/channel/ratchet/peer/tests.rs::initialization_epoch_and_directional_chains_match_independent_hkdf_vectors"
+      ]
+    },
+    {
+      "path": "src/lib.rs",
+      "name": "negotiate_to_v0_a2b",
+      "status": "not_applicable",
+      "reason": "No version negotiation, empty initialization or legacy v0 exists. Setup authenticates the required v3 profile and rejects retired profiles."
+    },
+    {
+      "path": "src/lib.rs",
+      "name": "negotiate_to_v0_b2a",
+      "status": "not_applicable",
+      "reason": "No version negotiation, empty initialization or legacy v0 exists. Setup authenticates the required v3 profile and rejects retired profiles."
+    },
+    {
+      "path": "src/lib.rs",
+      "name": "negotiation_refused_a2b",
+      "status": "not_applicable",
+      "reason": "No version negotiation, empty initialization or legacy v0 exists. Setup authenticates the required v3 profile and rejects retired profiles."
+    },
+    {
+      "path": "src/lib.rs",
+      "name": "negotiation_refused_b2a",
+      "status": "not_applicable",
+      "reason": "No version negotiation, empty initialization or legacy v0 exists. Setup authenticates the required v3 profile and rejects retired profiles."
+    },
+    {
+      "path": "src/lib.rs",
+      "name": "lockstep_run_with_logging",
+      "status": "covered_behavior",
+      "tests": [
+        "crates/verifier/src/channel/ratchet/braid/tests.rs::loss_reordering_replay_asymmetric_bursts_and_offline_periods_preserve_epoch_agreement",
+        "crates/verifier/src/channel/ratchet/peer/tests.rs::loss_reordering_asymmetric_batches_and_different_chunk_sizes_make_progress",
+        "fuzz/fuzz_targets/ratchet.rs"
+      ]
+    },
+    {
+      "path": "src/lib.rs",
+      "name": "regression_test_libcrux_issue_1275_from_generated_states",
+      "status": "covered_behavior",
+      "tests": [
+        "crates/verifier/src/channel/ratchet/kem/tests.rs::incremental_mlkem_matches_independent_fips_implementation",
+        "crates/verifier/src/channel/ratchet/kem/tests.rs::wycheproof_mlkem768_incremental_encapsulation"
+      ],
+      "scope": "The historical issue involved serialized incremental state crossing SIMD backends. No state is persisted or transferred here. Exact deterministic incremental results are checked on native and portable Wasm backends against the same independent vectors."
+    },
+    {
+      "path": "src/lib.rs",
+      "name": "disallow_downgrade_due_to_unsupported_version",
+      "status": "covered_behavior",
+      "tests": [
+        "crates/verifier/src/channel/setup/tests.rs::retired_e2ee_profile_is_rejected_even_with_genuine_hardware_evidence",
+        "crates/verifier/src/channel/ratchet/braid/tests.rs::public_messages_have_one_bounded_canonical_encoding"
+      ]
+    },
+    {
+      "path": "src/lib.rs",
+      "name": "high_version_to_v1_uses_chain_keys",
+      "status": "not_applicable",
+      "reason": "No version negotiation, empty initialization or legacy v0 exists. Setup authenticates the required v3 profile and rejects retired profiles."
+    },
+    {
+      "path": "src/lib.rs",
+      "name": "empty_recv_fails_minv1",
+      "status": "covered_behavior",
+      "tests": [
+        "crates/verifier/src/channel/setup/tests.rs::retired_e2ee_profile_is_rejected_even_with_genuine_hardware_evidence",
+        "crates/verifier/src/channel/ratchet/braid/tests.rs::public_messages_have_one_bounded_canonical_encoding"
+      ]
+    },
+    {
+      "path": "src/test/generic_dr.rs",
+      "name": "hybrid_ratchet",
+      "status": "not_applicable",
+      "reason": "The selected recovery protocol is ML-KEM Braid plus SPQR. The upstream experimental X25519 SCKA and classical Triple Ratchet composition are not implemented."
+    },
+    {
+      "path": "src/test/messaging_scka.rs",
+      "name": "random_balanced",
+      "status": "covered_behavior",
+      "tests": [
+        "crates/verifier/src/channel/ratchet/braid/tests.rs::loss_reordering_replay_asymmetric_bursts_and_offline_periods_preserve_epoch_agreement",
+        "crates/verifier/src/channel/ratchet/peer/tests.rs::loss_reordering_asymmetric_batches_and_different_chunk_sizes_make_progress",
+        "fuzz/fuzz_targets/ratchet.rs"
+      ]
+    },
+    {
+      "path": "src/test/messaging_scka.rs",
+      "name": "random_balanced_out_of_order",
+      "status": "covered_behavior",
+      "tests": [
+        "crates/verifier/src/channel/ratchet/braid/tests.rs::loss_reordering_replay_asymmetric_bursts_and_offline_periods_preserve_epoch_agreement",
+        "crates/verifier/src/channel/ratchet/peer/tests.rs::loss_reordering_asymmetric_batches_and_different_chunk_sizes_make_progress",
+        "fuzz/fuzz_targets/ratchet.rs"
+      ]
+    },
+    {
+      "path": "src/test/messaging_scka.rs",
+      "name": "random_balanced_healing",
+      "status": "covered_behavior",
+      "tests": [
+        "crates/verifier/src/channel/ratchet/braid/tests.rs::fresh_entropy_changes_later_secrets_after_snapshots_of_every_protocol_state",
+        "crates/verifier/src/channel/ratchet/braid/tests.rs::loss_reordering_replay_asymmetric_bursts_and_offline_periods_preserve_epoch_agreement",
+        "crates/verifier/src/channel/ratchet/peer/tests.rs::loss_reordering_asymmetric_batches_and_different_chunk_sizes_make_progress"
+      ],
+      "scope": "Checks agreement, progress, and fresh-entropy influence after snapshots of all eleven states. Does not claim equivalence to upstream symbolic compromise analysis or inherit its proof."
+    },
+    {
+      "path": "src/test/messaging_scka.rs",
+      "name": "pingpong_healing",
+      "status": "covered_behavior",
+      "tests": [
+        "crates/verifier/src/channel/ratchet/braid/tests.rs::fresh_entropy_changes_later_secrets_after_snapshots_of_every_protocol_state",
+        "crates/verifier/src/channel/ratchet/braid/tests.rs::loss_reordering_replay_asymmetric_bursts_and_offline_periods_preserve_epoch_agreement",
+        "crates/verifier/src/channel/ratchet/peer/tests.rs::loss_reordering_asymmetric_batches_and_different_chunk_sizes_make_progress"
+      ],
+      "scope": "Checks agreement, progress, and fresh-entropy influence after snapshots of all eleven states. Does not claim equivalence to upstream symbolic compromise analysis or inherit its proof."
+    },
+    {
+      "path": "src/test/messaging_scka.rs",
+      "name": "onlineoffline_healing",
+      "status": "covered_behavior",
+      "tests": [
+        "crates/verifier/src/channel/ratchet/braid/tests.rs::fresh_entropy_changes_later_secrets_after_snapshots_of_every_protocol_state",
+        "crates/verifier/src/channel/ratchet/braid/tests.rs::loss_reordering_replay_asymmetric_bursts_and_offline_periods_preserve_epoch_agreement",
+        "crates/verifier/src/channel/ratchet/peer/tests.rs::loss_reordering_asymmetric_batches_and_different_chunk_sizes_make_progress"
+      ],
+      "scope": "Checks agreement, progress, and fresh-entropy influence after snapshots of all eleven states. Does not claim equivalence to upstream symbolic compromise analysis or inherit its proof."
+    },
+    {
+      "path": "src/test/x25519_scka/states.rs",
+      "name": "balanced_healing",
+      "status": "not_applicable",
+      "reason": "The selected recovery protocol is ML-KEM Braid plus SPQR. The upstream experimental X25519 SCKA and classical Triple Ratchet composition are not implemented."
+    },
+    {
+      "path": "src/test/x25519_scka/states.rs",
+      "name": "random_balanced",
+      "status": "not_applicable",
+      "reason": "The selected recovery protocol is ML-KEM Braid plus SPQR. The upstream experimental X25519 SCKA and classical Triple Ratchet composition are not implemented."
+    },
+    {
+      "path": "src/test/x25519_scka/states.rs",
+      "name": "chaos",
+      "status": "not_applicable",
+      "reason": "The selected recovery protocol is ML-KEM Braid plus SPQR. The upstream experimental X25519 SCKA and classical Triple Ratchet composition are not implemented."
+    },
+    {
+      "path": "src/test/x25519_scka/states.rs",
+      "name": "onlineoffline_healing",
+      "status": "not_applicable",
+      "reason": "The selected recovery protocol is ML-KEM Braid plus SPQR. The upstream experimental X25519 SCKA and classical Triple Ratchet composition are not implemented."
+    },
+    {
+      "path": "src/test/x25519_scka/states.rs",
+      "name": "random_balanced_out_of_order",
+      "status": "not_applicable",
+      "reason": "The selected recovery protocol is ML-KEM Braid plus SPQR. The upstream experimental X25519 SCKA and classical Triple Ratchet composition are not implemented."
+    },
+    {
+      "path": "src/test/x25519_scka/states.rs",
+      "name": "random_slow_alex_healing",
+      "status": "not_applicable",
+      "reason": "The selected recovery protocol is ML-KEM Braid plus SPQR. The upstream experimental X25519 SCKA and classical Triple Ratchet composition are not implemented."
+    },
+    {
+      "path": "src/v1/chunked/states/serialize.rs",
+      "name": "encoding_varint",
+      "status": "not_applicable",
+      "reason": "Secret state is never serialized or restored. The fixed binary wire grammar is separately covered; no Protobuf or varint codec is used."
+    },
+    {
+      "path": "src/v1/chunked/states/serialize.rs",
+      "name": "decoding_varint",
+      "status": "not_applicable",
+      "reason": "Secret state is never serialized or restored. The fixed binary wire grammar is separately covered; no Protobuf or varint codec is used."
+    },
+    {
+      "path": "src/v1/chunked/states/serialize.rs",
+      "name": "decoding_varint_zero",
+      "status": "not_applicable",
+      "reason": "Secret state is never serialized or restored. The fixed binary wire grammar is separately covered; no Protobuf or varint codec is used."
+    },
+    {
+      "path": "src/v1/chunked/states/serialize.rs",
+      "name": "roundtrip_varint",
+      "status": "not_applicable",
+      "reason": "Secret state is never serialized or restored. The fixed binary wire grammar is separately covered; no Protobuf or varint codec is used."
+    },
+    {
+      "path": "src/v1.rs",
+      "name": "balanced_healing",
+      "status": "covered_behavior",
+      "tests": [
+        "crates/verifier/src/channel/ratchet/braid/tests.rs::fresh_entropy_changes_later_secrets_after_snapshots_of_every_protocol_state",
+        "crates/verifier/src/channel/ratchet/braid/tests.rs::loss_reordering_replay_asymmetric_bursts_and_offline_periods_preserve_epoch_agreement",
+        "crates/verifier/src/channel/ratchet/peer/tests.rs::loss_reordering_asymmetric_batches_and_different_chunk_sizes_make_progress"
+      ],
+      "scope": "Checks agreement, progress, and fresh-entropy influence after snapshots of all eleven states. Does not claim equivalence to upstream symbolic compromise analysis or inherit its proof."
+    },
+    {
+      "path": "src/v1.rs",
+      "name": "random_balanced",
+      "status": "covered_behavior",
+      "tests": [
+        "crates/verifier/src/channel/ratchet/braid/tests.rs::loss_reordering_replay_asymmetric_bursts_and_offline_periods_preserve_epoch_agreement",
+        "crates/verifier/src/channel/ratchet/peer/tests.rs::loss_reordering_asymmetric_batches_and_different_chunk_sizes_make_progress",
+        "fuzz/fuzz_targets/ratchet.rs"
+      ]
+    },
+    {
+      "path": "src/v1.rs",
+      "name": "chaos",
+      "status": "covered_behavior",
+      "tests": [
+        "crates/verifier/src/channel/ratchet/braid/tests.rs::loss_reordering_replay_asymmetric_bursts_and_offline_periods_preserve_epoch_agreement",
+        "crates/verifier/src/channel/ratchet/peer/tests.rs::loss_reordering_asymmetric_batches_and_different_chunk_sizes_make_progress",
+        "fuzz/fuzz_targets/ratchet.rs"
+      ]
+    },
+    {
+      "path": "src/v1.rs",
+      "name": "onlineoffline_healing_unidir",
+      "status": "covered_behavior",
+      "tests": [
+        "crates/verifier/src/channel/ratchet/braid/tests.rs::fresh_entropy_changes_later_secrets_after_snapshots_of_every_protocol_state",
+        "crates/verifier/src/channel/ratchet/braid/tests.rs::loss_reordering_replay_asymmetric_bursts_and_offline_periods_preserve_epoch_agreement",
+        "crates/verifier/src/channel/ratchet/peer/tests.rs::loss_reordering_asymmetric_batches_and_different_chunk_sizes_make_progress"
+      ],
+      "scope": "Checks agreement, progress, and fresh-entropy influence after snapshots of all eleven states. Does not claim equivalence to upstream symbolic compromise analysis or inherit its proof."
+    },
+    {
+      "path": "src/v1.rs",
+      "name": "random_balanced_out_of_order",
+      "status": "covered_behavior",
+      "tests": [
+        "crates/verifier/src/channel/ratchet/braid/tests.rs::loss_reordering_replay_asymmetric_bursts_and_offline_periods_preserve_epoch_agreement",
+        "crates/verifier/src/channel/ratchet/peer/tests.rs::loss_reordering_asymmetric_batches_and_different_chunk_sizes_make_progress",
+        "fuzz/fuzz_targets/ratchet.rs"
+      ]
+    },
+    {
+      "path": "src/v1.rs",
+      "name": "random_slow_alex_healing_auth_bidir",
+      "status": "covered_behavior",
+      "tests": [
+        "crates/verifier/src/channel/ratchet/braid/tests.rs::fresh_entropy_changes_later_secrets_after_snapshots_of_every_protocol_state",
+        "crates/verifier/src/channel/ratchet/braid/tests.rs::loss_reordering_replay_asymmetric_bursts_and_offline_periods_preserve_epoch_agreement",
+        "crates/verifier/src/channel/ratchet/peer/tests.rs::loss_reordering_asymmetric_batches_and_different_chunk_sizes_make_progress"
+      ],
+      "scope": "Checks agreement, progress, and fresh-entropy influence after snapshots of all eleven states. Does not claim equivalence to upstream symbolic compromise analysis or inherit its proof."
+    }
+  ],
+  "scope": "Independent behavioral coverage of the public specifications. This is not Signal wire compatibility or an inherited formal proof. No upstream implementation or test body is included.",
+  "baseline": {
+    "upstream_tests_passed": 57,
+    "version": "1.6.0"
+  },
+  "related_suites": [
+    {
+      "source": "https://github.com/C2SP/wycheproof",
+      "provenance": "wycheproof/provenance.json",
+      "cases": 1084
+    },
+    {
+      "source": "https://github.com/RustCrypto/KEMs",
+      "crate": "ml-kem",
+      "version": "0.3.2",
+      "coverage": "Exact deterministic keys, ciphertexts and shared secrets; byte-by-byte ciphertext mutation and implicit rejection."
+    },
+    {
+      "source": "https://github.com/signalapp/libsignal",
+      "revision": "e8cc2dddd578859b4a029c9c94670b24ce2b616a",
+      "scope": "Complete inventories for protocol session/ratchet integration tests, chain-key unit tests and session-management regression/property tests. Group messaging, sealed sender, identity fingerprints and other unrelated APIs are outside this channel. Behavioral mappings are independent tests, not copied bodies or a claim of identical wire compatibility.",
+      "cases": [
+        {
+          "path": "rust/protocol/tests/session.rs",
+          "name": "test_basic_prekey",
+          "status": "not_applicable",
+          "reason": "PQXDH/prekey identities, persistent session stores and archived-session selection are not part of the authenticated ephemeral HPKE client/server setup."
+        },
+        {
+          "path": "rust/protocol/tests/session.rs",
+          "name": "test_chain_jump_over_limit",
+          "status": "covered_behavior",
+          "tests": [
+            "crates/verifier/src/channel/ratchet/double/tests.rs::skipped_key_bounds_apply_across_both_chains_and_all_dh_turns",
+            "crates/verifier/src/channel/ratchet/peer/tests.rs::impossible_counters_and_epochs_do_not_advance_or_allocate"
+          ]
+        },
+        {
+          "path": "rust/protocol/tests/session.rs",
+          "name": "test_chain_jump_over_limit_with_self",
+          "status": "covered_behavior",
+          "tests": [
+            "crates/verifier/src/channel/ratchet/double/tests.rs::skipped_key_bounds_apply_across_both_chains_and_all_dh_turns"
+          ],
+          "scope": "No self-messaging identity special case; every endpoint uses the same 4096 derivation bound."
+        },
+        {
+          "path": "rust/protocol/tests/session.rs",
+          "name": "test_bad_signed_pre_key_signature",
+          "status": "not_applicable",
+          "reason": "PQXDH/prekey identities, persistent session stores and archived-session selection are not part of the authenticated ephemeral HPKE client/server setup."
+        },
+        {
+          "path": "rust/protocol/tests/session.rs",
+          "name": "test_repeat_bundle_message",
+          "status": "not_applicable",
+          "reason": "PQXDH/prekey identities, persistent session stores and archived-session selection are not part of the authenticated ephemeral HPKE client/server setup."
+        },
+        {
+          "path": "rust/protocol/tests/session.rs",
+          "name": "test_bad_message_bundle",
+          "status": "not_applicable",
+          "reason": "PQXDH/prekey identities, persistent session stores and archived-session selection are not part of the authenticated ephemeral HPKE client/server setup."
+        },
+        {
+          "path": "rust/protocol/tests/session.rs",
+          "name": "test_optional_one_time_prekey",
+          "status": "not_applicable",
+          "reason": "PQXDH/prekey identities, persistent session stores and archived-session selection are not part of the authenticated ephemeral HPKE client/server setup."
+        },
+        {
+          "path": "rust/protocol/tests/session.rs",
+          "name": "test_basic_session",
+          "status": "covered_behavior",
+          "tests": [
+            "crates/verifier/src/channel/ratchet/hybrid/tests.rs::hybrid_sessions_agree_across_fresh_classical_and_post_quantum_epochs",
+            "crates/verifier/src/channel/ratchet/hybrid/tests.rs::concurrent_reordering_loss_and_old_messages_cross_both_component_epochs"
+          ]
+        },
+        {
+          "path": "rust/protocol/tests/session.rs",
+          "name": "test_message_key_limits",
+          "status": "covered_behavior",
+          "tests": [
+            "crates/verifier/src/channel/ratchet/double/tests.rs::skipped_key_bounds_apply_across_both_chains_and_all_dh_turns",
+            "crates/verifier/src/channel/ratchet/peer/tests.rs::cache_limits_are_global_and_expiry_is_not_extended_by_clock_regression_or_bad_input"
+          ],
+          "scope": "Exercises our global 4096-key component limit, authenticated eviction, consumption and expiry rather than Signal's 2000-key limit."
+        },
+        {
+          "path": "rust/protocol/tests/session.rs",
+          "name": "test_basic_simultaneous_initiate",
+          "status": "not_applicable",
+          "reason": "Setup fixes client and responder roles; there is no simultaneous prekey initiation or archived-session merge."
+        },
+        {
+          "path": "rust/protocol/tests/session.rs",
+          "name": "test_simultaneous_initiate_with_lossage",
+          "status": "not_applicable",
+          "reason": "Setup fixes client and responder roles; there is no simultaneous prekey initiation or archived-session merge."
+        },
+        {
+          "path": "rust/protocol/tests/session.rs",
+          "name": "test_simultaneous_initiate_lost_message",
+          "status": "not_applicable",
+          "reason": "Setup fixes client and responder roles; there is no simultaneous prekey initiation or archived-session merge."
+        },
+        {
+          "path": "rust/protocol/tests/session.rs",
+          "name": "test_simultaneous_initiate_repeated_messages",
+          "status": "not_applicable",
+          "reason": "Setup fixes client and responder roles; there is no simultaneous prekey initiation or archived-session merge."
+        },
+        {
+          "path": "rust/protocol/tests/session.rs",
+          "name": "test_simultaneous_initiate_lost_message_repeated_messages",
+          "status": "not_applicable",
+          "reason": "Setup fixes client and responder roles; there is no simultaneous prekey initiation or archived-session merge."
+        },
+        {
+          "path": "rust/protocol/tests/session.rs",
+          "name": "test_zero_is_a_valid_prekey_id",
+          "status": "not_applicable",
+          "reason": "PQXDH/prekey identities, persistent session stores and archived-session selection are not part of the authenticated ephemeral HPKE client/server setup."
+        },
+        {
+          "path": "rust/protocol/tests/session.rs",
+          "name": "test_unacknowledged_sessions_eventually_expire",
+          "status": "not_applicable",
+          "reason": "No seven-day prekey session age policy. Gateway idle admission and client outstanding-request ownership have their own tested bounds."
+        },
+        {
+          "path": "rust/protocol/tests/session.rs",
+          "name": "prekey_message_failed_decryption_does_not_update_stores",
+          "status": "not_applicable",
+          "reason": "PQXDH/prekey identities, persistent session stores and archived-session selection are not part of the authenticated ephemeral HPKE client/server setup."
+        },
+        {
+          "path": "rust/protocol/tests/session.rs",
+          "name": "prekey_message_failed_decryption_does_not_update_stores_even_when_previously_archived",
+          "status": "not_applicable",
+          "reason": "PQXDH/prekey identities, persistent session stores and archived-session selection are not part of the authenticated ephemeral HPKE client/server setup."
+        },
+        {
+          "path": "rust/protocol/tests/session.rs",
+          "name": "prekey_message_to_archived_session",
+          "status": "not_applicable",
+          "reason": "PQXDH/prekey identities, persistent session stores and archived-session selection are not part of the authenticated ephemeral HPKE client/server setup."
+        },
+        {
+          "path": "rust/protocol/tests/session.rs",
+          "name": "prekey_message_must_not_have_changed_identity_key",
+          "status": "not_applicable",
+          "reason": "PQXDH/prekey identities, persistent session stores and archived-session selection are not part of the authenticated ephemeral HPKE client/server setup."
+        },
+        {
+          "path": "rust/protocol/tests/session.rs",
+          "name": "test_signedprekey_not_saved",
+          "status": "not_applicable",
+          "reason": "PQXDH/prekey identities, persistent session stores and archived-session selection are not part of the authenticated ephemeral HPKE client/server setup."
+        },
+        {
+          "path": "rust/protocol/tests/session.rs",
+          "name": "test_longer_sessions",
+          "status": "covered_behavior",
+          "tests": [
+            "crates/verifier/src/channel/ratchet/hybrid/tests.rs::concurrent_reordering_loss_and_old_messages_cross_both_component_epochs",
+            "fuzz/fuzz_targets/ratchet.rs"
+          ]
+        },
+        {
+          "path": "rust/protocol/tests/session.rs",
+          "name": "test_duplicate_message_error_returned",
+          "status": "covered_behavior",
+          "tests": [
+            "crates/verifier/src/channel/server.rs::admission_rejects_forgery_and_replay_and_streams_outlive_the_session"
+          ]
+        },
+        {
+          "path": "rust/protocol/tests/session.rs",
+          "name": "test_pqr_state_and_message_contents_nonempty",
+          "status": "covered_behavior",
+          "tests": [
+            "crates/verifier/src/channel/ratchet/hybrid/tests.rs::hybrid_sessions_agree_across_fresh_classical_and_post_quantum_epochs"
+          ]
+        },
+        {
+          "path": "rust/protocol/tests/session.rs",
+          "name": "x3dh_prekey_rejected_as_invalid_message_specifically",
+          "status": "not_applicable",
+          "reason": "No legacy protocol, persistence or implementation-handover path. Retired channel versions are rejected."
+        },
+        {
+          "path": "rust/protocol/tests/session.rs",
+          "name": "x3dh_established_session_is_or_is_not_usable",
+          "status": "not_applicable",
+          "reason": "No legacy protocol, persistence or implementation-handover path. Retired channel versions are rejected."
+        },
+        {
+          "path": "rust/protocol/tests/session.rs",
+          "name": "prekey_message_sent_from_different_user_is_rejected",
+          "status": "not_applicable",
+          "reason": "PQXDH/prekey identities, persistent session stores and archived-session selection are not part of the authenticated ephemeral HPKE client/server setup."
+        },
+        {
+          "path": "rust/protocol/tests/session.rs",
+          "name": "prekey_message_rejects_wrong_local_recipient_address",
+          "status": "not_applicable",
+          "reason": "PQXDH/prekey identities, persistent session stores and archived-session selection are not part of the authenticated ephemeral HPKE client/server setup."
+        },
+        {
+          "path": "rust/protocol/tests/session.rs",
+          "name": "proptest_session_resets",
+          "status": "not_applicable",
+          "reason": "No prekey reset/resend protocol or identity store. A new authenticated session has independent state; active stream cancellation and close are tested by the adapters."
+        },
+        {
+          "path": "rust/protocol/tests/ratchet.rs",
+          "name": "test_alice_and_bob_agree_on_chain_keys_with_kyber",
+          "status": "not_applicable",
+          "reason": "PQXDH/prekey identities, persistent session stores and archived-session selection are not part of the authenticated ephemeral HPKE client/server setup."
+        },
+        {
+          "path": "rust/protocol/tests/ratchet.rs",
+          "name": "test_bob_rejects_torsioned_basekey",
+          "status": "not_applicable",
+          "reason": "This upstream check authenticates a PQXDH base key. Our setup authenticates every initial DH-key byte in its quote/transcript; every record authenticates its exact public-key encoding, including the X25519 ignored high bit."
+        },
+        {
+          "path": "rust/protocol/tests/ratchet.rs",
+          "name": "test_bob_rejects_highbit_basekey",
+          "status": "not_applicable",
+          "reason": "This upstream check authenticates a PQXDH base key. Our setup authenticates every initial DH-key byte in its quote/transcript; every record authenticates its exact public-key encoding, including the X25519 ignored high bit."
+        },
+        {
+          "path": "rust/protocol/src/ratchet/keys.rs",
+          "name": "test_chain_key_derivation",
+          "status": "covered_behavior",
+          "tests": [
+            "crates/verifier/src/channel/ratchet/double/tests.rs::double_ratchet_matches_independent_x25519_hkdf_hmac_vectors"
+          ]
+        },
+        {
+          "path": "rust/protocol/src/session_management.rs",
+          "name": "encrypt_preserves_corruption_error_instead_of_session_not_found",
+          "status": "not_applicable",
+          "reason": "No serialized secret-state import or previous-session store. Malformed wire input and authentication failures are covered separately."
+        },
+        {
+          "path": "rust/protocol/src/session_management.rs",
+          "name": "encrypt_ignores_corrupt_unused_receiver_chain",
+          "status": "not_applicable",
+          "reason": "No serialized secret-state import or previous-session store. Malformed wire input and authentication failures are covered separately."
+        },
+        {
+          "path": "rust/protocol/src/session_management.rs",
+          "name": "decrypt_skips_corrupt_previous_session_and_uses_later_valid_previous",
+          "status": "not_applicable",
+          "reason": "No serialized secret-state import or previous-session store. Malformed wire input and authentication failures are covered separately."
+        },
+        {
+          "path": "rust/protocol/src/session_management.rs",
+          "name": "decrypt_ignores_corrupt_unmatched_receiver_chain",
+          "status": "not_applicable",
+          "reason": "No serialized secret-state import or previous-session store. Malformed wire input and authentication failures are covered separately."
+        },
+        {
+          "path": "rust/protocol/src/session_management.rs",
+          "name": "decrypt_fails_on_corrupt_matched_receiver_chain",
+          "status": "not_applicable",
+          "reason": "No serialized secret-state import or previous-session store. Malformed wire input and authentication failures are covered separately."
+        },
+        {
+          "path": "rust/protocol/src/session_management.rs",
+          "name": "scenario_interleaved_delivery_with_gaps_and_recovery",
+          "status": "covered_behavior",
+          "tests": [
+            "crates/verifier/src/channel/ratchet/hybrid/tests.rs::concurrent_reordering_loss_and_old_messages_cross_both_component_epochs"
+          ],
+          "scope": "Covers message behavior; does not implement legacy event-machine migration."
+        },
+        {
+          "path": "rust/protocol/src/session_management.rs",
+          "name": "scenario_chain_jump_over_limit",
+          "status": "covered_behavior",
+          "tests": [
+            "crates/verifier/src/channel/ratchet/double/tests.rs::skipped_key_bounds_apply_across_both_chains_and_all_dh_turns"
+          ],
+          "scope": "Covers message behavior; does not implement legacy event-machine migration."
+        },
+        {
+          "path": "rust/protocol/src/session_management.rs",
+          "name": "scenario_prekey_session_establishment_equivalence",
+          "status": "not_applicable",
+          "reason": "PQXDH/prekey identities, persistent session stores and archived-session selection are not part of the authenticated ephemeral HPKE client/server setup."
+        },
+        {
+          "path": "rust/protocol/src/session_management.rs",
+          "name": "scenario_corrupted_ciphertext",
+          "status": "covered_behavior",
+          "tests": [
+            "crates/verifier/src/channel/server.rs::admission_rejects_forgery_and_replay_and_streams_outlive_the_session",
+            "crates/verifier/src/channel/ratchet/hybrid/tests.rs::invalid_composite_headers_and_ciphertexts_never_commit_either_component"
+          ],
+          "scope": "Covers message behavior; does not implement legacy event-machine migration."
+        },
+        {
+          "path": "rust/protocol/src/session_management.rs",
+          "name": "scenario_replay_message",
+          "status": "covered_behavior",
+          "tests": [
+            "crates/verifier/src/channel/server.rs::admission_rejects_forgery_and_replay_and_streams_outlive_the_session"
+          ],
+          "scope": "Covers message behavior; does not implement legacy event-machine migration."
+        },
+        {
+          "path": "rust/protocol/src/session_management.rs",
+          "name": "proptest_event_model_matches_legacy",
+          "status": "not_applicable",
+          "reason": "No legacy protocol, persistence or implementation-handover path. Retired channel versions are rejected."
+        },
+        {
+          "path": "rust/protocol/src/session_management.rs",
+          "name": "proptest_legacy_handover_to_new",
+          "status": "not_applicable",
+          "reason": "No legacy protocol, persistence or implementation-handover path. Retired channel versions are rejected."
+        },
+        {
+          "path": "rust/protocol/src/session_management.rs",
+          "name": "proptest_delayed_message_via_previous_session",
+          "status": "not_applicable",
+          "reason": "PQXDH/prekey identities, persistent session stores and archived-session selection are not part of the authenticated ephemeral HPKE client/server setup."
+        },
+        {
+          "path": "rust/protocol/src/session_management.rs",
+          "name": "proptest_ciphertext_equality",
+          "status": "not_applicable",
+          "reason": "No legacy protocol, persistence or implementation-handover path. Retired channel versions are rejected."
+        }
+      ],
+      "baseline": {
+        "unit_tests_passed": 62,
+        "ratchet_integration_tests_passed": 3,
+        "session_integration_tests_passed": 29,
+        "normally_ignored_session_tests_included": 2
+      }
+    }
+  ]
+}

@@ -13,12 +13,13 @@ struct PythonTransport {
 #[pymethods]
 impl PythonTransport {
     #[new]
-    #[pyo3(signature = (*, environment = "prod", security = "tls", max_connections = 4, base_url = None))]
+    #[pyo3(signature = (*, environment = "prod", security = "tls", max_connections = 4, ratchet_bytes = 1152, base_url = None))]
     fn new(
         py: Python<'_>,
         environment: &str,
         security: &str,
         max_connections: usize,
+        ratchet_bytes: u16,
         base_url: Option<String>,
     ) -> PyResult<Self> {
         let options = TransportOptions {
@@ -30,6 +31,7 @@ impl PythonTransport {
                 _ => return Err(PyValueError::new_err("security must be tls or e2ee")),
             },
             max_connections,
+            ratchet_bytes,
             base_url,
         };
         let inner = py

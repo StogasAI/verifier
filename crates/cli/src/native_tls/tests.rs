@@ -100,7 +100,7 @@ impl ResolvesServerCert for CertificateResolver {
 }
 
 #[tokio::test]
-async fn real_tls_rejects_classical_negotiation_and_unattested_certificates_before_any_application_data()
+async fn real_tls_rejects_unsupported_profiles_and_unattested_certificates_before_any_application_data()
  {
     let snapshot = snapshot();
     let certificate: serde_json::Value = serde_json::from_str(include_str!(
@@ -125,26 +125,44 @@ async fn real_tls_rejects_classical_negotiation_and_unattested_certificates_befo
         )
         .unwrap(),
     ));
-    for (version, group, certificate_expected) in [
+    for (version, group, suite, certificate_expected) in [
         (
             &rustls::version::TLS12,
             rustls::crypto::aws_lc_rs::kx_group::X25519,
+            None,
             false,
         ),
         (
             &rustls::version::TLS13,
             rustls::crypto::aws_lc_rs::kx_group::X25519,
+            None,
             false,
         ),
         (
             &rustls::version::TLS13,
             rustls::crypto::aws_lc_rs::kx_group::X25519MLKEM768,
+            Some(rustls::crypto::aws_lc_rs::cipher_suite::TLS13_AES_128_GCM_SHA256),
+            false,
+        ),
+        (
+            &rustls::version::TLS13,
+            rustls::crypto::aws_lc_rs::kx_group::X25519MLKEM768,
+            Some(rustls::crypto::aws_lc_rs::cipher_suite::TLS13_CHACHA20_POLY1305_SHA256),
+            true,
+        ),
+        (
+            &rustls::version::TLS13,
+            rustls::crypto::aws_lc_rs::kx_group::X25519MLKEM768,
+            Some(rustls::crypto::aws_lc_rs::cipher_suite::TLS13_AES_256_GCM_SHA384),
             true,
         ),
     ] {
         let calls = Arc::new(AtomicUsize::new(0));
         let mut provider = rustls::crypto::aws_lc_rs::default_provider();
         provider.kx_groups = vec![group];
+        if let Some(suite) = suite {
+            provider.cipher_suites = vec![suite];
+        }
         let mut config = ServerConfig::builder_with_provider(Arc::new(provider))
             .with_protocol_versions(&[version])
             .unwrap()

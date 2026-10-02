@@ -1,7 +1,7 @@
 import os
 
 from openai import DefaultHttpxClient, OpenAI
-from stogas_verifier import Transport
+from stogas import Transport
 
 
 def client(base_url: str, api_key: str) -> OpenAI:

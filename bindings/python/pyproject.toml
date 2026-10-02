@@ -3,7 +3,7 @@ requires = ["maturin>=1.14,<2"]
 build-backend = "maturin"
 
 [project]
-name = "stogas-verifier"
+name = "stogas"
 description = "Stogas SDK for verified confidential AI connections and evidence"
 requires-python = ">=3.10"
 dynamic = ["version"]
@@ -25,5 +25,5 @@ Repository = "https://github.com/StogasAI/verifier"
 
 [tool.maturin]
 features = ["pyo3/extension-module"]
-module-name = "stogas_verifier._stogas_verifier"
+module-name = "stogas._stogas_verifier"
 python-source = "python"

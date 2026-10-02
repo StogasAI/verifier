@@ -5,6 +5,8 @@ export interface StogasTransportOptions {
 	environment?: 'prod' | 'staging';
 	/** One initial session, growing on capacity pressure to this maximum. Default: four. */
 	maxConnections?: number;
+	/** Maximum ML-KEM chunk payload per message in each direction. Even, 32–1152; default 1152. */
+	ratchetBytes?: number;
 	fetch?: typeof globalThis.fetch;
 	/** Delivered only after the requested terminal content receipt verifies. */
 	onMetadata?: (metadata: unknown) => void;

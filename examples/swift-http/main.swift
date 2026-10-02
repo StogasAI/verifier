@@ -1,5 +1,5 @@
 import Foundation
-import StogasVerifier
+import Stogas
 
 final class NoRedirects: NSObject, URLSessionTaskDelegate, @unchecked Sendable {
     func urlSession(_ session: URLSession, task: URLSessionTask,

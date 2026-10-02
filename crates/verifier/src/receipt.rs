@@ -451,7 +451,7 @@ mod http_tests {
                 // verification for each byte boundary adds no cryptographic coverage.
                 let (actual_metadata, actual_response) = stream.body.finish().unwrap();
                 assert_eq!(actual_metadata, metadata_bytes);
-                assert_eq!(actual_response.as_slice(), response.as_slice());
+                assert_eq!(actual_response.as_slice(), &response[..]);
             }
             let mut stream = Stream::new(request);
             stream.push(&wire).unwrap();

@@ -20,9 +20,9 @@ for name in ["bindings/java/pom.xml", "examples/java-openai/pom.xml"]:
     namespace = {"m": "http://maven.apache.org/POM/4.0.0"}
     path = "m:version" if name.startswith("bindings") else "m:dependencies/m:dependency[m:groupId='ai.stogas']/m:version"
     assert pom.findtext(path, namespaces=namespace) == version, name
-for name in ["bindings/dotnet/Stogas.Verifier/Stogas.Verifier.csproj", "bindings/dotnet/tests/Consumer.csproj"]:
+for name in ["bindings/dotnet/Stogas/Stogas.csproj", "bindings/dotnet/tests/Consumer.csproj"]:
     project = ET.parse(root / name)
-    actual = project.findtext("PropertyGroup/Version") if "Stogas.Verifier/" in name else project.find("ItemGroup/PackageReference[@Include='Stogas.Verifier']").get("Version")
+    actual = project.findtext("PropertyGroup/Version") if "Stogas/" in name else project.find("ItemGroup/PackageReference[@Include='Stogas']").get("Version")
     assert actual == version, name
-gem = re.search(r"s.version = '([^']+)'", (root / "bindings/ruby/stogas-verifier.gemspec").read_text())[1]
+gem = re.search(r"s.version = '([^']+)'", (root / "bindings/ruby/stogas.gemspec").read_text())[1]
 assert gem == version.replace("-", "."), "Ruby gem"

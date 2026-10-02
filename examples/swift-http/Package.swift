@@ -7,7 +7,7 @@ let package = Package(
     dependencies: [.package(path: "../../bindings/swift")],
     targets: [.executableTarget(
         name: "StogasHTTPExample",
-        dependencies: [.product(name: "StogasVerifier", package: "swift")],
+        dependencies: [.product(name: "Stogas", package: "swift")],
         path: ".",
         sources: ["main.swift"]
     )]

@@ -57,5 +57,12 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "ratchet"
+path = "fuzz_targets/ratchet.rs"
+test = false
+doc = false
+bench = false
+
 [workspace]
 members = ["."]

@@ -5,5 +5,5 @@
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
   </PropertyGroup>
-  <ItemGroup><PackageReference Include="Stogas.Verifier" Version="0.1.0-alpha.1" /></ItemGroup>
+  <ItemGroup><PackageReference Include="Stogas" Version="0.1.0-alpha.1" /></ItemGroup>
 </Project>

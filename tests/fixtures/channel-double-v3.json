@@ -1,0 +1,128 @@
+{
+  "source": "Independent Python cryptography X25519/HKDF and standard-library HMAC calculation of the public Double Ratchet specification.",
+  "initial_root_hex": "2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a",
+  "initial_responder_private_hex": "0303030303030303030303030303030303030303030303030303030303030303",
+  "initial_responder_public_hex": "5dfedd3b6bd47f6fa28ee15d969d5bb0ea53774d488bdaf9df1c6e0124b3ef22",
+  "turns": [
+    {
+      "side": 0,
+      "private_hex": "0707070707070707070707070707070707070707070707070707070707070707",
+      "public_hex": "13be4feaeaf204c7fd3358fc9c00721881d174278128227ec674f37f7fe97b6d",
+      "root_hex": "f1780fbdc1e7a2c051f0cf2a7a4cf9965e92ab2b9be784083923225a8f529ba4",
+      "chain_hex": "0a7305920ff5d09ed969b3e0e13761eb1bc4b08f1862adbe89849eee08ed9064",
+      "previous": 0,
+      "messages": [
+        {
+          "number": 0,
+          "secret_hex": "a3e9bd3e37a0199bbcbcf82208b806ab3542d0dedbafa8b8ce20c067e99db921",
+          "next_chain_hex": "5e03782141fef4323f8a3486b4706de9b71851cac220ed9ba077b788ba7839c4"
+        },
+        {
+          "number": 1,
+          "secret_hex": "4fb508ac6b0ec8ca520857e409980ce31d1c2dad4bf453f5fce2eaf12f94aa3e",
+          "next_chain_hex": "e69b188d3ac601a86cc36e8e874dcca58f62298fae3d233fce1313e5da8e61f1"
+        },
+        {
+          "number": 42,
+          "secret_hex": "06d17d74a144ead8c2c8298fa6623391089687df3601f97fb2a047e978f1bfe9",
+          "next_chain_hex": "5d6c50c344db229a87e18ba6016503b0511442bfe4ce6454159b6eeddcfd6a08"
+        },
+        {
+          "number": 4095,
+          "secret_hex": "b380ebc484f58df822494fd219edae51c8d85e4eaa607964c3a3350b7843b28d",
+          "next_chain_hex": "a615cf382882087af07e38e86f49166c2a3d9763fe5597b5c8c3b53f4f561ab5"
+        }
+      ]
+    },
+    {
+      "side": 1,
+      "private_hex": "0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b",
+      "public_hex": "73b2d8b76aa9b53660032bc8f5d8bee3a3ae4e3b3a7fd49ade81f7347a34aa68",
+      "root_hex": "6835484fe24e6900478194a514782d849b3298f2a2b30bed829375ac7ebc6272",
+      "chain_hex": "ba1cbaaaf833233352a8e93007ff2257934456223a55062acb78aa155f4908bb",
+      "previous": 0,
+      "messages": [
+        {
+          "number": 0,
+          "secret_hex": "1a343fd59633a877cec0f95ccfcbddd8641c117fcf4c41aa7cfea37647adef93",
+          "next_chain_hex": "f191af5104adf516df6fceda759bc5e95cfa0c1dcc17277e7c458909d3855def"
+        },
+        {
+          "number": 1,
+          "secret_hex": "dc13cddc9a8131307e1b4f7ecf2306599b2d0ea7789bcf71de3eaa8762cf372e",
+          "next_chain_hex": "7fc2197cf7fb79433152de95e93c8b6dee805d27e544fe33bf72b47d2d3180fd"
+        },
+        {
+          "number": 42,
+          "secret_hex": "53e7614bd67dc29ca8528026fe27a488c7dce3aa6933fae2effc4632de6b9031",
+          "next_chain_hex": "fa9d7de12510f21e6adb886de8510e3f44f61a7a3134713958c2408609e79e38"
+        },
+        {
+          "number": 4095,
+          "secret_hex": "fce443aece3c98679b0180a5ce104c82474c48fc85cc4ca12de19e55ac7069b3",
+          "next_chain_hex": "722714fc93ec279eae51b2f93578616d159db616b62b1aae37b8c0564c05b78a"
+        }
+      ]
+    },
+    {
+      "side": 0,
+      "private_hex": "0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d",
+      "public_hex": "b307ae8660efaed4d6a65f6640896892ea4a1f0075555c489d1312a2e1677c28",
+      "root_hex": "ee33a710c331daad048ddad6203991066e260c2e6687620ddb1f984e4a019d4a",
+      "chain_hex": "0c5414bc18f688b3fa754ee385255686003972ed6d31a2252c642422097f959d",
+      "previous": 4096,
+      "messages": [
+        {
+          "number": 0,
+          "secret_hex": "d4426f4e7259a7fba77aa449fa5ce882025ccbe9372c7b4231de0e1b00619a81",
+          "next_chain_hex": "95d2ec01ba221ac0ace22d17229ca42406a2a70f5927810c5490f8d2ff91a8a8"
+        },
+        {
+          "number": 1,
+          "secret_hex": "3963222b9766c1f4bf4fdfc177c71ecbde49af2c06dd5b6825d4b5fe99efb270",
+          "next_chain_hex": "de4c9de73d64fcbaa89a34ebda0bc05113c1a1ecd615ed3405f816078effec62"
+        },
+        {
+          "number": 42,
+          "secret_hex": "2e34a60f3c6c38b9bf191bc33ab0737a6b9bb86aa6b9434453cf770d256b0419",
+          "next_chain_hex": "912fe3a5493ac7e4be17b5c4c4a99f7e3ede7b5f09c4e06fdf08b4eda2241620"
+        },
+        {
+          "number": 4095,
+          "secret_hex": "251c6968f128d25db26ec3dcca013b89f7ee797066d6d7168587a9dc849e2105",
+          "next_chain_hex": "2e0fe0427d7a14b13ae0c148c9f2e465ef3f16666aff609b0e6c95d10852976b"
+        }
+      ]
+    },
+    {
+      "side": 1,
+      "private_hex": "1111111111111111111111111111111111111111111111111111111111111111",
+      "public_hex": "7b4e909bbe7ffe44c465a220037d608ee35897d31ef972f07f74892cb0f73f13",
+      "root_hex": "5007f6d2c5539f3d1a25b29acdca7000f3182385248ad0fa5acce34e83b5faac",
+      "chain_hex": "9865ef3eb9402b46e3f1a2dc658aafe775fff72b7554d6f08b4fab5788f13db6",
+      "previous": 4096,
+      "messages": [
+        {
+          "number": 0,
+          "secret_hex": "18ef37110ba16ed28274dde0e957ec89a0ac2016dd0c9fbe96bec2a461109945",
+          "next_chain_hex": "e21d5700958514c2dac5e6e72d898b9828ef2774323d54c9ccde3505352809c3"
+        },
+        {
+          "number": 1,
+          "secret_hex": "04a982a7fec419199b34409ee9edb8fd2d9a70c55f2807671a45837f20303027",
+          "next_chain_hex": "680f7aeaff8e8f446ac370b45d3f7d617578fcd7b101e26a3ba88062203e77d4"
+        },
+        {
+          "number": 42,
+          "secret_hex": "588c300eb4e3812deb34d1cca3a06e700995f031af803f6a49b30da585ba2d38",
+          "next_chain_hex": "1e11c2a38cc1aa2b0d09e1e21b32ac53732c9a6346b1ada4c3cadcfa50ba7861"
+        },
+        {
+          "number": 4095,
+          "secret_hex": "7d389c7c2241d77773c3a20aaf5aa0567f3a4389e9c75ef78ab9279b627e8f67",
+          "next_chain_hex": "d35a8248836cbe8947fd323e03af895e609520c69bef13b3788aab399a291cb9"
+        }
+      ]
+    }
+  ]
+}

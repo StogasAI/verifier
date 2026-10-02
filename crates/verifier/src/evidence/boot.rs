@@ -5,48 +5,58 @@ use hpke::{Deserializable as _, kem::XWing};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256, Sha512};
 
-use super::{Error, Snapshot, VerifiedSnpReport};
+use super::{Error, Snapshot, SnpHardwareFacts, VerifiedSnpReport};
 use crate::approvals::Environment;
 
 pub const BOOT_SCHEMA: &str = "stogas.node-boot.v1";
 pub const BOOT_PUBLICATION_SCHEMA: &str = "stogas.node-registration.v1";
 pub const REPORT_DATA_SCHEMA: &str = "stogas.node-report.v1";
-const RENEWAL_DOMAIN: &[u8] = b"stogas.certificate-renewal.v1\0";
+#[derive(Clone, Copy, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BootRequestPurpose {
+    Certificate,
+    Complete,
+}
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct CertificateRenewal {
+struct BootRequestAuthorization {
     node_id: String,
     issued_at_ms: i64,
     signature: String,
 }
 
-/// Authenticate a bounded renewal request using the key from durable boot registration.
-/// Renewal is idempotent and returns public material; retries need no replay database.
+/// Authenticate a bounded request using the key from its verified boot evidence.
+/// Both operations are idempotent; retries need no replay database.
 ///
 /// # Errors
 /// Rejects another identity, bad signatures or a timestamp more than five minutes away.
-pub fn verify_certificate_renewal(
+pub fn verify_boot_request(
     request: &[u8],
     expected_node_id: &str,
     public_key: &[u8],
     now_unix_ms: i64,
+    purpose: BootRequestPurpose,
 ) -> Result<(), Error> {
     if request.len() > 5 * 1024 {
         return Err(Error::TooLarge);
     }
-    let request: CertificateRenewal =
+    let request: BootRequestAuthorization =
         serde_json::from_value(crate::strict_json::from_slice(request).map_err(invalid)?)
             .map_err(invalid)?;
     if request.node_id != expected_node_id
         || request.issued_at_ms <= 0
         || request.issued_at_ms.abs_diff(now_unix_ms) > 300_000
     {
-        return Err(invalid("certificate renewal identity or time differs"));
+        return Err(invalid("boot request identity or time differs"));
     }
     let signature = decode(&request.signature, crate::signing::SIGNATURE_BYTES)?;
+    let domain: &[u8] = match purpose {
+        BootRequestPurpose::Certificate => b"stogas.certificate-renewal.v1\0",
+        BootRequestPurpose::Complete => b"stogas.registration-complete.v1\0",
+    };
     let message = [
-        RENEWAL_DOMAIN,
+        domain,
         request.node_id.as_bytes(),
         b"\0",
         &request.issued_at_ms.to_be_bytes(),
@@ -85,6 +95,17 @@ struct BootInclusion {
     rekor: serde_json::Value,
 }
 
+/// Compact facts for an authority's verified registration database. Deserialization
+/// does not authenticate them: accept these only from a prior verified registration.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RegisteredBootFacts {
+    pub node_id: String,
+    pub chip_id: String,
+    pub gateway_release_id: String,
+    pub hardware: SnpHardwareFacts,
+}
+
 /// Hardware and registration checks passed. The Control transaction must still consume its
 /// challenge atomically before releasing secrets to the bound provisioning recipient.
 #[derive(Debug)]
@@ -95,6 +116,24 @@ pub struct VerifiedRegistration {
 }
 
 impl VerifiedRegistration {
+    #[must_use]
+    pub fn registered_facts(&self) -> RegisteredBootFacts {
+        RegisteredBootFacts {
+            node_id: self.hardware.node_id().into(),
+            chip_id: self.hardware.chip_id().into(),
+            gateway_release_id: self.record.gateway_release_id.clone(),
+            hardware: *self.hardware.facts(),
+        }
+    }
+
+    /// Registration output includes compact facts for subsequent policy previews.
+    #[must_use]
+    pub fn registration_summary(&self) -> serde_json::Value {
+        let mut summary = self.summary();
+        summary["policy_facts"] = serde_json::json!(self.registered_facts());
+        summary
+    }
+
     /// The boot quote authenticates the TLS key; PKCS #10 proves possession and
     /// restricts issuance to this environment's compiled API hostname.
     ///
@@ -162,6 +201,14 @@ pub struct VerifiedBoot {
 }
 
 impl VerifiedBoot {
+    /// Check the TLS CSR against this authenticated boot's key and environment.
+    ///
+    /// # Errors
+    /// Rejects another key, invalid signatures, extra identities or malformed DER.
+    pub fn verify_csr(&self, csr_der: &[u8]) -> Result<(), Error> {
+        self.identity.verify_csr(csr_der)
+    }
+
     /// Authenticated boot identity fields, including actual transparency inclusion time.
     #[must_use]
     pub fn summary(&self) -> serde_json::Value {
@@ -216,6 +263,31 @@ impl BootReportData {
 }
 
 impl Snapshot {
+    /// Appraise facts from an authority's trusted registration database. Initial
+    /// verification already checked the immutable release's launch policy. A new
+    /// approval may withdraw that release or change the hardware requirements.
+    /// This method does not authenticate evidence, requests or sessions.
+    ///
+    /// # Errors
+    /// Rejects a withdrawn release, stricter hardware policy or invalid current collateral.
+    pub fn appraise_registered_boot(
+        &self,
+        facts: &RegisteredBootFacts,
+        now_unix_ms: i64,
+    ) -> Result<(), Error> {
+        self.require_current_keys()?;
+        self.gateway(&facts.gateway_release_id)
+            .ok_or(Error::Approval(crate::approvals::Error::NotApproved(
+                "gateway",
+            )))?;
+        crate::appraise_hardware(&self.hardware_evidence.policy, &facts.chip_id, |profile| {
+            facts.hardware.appraise(profile, &facts.node_id)
+        })
+        .map_err(invalid)?;
+        self.collateral_validity(&facts.chip_id, &facts.hardware.reported_tcb(), now_unix_ms)?;
+        Ok(())
+    }
+
     /// Verify the initial quote before logging or secret release. This never accepts a public
     /// archived quote as fresh without the expected one-use Control challenge.
     ///

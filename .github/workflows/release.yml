@@ -83,9 +83,9 @@ jobs:
           set -euo pipefail
           target="target/${{ matrix.target }}/release"
           if [ "${{ runner.os }}" = "Windows" ]; then
-            "$target/stogas-verify.exe" --help
+            "$target/stogas.exe" --help
           else
-            "$target/stogas-verify" --help
+            "$target/stogas" --help
           fi
       - uses: ruby/setup-ruby@e8944e80fb94b20106697132f8c20c665fab29e9
         with:
@@ -95,15 +95,15 @@ jobs:
         run: |
           python scripts/stage-native-bindings.py --platform ${{ matrix.platform }} --native-dir target/${{ matrix.target }}/release
           mkdir -p dist
-          gem -C bindings/ruby build stogas-verifier.gemspec --output "$PWD/dist/stogas-verifier-${GITHUB_REF_NAME}-${{ matrix.platform }}.gem"
-          gem install "dist/stogas-verifier-${GITHUB_REF_NAME}-${{ matrix.platform }}.gem" --no-document
+          gem -C bindings/ruby build stogas.gemspec --output "$PWD/dist/stogas-${GITHUB_REF_NAME}-${{ matrix.platform }}.gem"
+          gem install "dist/stogas-${GITHUB_REF_NAME}-${{ matrix.platform }}.gem" --no-document
           gem install minitest:5.20.0 --no-document
           ruby bindings/ruby/test/transport_test.rb
       - name: Assemble native package
         shell: bash
         run: |
           set -euo pipefail
-          name="stogas-verifier-${GITHUB_REF_NAME}-${{ matrix.platform }}"
+          name="stogas-${GITHUB_REF_NAME}-${{ matrix.platform }}"
           root="dist/$name"
           target="target/${{ matrix.target }}/release"
           mkdir -p "$root/include"
@@ -111,18 +111,18 @@ jobs:
           cmp LICENSE "$root/LICENSE"
           cp include/stogas_verifier.h "$root/include/"
           if [ "${{ runner.os }}" = "Windows" ]; then
-            cp "$target/stogas-verify.exe" "$target/stogas_verifier_ffi.dll" "$target/stogas_verifier_ffi.lib" "$root/"
+            cp "$target/stogas.exe" "$target/stogas_verifier_ffi.dll" "$target/stogas_verifier_ffi.lib" "$root/"
             (cd dist && 7z a -bd -tzip "$name.zip" "$name")
           else
-            cp "$target/stogas-verify" "$target/libstogas_verifier_ffi.a" "$target/libstogas_verifier_ffi.${{ matrix.shared_ext }}" "$root/"
+            cp "$target/stogas" "$target/libstogas_verifier_ffi.a" "$target/libstogas_verifier_ffi.${{ matrix.shared_ext }}" "$root/"
             tar -C dist -czf "dist/$name.tar.gz" "$name"
           fi
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
           name: native-${{ matrix.platform }}
           path: |
-            dist/stogas-verifier-${{ github.ref_name }}-${{ matrix.platform }}.${{ matrix.archive }}
-            dist/stogas-verifier-${{ github.ref_name }}-${{ matrix.platform }}.gem
+            dist/stogas-${{ github.ref_name }}-${{ matrix.platform }}.${{ matrix.archive }}
+            dist/stogas-${{ github.ref_name }}-${{ matrix.platform }}.gem
           if-no-files-found: error
           retention-days: 7
 
@@ -297,7 +297,7 @@ jobs:
           npm install --prefix "$smoke" --ignore-scripts "$PWD"/dist/*.tgz
           cd "$smoke"
           node --input-type=module <<'NODE'
-          const full = await import('@stogas/verifier')
+          const full = await import('stogas')
           const offline = await import('@stogas/offline-sigstore')
           const verifier = new full.EvidenceVerifier('prod', 'package-test', 'MCowBQYDK2VwAyEA3L5P2vQ8YUaIm4Kw5pD8iMEoZgUuo+oEKx95iLylrgg=')
           try {
@@ -475,12 +475,12 @@ jobs:
         run: |
           python3 scripts/stage-release-bindings.py --artifacts dist
           mvn -q -f bindings/java/pom.xml package
-          cp bindings/java/target/verifier-${{ needs.metadata.outputs.version }}.jar dist/
-          cp bindings/java/pom.xml dist/verifier-${{ needs.metadata.outputs.version }}.pom
-          dotnet pack bindings/dotnet/Stogas.Verifier -o dist
+          cp bindings/java/target/stogas-${{ needs.metadata.outputs.version }}.jar dist/
+          cp bindings/java/pom.xml dist/stogas-${{ needs.metadata.outputs.version }}.pom
+          dotnet pack bindings/dotnet/Stogas -o dist
           dotnet restore bindings/dotnet/tests/Consumer.csproj --source "$PWD/dist" --source https://api.nuget.org/v3/index.json
           dotnet run --no-restore --project bindings/dotnet/tests/Consumer.csproj
-          tar -C bindings/swift -czf "dist/stogas-verifier-swift-${GITHUB_REF_NAME}.tar.gz" Package.swift Sources README.md CStogas.artifactbundle
+          tar -C bindings/swift -czf "dist/stogas-swift-${GITHUB_REF_NAME}.tar.gz" Package.swift Sources README.md CStogas.artifactbundle
       - name: Create and verify reproducible checksum manifest
         shell: bash
         run: |
@@ -511,5 +511,5 @@ jobs:
             done
             gh release upload "$GITHUB_REF_NAME" dist/*
           else
-            gh release create "$GITHUB_REF_NAME" dist/* --draft --verify-tag --target "$GITHUB_SHA" --title "Stogas Verifier $GITHUB_REF_NAME"
+            gh release create "$GITHUB_REF_NAME" dist/* --draft --verify-tag --target "$GITHUB_SHA" --title "Stogas SDK $GITHUB_REF_NAME"
           fi

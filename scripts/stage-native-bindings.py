@@ -28,7 +28,7 @@ def stage(platform, native, bindings, version):
     rid, jna, swift = PLATFORMS[platform]
     extension = "dll" if platform.startswith("windows") else "dylib" if platform.startswith("darwin") else "so"
     name = ("" if extension == "dll" else "lib") + "stogas_verifier_ffi." + extension
-    copy(native / name, bindings / "dotnet/Stogas.Verifier/runtimes" / rid / "native" / name)
+    copy(native / name, bindings / "dotnet/Stogas/runtimes" / rid / "native" / name)
     copy(native / name, bindings / "java/src/main/resources" / jna / name)
     copy(native / name, bindings / "ruby/lib/stogas/native" / name)
 

@@ -42,6 +42,7 @@ fn fixture(maximum: usize) -> (Client, Arc<Owner>, [u8; 32], [u8; 32], Arc<Reque
         Url::parse("https://example.test/v1/session").unwrap(),
         Environment::Staging,
         NonZeroUsize::new(maximum).unwrap(),
+        channel::ratchet::ChunkSize::FULL,
     );
     let context = Arc::new(RequestContext {
         snapshot: Arc::clone(&snapshot),
@@ -81,7 +82,7 @@ async fn pool_respects_acknowledgement_capacity_idle_hints_and_setup_cancellatio
     let mut peer = Records::new(&root, &id, 0, 2);
     requests[0]
         .1
-        .open(&mut peer.seal(Kind::Keepalive, &[]))
+        .open(&mut peer.seal(Kind::Keepalive, &[]), 0)
         .unwrap();
     let next = ready(&client);
     assert_eq!(next.1.number(), 4096);
@@ -191,4 +192,38 @@ async fn graceful_close_authenticates_one_terminal_exchange_and_is_idempotent() 
         owner.state.lock().unwrap().core.request(),
         Err(channel::Error::Closed)
     ));
+}
+
+#[tokio::test]
+async fn cancelled_start_gap_renews_without_cutting_off_an_admitted_response() {
+    let (client, owner, root, id, _) = fixture(1);
+    let (lease, mut active) = ready(&client);
+    let mut peer = Records::new(&root, &id, 0, 2);
+    active
+        .open(&mut peer.seal(Kind::Keepalive, &[]), 0)
+        .unwrap();
+    for number in 1..=4096 {
+        let request = ready(&client);
+        assert_eq!(request.1.number(), number);
+        drop(request);
+    }
+    let Selection::Opening(_opening) = client.select().unwrap() else {
+        panic!("cancelled delivery gap did not renew the session");
+    };
+    assert!(owner.state.lock().unwrap().retired);
+    assert!(matches!(
+        owner.state.lock().unwrap().core.request(),
+        Err(channel::Error::Closed)
+    ));
+    assert_eq!(owner.state.lock().unwrap().active, 1);
+    active
+        .open(
+            &mut peer.seal(Kind::Metadata, br#"{"status":200,"headers":{}}"#),
+            0,
+        )
+        .unwrap();
+    active.open(&mut peer.seal(Kind::Finished, &[]), 0).unwrap();
+    active.complete().unwrap();
+    drop((lease, active));
+    assert_eq!(owner.state.lock().unwrap().active, 0);
 }

@@ -148,15 +148,15 @@ jobs:
         shell: pwsh
         run: |
           $PSNativeCommandUseErrorActionPreference = $true
-          dotnet pack bindings/dotnet/Stogas.Verifier -o "$env:RUNNER_TEMP/stogas-nuget"
+          dotnet pack bindings/dotnet/Stogas -o "$env:RUNNER_TEMP/stogas-nuget"
           dotnet nuget add source "$env:RUNNER_TEMP/stogas-nuget" --name stogas-local
           dotnet restore bindings/dotnet/tests/Consumer.csproj
           dotnet run --no-restore --project bindings/dotnet/tests/Consumer.csproj
       - name: Ruby platform gem loading and native errors
         shell: bash
         run: |
-          gem -C bindings/ruby build stogas-verifier.gemspec --output "$RUNNER_TEMP/stogas-verifier.gem"
-          gem install "$RUNNER_TEMP/stogas-verifier.gem" --no-document
+          gem -C bindings/ruby build stogas.gemspec --output "$RUNNER_TEMP/stogas.gem"
+          gem install "$RUNNER_TEMP/stogas.gem" --no-document
           gem install minitest:5.20.0 --no-document
           ruby bindings/ruby/test/transport_test.rb
       - name: Swift static package on macOS
@@ -198,8 +198,8 @@ jobs:
           cargo build --locked --package stogas-verifier-ffi
           python3 scripts/stage-native-bindings.py --platform linux-amd64 --native-dir target/debug
           mvn -q -f bindings/java/pom.xml install -DskipTests
-          gem -C bindings/ruby build stogas-verifier.gemspec --output "$RUNNER_TEMP/stogas-verifier.gem"
-          gem install "$RUNNER_TEMP/stogas-verifier.gem" --no-document
+          gem -C bindings/ruby build stogas.gemspec --output "$RUNNER_TEMP/stogas.gem"
+          gem install "$RUNNER_TEMP/stogas.gem" --no-document
       - name: Java typed requests and streaming failures
         run: |
           mvn -q -f examples/java-openai/pom.xml test dependency:build-classpath -Dmdep.outputFile=target/classpath
@@ -421,7 +421,7 @@ jobs:
           cd examples/elixir-openai
           mix deps.get --check-locked
           mix compile --warnings-as-errors
-          mix run test_transport.exs "$GITHUB_WORKSPACE/target/${{ env.CARGO_BUILD_TARGET }}/debug/stogas-verify"
+          mix run test_transport.exs "$GITHUB_WORKSPACE/target/${{ env.CARGO_BUILD_TARGET }}/debug/stogas"
           mix run test_client.exs
           python3 ../check_http_client.py mix run main.exs
           python3 ../check_http_client.py --unary mix run main.exs --no-stream
@@ -429,7 +429,7 @@ jobs:
         working-directory: examples/erlang-http
         run: |
           rebar3 escriptize
-          STOGAS_VERIFY_BIN="$GITHUB_WORKSPACE/target/${{ env.CARGO_BUILD_TARGET }}/debug/stogas-verify" rebar3 eunit
+          STOGAS_VERIFY_BIN="$GITHUB_WORKSPACE/target/${{ env.CARGO_BUILD_TARGET }}/debug/stogas" rebar3 eunit
           python3 ../check_http_client.py --sse-framing _build/default/bin/stogas-example
           python3 ../check_http_client.py --unary _build/default/bin/stogas-example --no-stream
       - uses: haskell-actions/setup@7fd2bb5ca789761088fbc831406b2910e47e56f1
@@ -526,7 +526,7 @@ jobs:
       - name: Install browser test runtime
         run: |
           npm ci --ignore-scripts --workspaces=false
-          npx --no-install playwright install --with-deps chromium
+          npx --no-install playwright install --with-deps chromium firefox webkit
       - name: Verify with every browser network request blocked
         run: npm run test:browser
       - name: Verify the Node package entrypoint
@@ -648,6 +648,6 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          for target in sigstore current_evidence session_evidence c_abi encrypted_setup signatures; do
+          for target in sigstore current_evidence session_evidence c_abi encrypted_setup signatures ratchet; do
             cargo fuzz run "$target" -- -max_total_time=10 -timeout=10
           done

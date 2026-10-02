@@ -1,4 +1,4 @@
-use super::{ClientSession, Error};
+use super::{ClientSession, Error, ratchet::ChunkSize};
 use crate::{
     approvals::Environment,
     attestation::{
@@ -15,15 +15,15 @@ use subtle::ConstantTimeEq as _;
 use thiserror::Error as ThisError;
 use zeroize::Zeroizing;
 
-const CLIENT_HEADER: &[u8] = b"STGS\x01\x01";
-const SERVER_HEADER: &[u8] = b"STGS\x01\x02";
-pub const CLIENT_SETUP_BYTES: usize = CLIENT_HEADER.len() + 1 + 32 + 1216;
-const SERVER_PREFIX_BYTES: usize = SERVER_HEADER.len() + 32 + 4 + 1120;
+const CLIENT_HEADER: &[u8] = b"STGS\x03\x01";
+const SERVER_HEADER: &[u8] = b"STGS\x03\x02";
+pub const CLIENT_SETUP_BYTES: usize = CLIENT_HEADER.len() + 1 + 2 + 32 + 1216;
+const SERVER_PREFIX_BYTES: usize = SERVER_HEADER.len() + 32 + 4 + 1120 + 32;
 pub const MAX_SERVER_SETUP_BYTES: usize = SERVER_PREFIX_BYTES + 32 + 4 + MAX_EVIDENCE_BYTES;
-const INFO_DOMAIN: &[u8] = b"stogas.e2ee.setup.v1\0";
-const TRANSCRIPT_DOMAIN: &[u8] = b"stogas.e2ee.transcript.v1\0";
-const ROOT_DOMAIN: &[u8] = b"stogas.e2ee.root.v1\0";
-const CONFIRMATION_DOMAIN: &[u8] = b"stogas.e2ee.confirmation.v1\0";
+const INFO_DOMAIN: &[u8] = b"stogas.e2ee.setup.v3\0";
+const TRANSCRIPT_DOMAIN: &[u8] = b"stogas.e2ee.transcript.v3\0";
+const ROOT_DOMAIN: &[u8] = b"stogas.e2ee.root.v3\0";
+const CONFIRMATION_DOMAIN: &[u8] = b"stogas.e2ee.confirmation.v3\0";
 
 #[derive(Debug, ThisError)]
 pub enum SetupError {
@@ -45,12 +45,24 @@ pub struct PendingSetup {
     private_key: Option<<XWing as hpke::Kem>::PrivateKey>,
     hello: Vec<u8>,
     environment: Environment,
+    chunk_size: ChunkSize,
 }
 
 impl PendingSetup {
     /// # Errors
     /// Returns Crypto if the platform's secure random generator fails.
     pub fn new(environment: Environment) -> Result<Self, SetupError> {
+        Self::with_chunk_size(environment, ChunkSize::FULL)
+    }
+
+    /// Set the maximum KEM chunk payload per message, authenticated in setup.
+    ///
+    /// # Errors
+    /// Returns Crypto if secure randomness is unavailable.
+    pub fn with_chunk_size(
+        environment: Environment,
+        chunk_size: ChunkSize,
+    ) -> Result<Self, SetupError> {
         let mut seed = Zeroizing::new([0_u8; 32]);
         getrandom::fill(seed.as_mut()).map_err(|_| Error::Crypto)?;
         let private_key = <XWing as hpke::Kem>::PrivateKey::from_bytes(seed.as_ref())
@@ -61,12 +73,14 @@ impl PendingSetup {
         let mut hello = Vec::with_capacity(CLIENT_SETUP_BYTES);
         hello.extend_from_slice(CLIENT_HEADER);
         hello.push(crate::attestation::environment_byte(environment));
+        hello.extend_from_slice(&chunk_size.get().to_be_bytes());
         hello.extend_from_slice(&challenge);
         hello.extend_from_slice(&public_key.to_bytes());
         Ok(Self {
             private_key: Some(private_key),
             hello,
             environment,
+            chunk_size,
         })
     }
 
@@ -198,6 +212,8 @@ impl PendingSetup {
             root,
             parsed.session_id,
             parsed.idle_seconds,
+            self.chunk_size,
+            parsed.ratchet_key,
         ))
     }
 
@@ -215,6 +231,7 @@ pub struct SetupEvidence<'a> {
     prefix: &'a [u8],
     enc: &'a [u8],
     confirmation: &'a [u8],
+    ratchet_key: [u8; 32],
     pub session_id: [u8; 32],
     pub idle_seconds: u32,
     pub evidence: SessionEvidence<'a>,
@@ -251,7 +268,10 @@ impl<'a> SetupEvidence<'a> {
         }
         Ok(Self {
             prefix: &response[..SERVER_PREFIX_BYTES],
-            enc: &response[start + 36..SERVER_PREFIX_BYTES],
+            enc: &response[start + 36..SERVER_PREFIX_BYTES - 32],
+            ratchet_key: response[SERVER_PREFIX_BYTES - 32..SERVER_PREFIX_BYTES]
+                .try_into()
+                .map_err(|_| Error::Record)?,
             confirmation: &response[SERVER_PREFIX_BYTES..SERVER_PREFIX_BYTES + 32],
             session_id,
             idle_seconds,

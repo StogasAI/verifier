@@ -57,6 +57,13 @@ fn genuine_registration_binds_csr_possession_to_the_quoted_key() {
         .decode(registration["csr_der"].as_str().unwrap())
         .unwrap();
     boot.verify_csr(&csr).unwrap();
+    assert_eq!(
+        serde_json::to_value(boot.registered_facts()).unwrap(),
+        registration["policy_facts"]
+    );
+    snapshot
+        .appraise_registered_boot(&boot.registered_facts(), now)
+        .unwrap();
     let mut corrupted = csr;
     *corrupted.last_mut().unwrap() ^= 1;
     assert!(boot.verify_csr(&corrupted).is_err());
@@ -70,6 +77,106 @@ fn genuine_registration_binds_csr_possession_to_the_quoted_key() {
             .unwrap();
         assert!(boot.verify_csr(&other).is_err());
     }
+}
+
+#[test]
+fn registered_facts_recheck_current_policy_collateral_and_release_membership() {
+    let (mut verifier, bundle, _, _, now) = fixture();
+    let registration: Value = serde_json::from_str(include_str!(
+        "../../../../../tests/fixtures/hardware-registration-v1.json"
+    ))
+    .unwrap();
+    let facts: super::super::boot::RegisteredBootFacts =
+        serde_json::from_value(registration["policy_facts"].clone()).unwrap();
+    let snapshot = verifier
+        .refresh(&serde_json::to_vec(&bundle).unwrap(), now)
+        .unwrap();
+    snapshot.appraise_registered_boot(&facts, now).unwrap();
+    let validity = snapshot
+        .collateral_validity(&facts.chip_id, &facts.hardware.reported_tcb(), now)
+        .unwrap();
+    assert!(matches!(
+        snapshot.appraise_registered_boot(&facts, validity.not_after_unix_ms),
+        Err(Error::CollateralExpired)
+    ));
+    let mut unknown = facts.clone();
+    unknown.gateway_release_id = "ff".repeat(32);
+    assert!(matches!(
+        snapshot.appraise_registered_boot(&unknown, now),
+        Err(Error::Approval(crate::approvals::Error::NotApproved(
+            "gateway"
+        )))
+    ));
+    unknown = facts.clone();
+    unknown.chip_id = "ff".repeat(64);
+    assert!(snapshot.appraise_registered_boot(&unknown, now).is_err());
+    // Signature tests own acquisition. Here an already authenticated stricter
+    // policy must appraise the retained facts through the same hardware engine.
+    drop(verifier);
+    let mut snapshot = std::sync::Arc::try_unwrap(snapshot)
+        .ok()
+        .expect("exclusive fixture snapshot");
+    let original = snapshot.hardware_evidence.policy.clone();
+    snapshot.hardware_evidence.policy.policies[0]
+        .minimum_tcb
+        .snp = 255;
+    assert!(snapshot.appraise_registered_boot(&facts, now).is_err());
+    snapshot.hardware_evidence.policy = original.clone();
+    snapshot.hardware_evidence.policy.policies[0].required_current_mitigation_mask =
+        "0xffffffffffffffff".into();
+    assert!(snapshot.appraise_registered_boot(&facts, now).is_err());
+    snapshot.hardware_evidence.policy = original;
+    snapshot.appraise_registered_boot(&facts, now).unwrap();
+}
+
+#[test]
+fn hardware_alternatives_apply_to_quotes_registered_facts_and_fresh_sessions() {
+    let (mut verifier, bundle, certificate, challenge, now) = fixture();
+    let registration: Value = serde_json::from_str(include_str!(
+        "../../../../../tests/fixtures/hardware-registration-v1.json"
+    ))
+    .unwrap();
+    let facts: super::super::boot::RegisteredBootFacts =
+        serde_json::from_value(registration["policy_facts"].clone()).unwrap();
+    let document = crate::canonical_json(&registration["boot"]).unwrap();
+    let digest = sha2::Sha256::digest(document.as_bytes()).into();
+    let snapshot = verifier
+        .refresh(&serde_json::to_vec(&bundle).unwrap(), now)
+        .unwrap();
+    // Acquisition/signature tests own policy authenticity. Exercise the complete
+    // appraisal paths with genuine hardware evidence and validated alternatives.
+    drop(verifier);
+    let mut snapshot = std::sync::Arc::try_unwrap(snapshot).ok().unwrap();
+    let mut smt_on = snapshot.hardware_evidence.policy.policies[0].clone();
+    smt_on.required_platform_info_mask = "0x0000000000000025".into();
+    let mut smt_off = snapshot.hardware_evidence.policy.policies[0].clone();
+    smt_off.forbidden_platform_info_mask = "0x0000000000000001".into();
+    snapshot.hardware_evidence.policy.policies = vec![smt_on.clone(), smt_off.clone()];
+    crate::validate_hardware_policy(&snapshot.hardware_evidence.policy).unwrap();
+    snapshot
+        .verify_registered_boot(document.as_bytes(), &digest, now)
+        .unwrap();
+    snapshot.appraise_registered_boot(&facts, now).unwrap();
+    snapshot
+        .verify_native_certificate(&certificate, challenge, now)
+        .unwrap();
+
+    // Retiring the SMT-on alternative immediately rejects that configuration in
+    // all three paths. Another chip's matching configuration grants no permission.
+    smt_on.chip_ids = vec!["ff".repeat(64)];
+    snapshot.hardware_evidence.policy.policies = vec![smt_off, smt_on];
+    crate::validate_hardware_policy(&snapshot.hardware_evidence.policy).unwrap();
+    assert!(
+        snapshot
+            .verify_registered_boot(document.as_bytes(), &digest, now)
+            .is_err()
+    );
+    assert!(snapshot.appraise_registered_boot(&facts, now).is_err());
+    assert!(
+        snapshot
+            .verify_native_certificate(&certificate, challenge, now)
+            .is_err()
+    );
 }
 
 #[test]

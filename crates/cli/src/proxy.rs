@@ -149,6 +149,7 @@ impl ProxyState {
                 config.upstream.join("/v1/session")?,
                 environment,
                 maximum,
+                stogas_verifier::channel::ratchet::ChunkSize::new(config.options.ratchet_bytes)?,
             )),
         };
         Ok(Self {
@@ -451,7 +452,10 @@ fn route(config: &ServeConfig, request: &Request) -> Result<Route, Failure> {
     let path = routed_path(request.uri().path(), browser, Some(config.capability()))
         .map_err(|(status, message)| Failure::before(status, "invalid_path", message))?
         .to_owned();
-    if !matches!(path.as_str(), "/v1/chat/completions" | "/v1/responses") {
+    if !matches!(
+        path.as_str(),
+        "/v1/chat/completions" | "/v1/responses" | "/v1/policies/validate"
+    ) {
         return Err(Failure::before(
             StatusCode::NOT_FOUND,
             "unsupported_path",

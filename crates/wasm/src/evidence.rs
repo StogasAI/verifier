@@ -7,21 +7,25 @@ use stogas_verifier::{
 };
 use wasm_bindgen::prelude::*;
 
-/// Authenticate a renewal with the key from an already verified boot registration.
+/// Authenticate a request with the key from already verified boot evidence.
 ///
 /// # Errors
 /// Rejects malformed requests, changed identities, signatures or stale timestamps.
 #[wasm_bindgen]
-pub fn verify_certificate_renewal(
+pub fn verify_boot_request(
     request: &[u8],
     node_id: &str,
     public_key: &[u8],
+    purpose: &str,
 ) -> Result<(), JsValue> {
-    evidence::boot::verify_certificate_renewal(
+    let purpose = serde_json::from_value(json!(purpose))
+        .map_err(|_| js_sys::Error::new("invalid boot request purpose"))?;
+    evidence::boot::verify_boot_request(
         request,
         node_id,
         public_key,
         super::wall_clock_ms()?,
+        purpose,
     )
     .map_err(|error| verification_error(&error))
 }
@@ -209,7 +213,7 @@ impl EvidenceSnapshot {
             .core
             .verify_registration(document, challenge, super::wall_clock_ms()?)
             .map_err(|error| verification_error(&error))?;
-        Ok(super::to_js_value(&verified.summary())?)
+        Ok(super::to_js_value(&verified.registration_summary())?)
     }
 
     /// Appraise registration and its TLS key's CSR before certificate issuance.
@@ -232,7 +236,7 @@ impl EvidenceSnapshot {
         verified
             .verify_csr(csr_der)
             .map_err(|error| verification_error(&error))?;
-        Ok(super::to_js_value(&verified.summary())?)
+        Ok(super::to_js_value(&verified.registration_summary())?)
     }
 
     /// Reappraise durable registration bytes and their CSR against current authorization.
@@ -256,7 +260,7 @@ impl EvidenceSnapshot {
         verified
             .verify_csr(csr_der)
             .map_err(|error| verification_error(&error))?;
-        Ok(super::to_js_value(&verified.summary())?)
+        Ok(super::to_js_value(&verified.registration_summary())?)
     }
 
     /// Reappraise the exact boot already retained by the registration authority.
@@ -290,6 +294,42 @@ impl EvidenceSnapshot {
             .verify_logged_boot(document, inclusion, super::wall_clock_ms()?)
             .map_err(|error| verification_error(&error))?;
         Ok(super::to_js_value(&verified.summary())?)
+    }
+
+    /// Verify supplied boot history and possession of its exact TLS key.
+    ///
+    /// # Errors
+    /// Rejects invalid history, current appraisal or CSR binding.
+    pub fn verify_logged_boot_csr(
+        &self,
+        document: &[u8],
+        inclusion: &[u8],
+        csr_der: &[u8],
+    ) -> Result<JsValue, JsValue> {
+        let verified = self
+            .core
+            .verify_logged_boot(document, inclusion, super::wall_clock_ms()?)
+            .map_err(|error| verification_error(&error))?;
+        verified
+            .verify_csr(csr_der)
+            .map_err(|error| verification_error(&error))?;
+        Ok(super::to_js_value(&verified.summary())?)
+    }
+
+    /// Appraise only facts read from a trusted, previously verified registration store.
+    /// This does not authenticate caller-supplied evidence or establish live identity.
+    ///
+    /// # Errors
+    /// Rejects malformed facts, withdrawn releases, policy failure or invalid collateral.
+    pub fn appraise_registered_boot(&self, facts: &[u8]) -> Result<(), JsValue> {
+        if facts.len() > 4096 {
+            return Err(verification_error(&evidence::Error::TooLarge));
+        }
+        let facts = serde_json::from_slice(facts)
+            .map_err(|_| js_sys::Error::new("invalid registered boot facts"))?;
+        self.core
+            .appraise_registered_boot(&facts, super::wall_clock_ms()?)
+            .map_err(|error| verification_error(&error))
     }
 }
 

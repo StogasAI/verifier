@@ -3,7 +3,7 @@
 This Swift 6.2 package links the Rust verifier through its C ABI. Native artifacts support macOS 13 or later and Linux on x86-64 and ARM64. It does not include iOS or Windows artifacts.
 
 ```swift
-import StogasVerifier
+import Stogas
 
 let transport = try Transport()
 defer { transport.close() }

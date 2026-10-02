@@ -18,7 +18,7 @@ parser.add_argument("--artifacts", type=Path, required=True)
 args = parser.parse_args()
 version = json.loads((root / "package.json").read_text())["version"]
 for platform in native.PLATFORMS:
-    name = f"stogas-verifier-v{version}-{platform}"
+    name = f"stogas-v{version}-{platform}"
     with tempfile.TemporaryDirectory(prefix="stogas-native-") as directory:
         destination = Path(directory)
         if platform.startswith("windows"):

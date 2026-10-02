@@ -1,6 +1,6 @@
 package example
 
-import ai.stogas.verifier.Transport
+import ai.stogas.Transport
 import com.openai.client.okhttp.OpenAIOkHttpClient
 import com.openai.core.RequestOptions
 import com.openai.core.http.HttpClient

@@ -15,6 +15,7 @@ export class SessionTransport {
 	#endpoint;
 	#fetch;
 	#maximum;
+	#ratchetBytes;
 	#onMetadata;
 	#sessions = [];
 	#opening;
@@ -22,9 +23,11 @@ export class SessionTransport {
 	#closed = false;
 	#shutdown = new AbortController();
 
-	constructor({ Setup, evidence, environment, endpoint, fetch, maxSessions = 1, onMetadata }) {
+	constructor({ Setup, evidence, environment, endpoint, fetch, maxSessions = 1, ratchetBytes, onMetadata }) {
 		if (!Number.isSafeInteger(maxSessions) || maxSessions <= 0)
 			throw new RangeError('maxSessions must be a positive safe integer');
+
+		this.#ratchetBytes = ratchetBytes;
 		this.#Setup = Setup;
 		this.#evidence = evidence;
 		this.#environment = environment;
@@ -146,7 +149,7 @@ export class SessionTransport {
 	}
 
 	async #open(signal) {
-		const setup = new this.#Setup(this.#environment);
+		const setup = new this.#Setup(this.#environment, this.#ratchetBytes);
 		try {
 			// Initialize evidence before setup. Acquiring it does not release any
 			// application credentials and shares the same absolute setup deadline.
@@ -213,7 +216,7 @@ export class SessionTransport {
 		}
 	}
 
-	// Explicit close erases local roots immediately after creating each optional
+	// Explicit close erases local chains immediately after creating each optional
 	// close exchange. Existing requests own their directional keys independently.
 	close() {
 		if (this.#closing) return this.#closing;

@@ -28,6 +28,7 @@ type TransportOptions struct {
 	Environment    string `json:"environment,omitempty"`
 	Security       string `json:"security,omitempty"`
 	MaxConnections uint64 `json:"max_connections,omitempty"`
+	RatchetBytes   uint16 `json:"ratchet_bytes,omitempty"`
 	BaseURL        string `json:"base_url,omitempty"`
 }
 

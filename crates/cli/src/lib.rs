@@ -44,6 +44,8 @@ pub struct TransportOptions {
     pub security: SecurityMode,
     /// Maximum reusable connections or E2EE sessions. Opened lazily under capacity pressure.
     pub max_connections: usize,
+    /// Maximum ML-KEM chunk payload per E2EE message; even, 32 through 1152.
+    pub ratchet_bytes: u16,
     /// Optional HTTPS origin; compiled evidence authorities remain fixed.
     pub base_url: Option<String>,
 }
@@ -65,6 +67,7 @@ impl Default for TransportOptions {
             environment: Environment::Production,
             security: SecurityMode::Tls,
             max_connections: 4,
+            ratchet_bytes: stogas_verifier::channel::ratchet::ChunkSize::FULL.get(),
             base_url: None,
         }
     }
@@ -73,6 +76,13 @@ impl TransportOptions {
     fn validate(&self) -> Result<()> {
         if self.max_connections == 0 {
             bail!("max_connections must be positive");
+        }
+        stogas_verifier::channel::ratchet::ChunkSize::new(self.ratchet_bytes)
+            .map_err(|_| anyhow::anyhow!("ratchet_bytes must be even, from 32 through 1152"))?;
+        if self.security != SecurityMode::E2ee
+            && self.ratchet_bytes != stogas_verifier::channel::ratchet::ChunkSize::FULL.get()
+        {
+            bail!("ratchet_bytes applies only to e2ee security");
         }
         Ok(())
     }

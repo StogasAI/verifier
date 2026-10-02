@@ -26,6 +26,16 @@ fn bytes(value: &str) -> Vec<u8> {
 }
 
 #[test]
+fn imports_rfc9881_example_mldsa65_public_key() {
+    // Independent published encoding, not an output of our Go/Rust codecs:
+    // https://www.rfc-editor.org/rfc/rfc9881.html#appendix-C.2
+    let encoded = include_bytes!("../../../../tests/fixtures/rfc9881-mldsa65-spki.der");
+    assert_eq!(encoded.len(), 1974);
+    assert_eq!(public_key_from_spki(encoded).unwrap().len(), 1952);
+    assert!(public_key_from_spki(&encoded[..1972]).is_err());
+}
+
+#[test]
 fn remote_message_representative_matches_independently_signed_vectors() {
     let fixture: serde_json::Value = serde_json::from_str(include_str!(
         "../../../../tests/fixtures/mldsa65-remote-v1.json"

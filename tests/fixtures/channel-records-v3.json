@@ -1,0 +1,138 @@
+{
+  "description": "Independent Python cryptography 46.0.5 HKDF-Expand-SHA256 and AES-256-GCM vectors for stogas.e2ee.record.v3 with the authenticated composite ratchet header. These codec vectors take a message secret directly, not a session root.",
+  "root_hex": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+  "session_id_hex": "202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f",
+  "streams": [
+    {
+      "number": "0",
+      "direction": 1,
+      "records": [
+        {
+          "kind": 1,
+          "plaintext_hex": "7b226d6574686f64223a22504f5354222c2270617468223a222f76312f636861742f636f6d706c6574696f6e73227d",
+          "encoded_hex": "0000008f004913be4feaeaf204c7fd3358fc9c00721881d174278128227ec674f37f7fe97b6d0000000000000000000000000000000000000000000000000000000000000001000000000000000100b37657c224c673af83ac5ed7ac50d966bce3cade9a4f8df3b0b92d7753065563541be809216d9c3a619be08d9f1fae061f562ff5151cb6654c4fdb82d1d685a7"
+        },
+        {
+          "kind": 2,
+          "plaintext_hex": "00ff0a7b2270726f6d7074223a2268656c6c6f227d",
+          "encoded_hex": "0000002ac493562532a40674a047e2b59606214101aba6c21bd7559a20d4ce59790ea8abb52c84c16763"
+        },
+        {
+          "kind": 3,
+          "plaintext_hex": "",
+          "encoded_hex": "00000015e43de3ae2f87786475642e821a12690df0"
+        }
+      ]
+    },
+    {
+      "number": "0",
+      "direction": 2,
+      "records": [
+        {
+          "kind": 4,
+          "plaintext_hex": "",
+          "encoded_hex": "00000060004913be4feaeaf204c7fd3358fc9c00721881d174278128227ec674f37f7fe97b6d000000000000000000000000000000000000000000000000000000000000000100000000000000010053a32a2a09d842735586ee379e51649bde"
+        },
+        {
+          "kind": 1,
+          "plaintext_hex": "7b22737461747573223a3230307d",
+          "encoded_hex": "000000231f97bb1a59eb17e7f9259da3f3c7e97f7497798e09451ce32ff4380a2a62f0"
+        },
+        {
+          "kind": 2,
+          "plaintext_hex": "646174613a207b2274657874223a2268656c6c6f227d0a0a",
+          "encoded_hex": "0000002dea6546f3615bd2ca7184172551f7cdb97eff62989a05772d8e4719c12a989b1352ae93e546e5e4010b"
+        },
+        {
+          "kind": 4,
+          "plaintext_hex": "",
+          "encoded_hex": "00000015f849b232f4a06f406cef373247e0aa19fc"
+        },
+        {
+          "kind": 3,
+          "plaintext_hex": "",
+          "encoded_hex": "00000015c7c4d21d8652e0f05bb478437fd7e211b0"
+        }
+      ]
+    },
+    {
+      "number": "1152921504606847042",
+      "direction": 1,
+      "records": [
+        {
+          "kind": 1,
+          "plaintext_hex": "7b226d6574686f64223a22504f5354222c2270617468223a222f76312f636861742f636f6d706c6574696f6e73227d",
+          "encoded_hex": "0000008f004913be4feaeaf204c7fd3358fc9c00721881d174278128227ec674f37f7fe97b6d0000000000000000000000000000000000000000000000000000000000000001000000000000000100483df1b1b265fe7ac97127579a327373eeaa3d049f7f9b1ebd2ff3a3e84176c7fb412c152619b7ff069d87af2fc4fb47b8225a98f1ffec7b39a1cd0abc4642f4"
+        },
+        {
+          "kind": 2,
+          "plaintext_hex": "00ff0a7b2270726f6d7074223a2268656c6c6f227d",
+          "encoded_hex": "0000002a97cbaef75010100a6a73c1cd59465cbd0562e50a3e1e6a7cc9b0b38357a34637c2230ce431ff"
+        },
+        {
+          "kind": 3,
+          "plaintext_hex": "",
+          "encoded_hex": "00000015e3b2600f305556a5be8fe617d7312b5d4a"
+        }
+      ]
+    },
+    {
+      "number": "1152921504606847042",
+      "direction": 2,
+      "records": [
+        {
+          "kind": 4,
+          "plaintext_hex": "",
+          "encoded_hex": "00000060004913be4feaeaf204c7fd3358fc9c00721881d174278128227ec674f37f7fe97b6d0000000000000000000000000000000000000000000000000000000000000001000000000000000100efeb87c1c43dc4c4905c9ad0ee5b07412a"
+        },
+        {
+          "kind": 1,
+          "plaintext_hex": "7b22737461747573223a3230307d",
+          "encoded_hex": "0000002353571122762799d1c699e1fa21146573f6a044e491bdea7f62a5367c03956e"
+        },
+        {
+          "kind": 2,
+          "plaintext_hex": "646174613a207b2274657874223a2268656c6c6f227d0a0a",
+          "encoded_hex": "0000002da6b708e8c74ee2421d86c26e159d9eb25a26f390b7249dc64511de106f3bfbb99d0051f10eb4d92a89"
+        },
+        {
+          "kind": 4,
+          "plaintext_hex": "",
+          "encoded_hex": "00000015108290a4583510d83d0b383bca36c63864"
+        },
+        {
+          "kind": 3,
+          "plaintext_hex": "",
+          "encoded_hex": "0000001534db043a41a27e3b18f3ba760802676322"
+        }
+      ]
+    }
+  ],
+  "invalid_firsts": [
+    {
+      "direction": 1,
+      "encoded_hex": "00000060004913be4feaeaf204c7fd3358fc9c00721881d174278128227ec674f37f7fe97b6d0000000000000000000000000000000000000000000000000000000000000001000000000000000100b68346ab3fe8cc96504c0633954cf1ce9e"
+    },
+    {
+      "direction": 1,
+      "encoded_hex": "00000060004913be4feaeaf204c7fd3358fc9c00721881d174278128227ec674f37f7fe97b6d0000000000000000000000000000000000000000000000000000000000000001000000000000000100b342bba2cf7ef0f6bc4b37fb9f5b91e64e"
+    },
+    {
+      "direction": 1,
+      "encoded_hex": "00000061004913be4feaeaf204c7fd3358fc9c00721881d174278128227ec674f37f7fe97b6d0000000000000000000000000000000000000000000000000000000000000001000000000000000100b07560ad901e94e401f82fdfdfb87be2ab8a"
+    },
+    {
+      "direction": 1,
+      "encoded_hex": "00000060004913be4feaeaf204c7fd3358fc9c00721881d174278128227ec674f37f7fe97b6d0000000000000000000000000000000000000000000000000000000000000001000000000000000100b1e989a750dd1736d11d28d464adae09c4"
+    },
+    {
+      "direction": 2,
+      "encoded_hex": "00000060004913be4feaeaf204c7fd3358fc9c00721881d174278128227ec674f37f7fe97b6d0000000000000000000000000000000000000000000000000000000000000001000000000000000100a8aa3845a0094a9744d915f22d0e2e8330"
+    },
+    {
+      "direction": 2,
+      "encoded_hex": "00000061004913be4feaeaf204c7fd3358fc9c00721881d174278128227ec674f37f7fe97b6d000000000000000000000000000000000000000000000000000000000000000100000000000000010053110ea1e138472c45d3f621a037415ae894"
+    }
+  ],
+  "header_hex": "13be4feaeaf204c7fd3358fc9c00721881d174278128227ec674f37f7fe97b6d0000000000000000000000000000000000000000000000000000000000000001000000000000000100"
+}

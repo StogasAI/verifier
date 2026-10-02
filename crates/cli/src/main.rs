@@ -1,3 +1,5 @@
+mod customer_encryption;
+
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use sha2::{Digest as _, Sha256};
@@ -15,7 +17,7 @@ use stogas_verifier::{
 use tokio::io::AsyncReadExt as _;
 
 #[derive(Parser)]
-#[command(name = "stogas-verify", version, about)]
+#[command(name = "stogas", version, about)]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -44,6 +46,7 @@ struct ServeCommandInput {
     upstream: Option<String>,
     listen: String,
     max_connections: usize,
+    ratchet_bytes: u16,
     security: SecurityMode,
     browser_origin: Option<String>,
     exit_on_stdin_close: bool,
@@ -56,6 +59,24 @@ fn parse_environment(value: &str) -> Result<stogas::Environment, String> {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Generate an organization encryption key locally; print only its public identifier.
+    EncryptionKey {
+        #[arg(long)]
+        output: PathBuf,
+    },
+    /// Encrypt plugin JSON or a provider credential locally.
+    Encrypt {
+        #[arg(long)]
+        key_file: PathBuf,
+        #[arg(long)]
+        organization: String,
+        #[arg(long, value_parser = ["plugins", "byok/openai", "byok/anthropic", "byok/chutes"])]
+        purpose: String,
+        #[arg(long)]
+        input: PathBuf,
+        #[arg(long)]
+        output: PathBuf,
+    },
     /// Verify a bundle without network access.
     Verify {
         /// Bundle path, or `-` for stdin.
@@ -110,6 +131,9 @@ enum Command {
         /// Maximum reusable channels, opened lazily.
         #[arg(long, default_value_t = 4)]
         max_connections: usize,
+        /// Maximum ML-KEM payload per E2EE message; even, 32 through 1152.
+        #[arg(long, default_value_t = 1152)]
+        ratchet_bytes: u16,
         #[arg(long, value_enum, default_value = "tls")]
         security: SecurityMode,
         /// Allow one browser origin to use the capability-protected local endpoint.
@@ -124,6 +148,14 @@ enum Command {
 #[tokio::main]
 async fn main() -> Result<()> {
     match Cli::parse().command {
+        Command::EncryptionKey { output } => customer_encryption::generate(&output)?,
+        Command::Encrypt {
+            key_file,
+            organization,
+            purpose,
+            input,
+            output,
+        } => customer_encryption::encrypt(&key_file, &organization, &purpose, &input, &output)?,
         Command::Verify {
             bundle,
             environment,
@@ -167,6 +199,7 @@ async fn main() -> Result<()> {
             upstream,
             listen,
             max_connections,
+            ratchet_bytes,
             security,
             browser_origin,
             exit_on_stdin_close,
@@ -176,6 +209,7 @@ async fn main() -> Result<()> {
                 upstream,
                 listen,
                 max_connections,
+                ratchet_bytes,
                 security,
                 browser_origin,
                 exit_on_stdin_close,
@@ -212,6 +246,7 @@ async fn run_serve(input: ServeCommandInput) -> Result<()> {
             environment: input.environment,
             security: input.security,
             max_connections: input.max_connections,
+            ratchet_bytes: input.ratchet_bytes,
             base_url: input.upstream,
         },
         listen: input.listen,
@@ -338,7 +373,7 @@ mod tests {
 
     #[test]
     fn serve_uses_explicit_environment_and_transport_profile() {
-        let cli = Cli::try_parse_from(["stogas-verify", "serve"]).unwrap();
+        let cli = Cli::try_parse_from(["stogas", "serve"]).unwrap();
         let Command::Serve {
             environment,
             security,
@@ -353,14 +388,13 @@ mod tests {
         assert_eq!(security, SecurityMode::Tls);
         assert_eq!(max_connections, 4);
         assert!(upstream.is_none());
-        assert!(Cli::try_parse_from(["stogas-verify", "serve", "--security", "both"]).is_err());
+        assert!(Cli::try_parse_from(["stogas", "serve", "--security", "both"]).is_err());
         assert!(
-            Cli::try_parse_from(["stogas-verify", "serve", "--bundle-refresh-seconds", "300"])
-                .is_err()
+            Cli::try_parse_from(["stogas", "serve", "--bundle-refresh-seconds", "300"]).is_err()
         );
         assert!(
             Cli::try_parse_from([
-                "stogas-verify",
+                "stogas",
                 "serve",
                 "--bundle-url",
                 "https://untrusted.example"
@@ -368,12 +402,12 @@ mod tests {
             .is_err()
         );
         assert_eq!(
-            Cli::try_parse_from(["stogas-verify", "serve", "--environment", "staging"]).is_ok(),
+            Cli::try_parse_from(["stogas", "serve", "--environment", "staging"]).is_ok(),
             cfg!(feature = "staging")
         );
         assert_eq!(
             Cli::try_parse_from([
-                "stogas-verify",
+                "stogas",
                 "verify",
                 "bundle.json",
                 "--environment",
@@ -384,7 +418,7 @@ mod tests {
         );
         assert!(
             Cli::try_parse_from([
-                "stogas-verify",
+                "stogas",
                 "verify",
                 "bundle.json",
                 "--policy",
@@ -397,7 +431,7 @@ mod tests {
     #[test]
     fn proof_requires_complete_boot_evidence_and_unambiguous_response_framing() {
         let base = [
-            "stogas-verify",
+            "stogas",
             "proof",
             "--request",
             "request.json",

@@ -20,6 +20,7 @@ serde.workspace = true
 serde_json.workspace = true
 stogas-sdk = { package = "stogas", path = "../cli", optional = true }
 stogas-verifier = { path = "../verifier" }
+zeroize.workspace = true
 
 [dev-dependencies]
 base64.workspace = true

@@ -2,7 +2,7 @@ using OpenAI;
 using OpenAI.Chat;
 using System.ClientModel;
 using System.ClientModel.Primitives;
-using Stogas.Verifier;
+using Stogas;
 
 // An explicit URL can also use a separately managed verifier CLI.
 string? external = Environment.GetEnvironmentVariable("STOGAS_BASE_URL");

@@ -8,7 +8,7 @@ import os
 from pathlib import Path
 import unittest
 
-from stogas_verifier import EvidenceVerifier, VerificationError
+from stogas import EvidenceVerifier, VerificationError
 
 
 @unittest.skipUnless(os.environ.get("STOGAS_TEST_STAGING") == "1", "requires staging wheel")

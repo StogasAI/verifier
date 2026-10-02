@@ -1,5 +1,5 @@
 {
-	"name": "@stogas/verifier",
+	"name": "stogas",
 	"version": "0.1.0-alpha.1",
 	"description": "Stogas SDK for verified confidential AI connections and evidence",
 	"license": "Apache-2.0",

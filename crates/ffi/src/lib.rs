@@ -1,7 +1,7 @@
 //! Narrow stateful C ABI for the deterministic Stogas verifier.
 //!
-//! The ABI deliberately exchanges only bounded UTF-8 JSON and bundle byte slices. It does not
-//! expose keys, signatures, hashes, certificate helpers, or any other cryptographic primitive.
+//! Evidence uses bounded JSON and byte slices. The channel server uses opaque
+//! cipher owners and bounded binary records; it exposes no per-message secrets.
 
 #![deny(unsafe_op_in_unsafe_fn)]
 
@@ -14,6 +14,8 @@ use std::{
 
 mod evidence;
 pub use evidence::*;
+mod channel;
+pub use channel::*;
 
 #[cfg(feature = "transport")]
 mod transport;

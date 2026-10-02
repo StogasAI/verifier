@@ -20,7 +20,7 @@ impl Drop for Process {
 #[test]
 fn proxy_process_closes_cleanly_on_signals_and_parent_pipe_loss() {
     for trigger in ["-INT", "-TERM", "stdin", "-TERM-with-stdin"] {
-        let mut command = Command::new(env!("CARGO_BIN_EXE_stogas-verify"));
+        let mut command = Command::new(env!("CARGO_BIN_EXE_stogas"));
         command
             .args([
                 "serve",

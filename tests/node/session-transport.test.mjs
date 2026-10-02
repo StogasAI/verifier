@@ -313,3 +313,30 @@ test('close aborts a pending setup and never releases application bytes', async 
 	assert.equal(state.requests, 0);
 	assert.equal(state.setupFreed, 1);
 });
+
+test('setup carriage accepts the full hybrid evidence bound and rejects one extra byte before verification', async () => {
+	// 1194-byte server prefix, 32-byte confirmation, 4-byte evidence length,
+	// and the shared 58-KiB evidence maximum. The core tests validate contents.
+	const maximum = 1194 + 32 + 4 + 58 * 1024;
+	for (const size of [maximum, maximum + 1]) {
+		let checked = 0;
+		const state = fixture({
+			fetchSetup: () =>
+				new Response(new Uint8Array(size), { headers: { 'content-type': SESSION_CONTENT_TYPE } }),
+			verify: (bytes) => {
+				checked++;
+				assert.equal(bytes.byteLength, maximum);
+			}
+		});
+		if (size === maximum) {
+			assert.deepEqual(await (await state.send()).json(), { ok: true });
+			assert.equal(checked, 1);
+		} else {
+			await assert.rejects(state.send(), { submission: 'not_sent' });
+			assert.equal(checked, 0);
+			assert.equal(state.requests, 0);
+		}
+		assert.equal(state.setupFreed, 1);
+		await state.transport.close();
+	}
+});

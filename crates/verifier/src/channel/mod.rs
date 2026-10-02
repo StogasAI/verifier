@@ -1,7 +1,10 @@
 //! Binary session transport. Verification and HTTP adapters stay outside the
 //! record layer; application credentials are released only after verified setup.
 
+pub mod cipher;
+pub mod ratchet;
 mod record;
+mod server;
 mod session;
 pub mod setup;
 mod stream;
@@ -10,6 +13,7 @@ pub use record::{
     MAX_RECORD_BYTES, MAX_RECORD_PLAINTEXT, MAX_REQUEST_WIRE_BYTES, MAX_RESPONSE_WIRE_BYTES,
     record_size,
 };
+pub use server::{ServerReader, ServerSession, ServerWriter};
 pub use session::{ClientRequest, ClientSession, RequestEncoder};
 pub use stream::ResponseDecoder;
 

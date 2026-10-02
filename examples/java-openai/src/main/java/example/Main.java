@@ -1,6 +1,6 @@
 package example;
 
-import ai.stogas.verifier.Transport;
+import ai.stogas.Transport;
 import com.openai.client.OpenAIClient;
 import com.openai.client.okhttp.OpenAIOkHttpClient;
 import com.openai.models.chat.completions.ChatCompletionCreateParams;

@@ -100,7 +100,7 @@ pub fn verify(
         artifact,
         submission_key_spki,
         now_unix_ms,
-        &TrustedRoot::production()?,
+        TrustedRoot::production()?,
     )
 }
 

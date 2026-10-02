@@ -15,6 +15,7 @@ struct Reply {
     body: Vec<u8>,
     etag: &'static str,
     status: StatusCode,
+    encoding: Option<&'static str>,
 }
 
 struct Origins {
@@ -55,11 +56,19 @@ async fn handler(
             .body(Body::empty())
             .unwrap()
     } else {
-        Response::builder()
+        let mut response = Response::builder()
             .header(ETAG, reply.etag)
-            .header("content-length", reply.body.len())
-            .body(Body::from(reply.body))
-            .unwrap()
+            .header("content-length", reply.body.len());
+        if let Some(encoding) = reply.encoding {
+            assert!(
+                headers["accept-encoding"]
+                    .to_str()
+                    .unwrap()
+                    .contains(encoding)
+            );
+            response = response.header("content-encoding", encoding);
+        }
+        response.body(Body::from(reply.body)).unwrap()
     }
 }
 
@@ -120,10 +129,59 @@ const fn reply(body: Vec<u8>, etag: &'static str) -> Reply {
         body,
         etag,
         status: StatusCode::OK,
+        encoding: None,
     }
 }
 fn deadline() -> Instant {
     Instant::now() + Duration::from_secs(5)
+}
+
+fn compressed_reply(body: &[u8], etag: &'static str, encoding: &'static str) -> Reply {
+    use std::io::Write;
+    let bytes = match encoding {
+        "gzip" => {
+            let mut encoder =
+                flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+            encoder.write_all(body).unwrap();
+            encoder.finish().unwrap()
+        }
+        "br" => {
+            let mut encoder = brotli::CompressorWriter::new(Vec::new(), 4096, 1, 22);
+            encoder.write_all(body).unwrap();
+            encoder.into_inner()
+        }
+        _ => panic!("unsupported test encoding"),
+    };
+    Reply {
+        encoding: Some(encoding),
+        ..reply(bytes, etag)
+    }
+}
+
+#[tokio::test]
+async fn compression_cannot_bypass_the_decoded_evidence_limit() {
+    let (root, _) = fixture();
+    for encoding in ["br", "gzip"] {
+        let oversized =
+            compressed_reply(&vec![b' '; MAX_INPUT_BYTES + 1], "\"oversized\"", encoding);
+        assert!(oversized.body.len() < MAX_INPUT_BYTES);
+        let server = Server::new([oversized.clone(), oversized]).await;
+        let client = server.client(root.clone());
+        assert!(matches!(
+            client.refresh(deadline()).await,
+            Err(Error::TooLarge)
+        ));
+        assert!(client.current().unwrap().is_none());
+        assert!(
+            client
+                .acquisition
+                .lock()
+                .await
+                .representations
+                .iter()
+                .all(Option::is_none)
+        );
+    }
 }
 
 #[tokio::test]
@@ -230,6 +288,7 @@ async fn bad_or_oversized_delivery_preserves_snapshot_and_never_caches_the_candi
                 body: vec![],
                 etag: "",
                 status: StatusCode::SERVICE_UNAVAILABLE,
+                encoding: None,
             },
         ];
         assert!(client.refresh(deadline()).await.is_err());
@@ -281,11 +340,13 @@ async fn native_setup_sends_nothing_before_evidence_and_never_redials_an_unresol
             body: vec![],
             etag: "",
             status: StatusCode::SERVICE_UNAVAILABLE,
+            encoding: None,
         },
         Reply {
             body: vec![],
             etag: "",
             status: StatusCode::SERVICE_UNAVAILABLE,
+            encoding: None,
         },
     ])
     .await;
@@ -466,6 +527,50 @@ fn hardware_fixture() -> Value {
 }
 
 #[tokio::test]
+async fn cold_session_uses_current_bundle_without_boot_archive_on_either_origin() {
+    let fixture = hardware_fixture();
+    let now = fixture["verified_at_ms"].as_i64().unwrap();
+    let certificate = URL_SAFE_NO_PAD
+        .decode(fixture["certificate"].as_str().unwrap())
+        .unwrap();
+    let challenge = hex::decode(fixture["challenge"].as_str().unwrap())
+        .unwrap()
+        .try_into()
+        .unwrap();
+    // The current bundle retains the old boot's public signing identity after rotation.
+    let bundle = include_bytes!("../../../../tests/fixtures/hardware-session-rotated-v1.json");
+    for primary_available in [true, false] {
+        // This server exposes only current-bundle URLs; every archive URL returns 404.
+        let server = Server::new([
+            Reply {
+                status: if primary_available {
+                    StatusCode::OK
+                } else {
+                    StatusCode::SERVICE_UNAVAILABLE
+                },
+                ..compressed_reply(bundle, "\"r2-current\"", "br")
+            },
+            compressed_reply(bundle, "\"aws-current\"", "gzip"),
+        ])
+        .await;
+        let client = server.client(serde_json::from_value(fixture["root"].clone()).unwrap());
+        assert!(client.current().unwrap().is_none());
+        let snapshot = client.refresh(deadline()).await.unwrap();
+        snapshot
+            .verify_native_certificate(&certificate, challenge, now)
+            .unwrap();
+        assert_eq!(
+            *server.state.requests.lock().unwrap(),
+            if primary_available {
+                vec![(0, None)]
+            } else {
+                vec![(0, None), (1, None)]
+            }
+        );
+    }
+}
+
+#[tokio::test]
 async fn warm_appraisal_reuses_context_and_rotation_preserves_inflight_snapshot() {
     let fixture = hardware_fixture();
     let now = fixture["verified_at_ms"].as_i64().unwrap();
@@ -636,7 +741,7 @@ async fn encrypted_setup_bounds_delivery_and_never_recovers_invalid_protocol_dat
                     .await
                     .unwrap();
                 assert_eq!(hello.len(), CLIENT_SETUP_BYTES);
-                assert_eq!(&hello[..6], b"STGS\x01\x01");
+                assert_eq!(&hello[..6], b"STGS\x03\x01");
                 let mut response = Response::builder().header("content-type", CONTENT_TYPE);
                 let body = match case.as_str() {
                     "status" => {
@@ -677,6 +782,7 @@ async fn encrypted_setup_bounds_delivery_and_never_recovers_invalid_protocol_dat
             &http,
             Url::parse(&format!("http://{address}/{case}")).unwrap(),
             Environment::Staging,
+            stogas_verifier::channel::ratchet::ChunkSize::FULL,
             Instant::now() + limit,
         )
         .await;
@@ -707,6 +813,7 @@ async fn encrypted_setup_bounds_delivery_and_never_recovers_invalid_protocol_dat
         &http,
         Url::parse(&format!("http://{address}/malformed")).unwrap(),
         Environment::Staging,
+        stogas_verifier::channel::ratchet::ChunkSize::FULL,
         Instant::now(),
     )
     .await;

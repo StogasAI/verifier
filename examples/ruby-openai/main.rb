@@ -1,6 +1,6 @@
 # frozen_string_literal: true
 require "openai"
-require "stogas_verifier"
+require "stogas"
 
 def stogas_client(base_url, api_key, http)
   OpenAI::Client.new(

@@ -290,3 +290,150 @@ test('abort cleans up even when the caller never reads the response body', async
 	await assert.rejects(result.text(), { submission: 'execution_unknown' });
 	assert.equal(state.exchange.freed, 1);
 });
+
+function deferred() {
+	let resolve;
+	const promise = new Promise((done) => {
+		resolve = done;
+	});
+	return { promise, resolve };
+}
+
+test('asynchronous ciphers preserve upload order and wait for authenticated response records', async () => {
+	await Promise.all(
+		Array.from({ length: 32 }, async (_, index) => {
+			const state = fixture({
+				fetch: async () =>
+					response(
+						[
+							record(1, JSON.stringify({ status: 200, headers: {} })),
+							record(2, `response ${index}`),
+							record(3)
+						],
+						{ split: 7 }
+					)
+			});
+			for (const method of ['seal', 'push']) {
+				const original = state.exchange[method].bind(state.exchange);
+				let busy = false;
+				state.exchange[method] = async (...args) => {
+					assert.equal(busy, false, 'record operations must be serialized');
+					busy = true;
+					await new Promise((resolve) => setImmediate(resolve));
+					const result = original(...args);
+					busy = false;
+					return result;
+				};
+			}
+			const result = await state.send();
+			assert.equal(await result.text(), `response ${index}`);
+			assert.deepEqual(
+				state.exchange.sealed.map(({ kind }) => kind),
+				[1, 2, 3]
+			);
+			assert.equal(state.calls, 1);
+			assert.equal(state.exchange.freed, 1);
+		})
+	);
+});
+
+test('abort during pending encryption frees the cipher before it completes and never submits', async () => {
+	const state = fixture();
+	const abort = new AbortController();
+	const started = deferred();
+	const pending = deferred();
+	state.exchange.seal = async () => {
+		started.resolve();
+		await pending.promise;
+		return new Uint8Array([1]);
+	};
+	const sending = state.send({ signal: abort.signal });
+	await started.promise;
+	abort.abort();
+	assert.equal(state.exchange.freed, 1);
+	pending.resolve();
+	await assert.rejects(sending, { submission: 'not_sent' });
+	assert.equal(state.calls, 0);
+	assert.equal(state.releases, 1);
+	assert.equal(state.exchange.freed, 1);
+});
+
+test('abort during pending authentication releases the cipher and rejects late plaintext', async () => {
+	const state = fixture({
+		fetch: async () => response([record(1, JSON.stringify(header)), record(3)])
+	});
+	const abort = new AbortController();
+	const started = deferred();
+	const pending = deferred();
+	let lateRejected = false;
+	state.exchange.push = async (_, emit) => {
+		started.resolve();
+		await pending.promise;
+		try {
+			emit(1, new TextEncoder().encode(JSON.stringify(header)));
+		} catch (error) {
+			lateRejected = true;
+			throw error;
+		}
+	};
+	const sending = state.send({ signal: abort.signal });
+	await started.promise;
+	abort.abort();
+	assert.equal(state.exchange.freed, 1);
+	pending.resolve();
+	await assert.rejects(sending, { submission: 'execution_unknown' });
+	assert.equal(lateRejected, true);
+	assert.equal(state.calls, 1);
+	assert.equal(state.exchange.freed, 1);
+	assert.equal(state.releases, 1);
+});
+
+test('body cancellation closes pending crypto before the network cancellation finishes', async () => {
+	const cancellation = deferred();
+	const crypto = deferred();
+	const started = deferred();
+	const state = fixture({
+		fetch: async () =>
+			new Response(
+				new ReadableStream({
+					start(controller) {
+						controller.enqueue(new Uint8Array([1]));
+						controller.enqueue(new Uint8Array([2]));
+					},
+					cancel() {
+						return cancellation.promise;
+					}
+				}),
+				{ headers: { 'content-type': SESSION_CONTENT_TYPE } }
+			)
+	});
+	let lateRejected = false;
+	state.exchange.push = async (input, emit) => {
+		if (input[0] === 1) {
+			emit(1, new TextEncoder().encode(JSON.stringify({ status: 200, headers: {} })));
+			return;
+		}
+		started.resolve();
+		await crypto.promise;
+		try {
+			emit(2, new TextEncoder().encode('late plaintext'));
+		} catch (error) {
+			lateRejected = true;
+			throw error;
+		}
+	};
+	const result = await state.send();
+	const reader = result.body.getReader();
+	const reading = reader.read();
+	await started.promise;
+	const cancelled = reader.cancel();
+	assert.equal(state.exchange.freed, 1);
+	assert.deepEqual(await reading, { value: undefined, done: true });
+	crypto.resolve();
+	await new Promise((resolve) => setImmediate(resolve));
+	assert.equal(lateRejected, true);
+	cancellation.resolve();
+	await cancelled;
+	assert.equal(state.releases, 1);
+	assert.equal(state.exchange.freed, 1);
+});

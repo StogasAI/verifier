@@ -4,8 +4,8 @@ use std::sync::{Arc, Mutex};
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use rustls::{
-    CertificateError, ClientConfig, DigitallySignedStruct, Error as TlsError, NamedGroup,
-    ProtocolVersion, SignatureScheme,
+    CertificateError, CipherSuite, ClientConfig, DigitallySignedStruct, Error as TlsError,
+    NamedGroup, ProtocolVersion, SignatureScheme,
     client::{
         Resumption,
         danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier},
@@ -17,7 +17,10 @@ use tokio::{
     io::{AsyncRead, AsyncWrite},
     time::Instant,
 };
-use tokio_rustls::{TlsConnector, client::TlsStream};
+use tokio_rustls::TlsConnector;
+
+mod traffic;
+pub use traffic::TrafficStream;
 
 use crate::evidence_client::{self, EvidenceClient};
 
@@ -95,7 +98,7 @@ impl VerificationFailure {
 
 /// Available only after hardware appraisal, TLS signature verification and handshake completion.
 pub struct Connection<T> {
-    pub stream: TlsStream<T>,
+    pub stream: TrafficStream<T>,
     pub session: Arc<VerifiedSession>,
     pub snapshot: Arc<Snapshot>,
 }
@@ -182,6 +185,12 @@ where
     let stream = result?;
     let tls = &stream.get_ref().1;
     if tls.protocol_version() != Some(ProtocolVersion::TLSv1_3)
+        || !matches!(
+            tls.negotiated_cipher_suite().map(|suite| suite.suite()),
+            Some(
+                CipherSuite::TLS13_AES_256_GCM_SHA384 | CipherSuite::TLS13_CHACHA20_POLY1305_SHA256
+            )
+        )
         || tls
             .negotiated_key_exchange_group()
             .map(rustls::crypto::SupportedKxGroup::name)
@@ -205,7 +214,7 @@ where
             }))
         })?;
     Ok(Connection {
-        stream,
+        stream: TrafficStream::new(stream),
         session,
         snapshot: Arc::clone(&handshake.verifier.snapshot),
     })
@@ -227,6 +236,15 @@ impl Handshake {
         let mut challenge = [0; 32];
         getrandom::fill(&mut challenge).map_err(|_| Error::Entropy)?;
         let mut provider = rustls::crypto::aws_lc_rs::default_provider();
+        provider.cipher_suites = vec![
+            rustls::crypto::aws_lc_rs::cipher_suite::TLS13_AES_256_GCM_SHA384,
+            rustls::crypto::aws_lc_rs::cipher_suite::TLS13_CHACHA20_POLY1305_SHA256,
+        ];
+        // Go's TLS server uses our first suite to infer client AES-GCM support.
+        // Keep 256-bit keys on both paths without forcing software AES on clients.
+        if !accelerated_aes_gcm() {
+            provider.cipher_suites.swap(0, 1);
+        }
         provider.kx_groups = vec![rustls::crypto::aws_lc_rs::kx_group::X25519MLKEM768];
         let verifier = Arc::new(CertificateVerifier {
             snapshot,
@@ -249,6 +267,22 @@ impl Handshake {
             config: Arc::new(config),
             verifier,
         })
+    }
+}
+
+fn accelerated_aes_gcm() -> bool {
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    {
+        std::is_x86_feature_detected!("aes") && std::is_x86_feature_detected!("pclmulqdq")
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        std::arch::is_aarch64_feature_detected!("aes")
+            && std::arch::is_aarch64_feature_detected!("pmull")
+    }
+    #[cfg(not(any(target_arch = "x86", target_arch = "x86_64", target_arch = "aarch64")))]
+    {
+        false
     }
 }
 

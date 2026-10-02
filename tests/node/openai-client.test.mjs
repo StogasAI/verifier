@@ -68,6 +68,29 @@ async function fixture(inference) {
 
 const request = { model: 'example/model', messages: [{ role: 'user', content: 'hello' }] };
 
+test('outer IP rejection stays execution-unknown and OpenAI never resubmits it', async () => {
+	for (const status of [429, 503]) {
+		const state = await fixture(() =>
+			Response.json(
+				{ error: { code: 'ip_rate_limit_exceeded' } },
+				{
+					status,
+					headers: { 'retry-after': '1' }
+				}
+			)
+		);
+		try {
+			await assert.rejects(state.client.chat.completions.create(request), (error) => {
+				assert.equal(error.cause?.submission, 'execution_unknown');
+				return true;
+			});
+			assert.equal(state.calls(), 1);
+		} finally {
+			await state.transport.close();
+		}
+	}
+});
+
 test('OpenAI cancellation cannot turn partial encrypted delivery into successful completion', async () => {
 	let cancelled = 0;
 	const content = { id: 'chat-1', choices: [{ index: 0, delta: { content: 'Hello' } }] };

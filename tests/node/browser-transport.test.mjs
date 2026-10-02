@@ -58,6 +58,8 @@ test('options are explicit and confidential fetch never falls through to ordinar
 		'https://e2ee.example/other'
 	])
 		assert.throws(() => new Transport({ baseURL }), /HTTPS/);
+	for (const ratchetBytes of [null, 0, 31, 33, 1153, 65536, 32.5, NaN, Infinity, '32'])
+		assert.throws(() => new Transport({ ratchetBytes }), /ratchetBytes/);
 	let calls = 0;
 	const transport = new Transport({
 		fetch: async () => {

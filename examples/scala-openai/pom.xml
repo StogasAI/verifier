@@ -4,7 +4,7 @@
   <properties><scala.version>3.9.0</scala.version><project.build.sourceEncoding>UTF-8</project.build.sourceEncoding></properties>
   <dependencies>
     <dependency><groupId>org.scala-lang</groupId><artifactId>scala3-library_3</artifactId><version>${scala.version}</version></dependency>
-    <dependency><groupId>ai.stogas</groupId><artifactId>verifier</artifactId><version>0.1.0-alpha.1</version></dependency>
+    <dependency><groupId>ai.stogas</groupId><artifactId>stogas</artifactId><version>0.1.0-alpha.1</version></dependency>
     <dependency><groupId>com.openai</groupId><artifactId>openai-java</artifactId><version>4.68.0</version></dependency>
   </dependencies>
   <build><plugins>

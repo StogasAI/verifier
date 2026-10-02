@@ -3,7 +3,7 @@ import { verifyReceiptResponse } from './receipt-response.js';
 
 // HTTP owns delivery; the Rust core owns verification, record keys and counters.
 export const SESSION_CONTENT_TYPE = 'application/vnd.stogas.session';
-export const MAX_SETUP_RESPONSE_BYTES = 60_590;
+export const MAX_SETUP_RESPONSE_BYTES = 60_622;
 const MAX_RECORD_PAYLOAD = 65_515;
 const MAX_METADATA_BYTES = 16 * 1024;
 const MAX_REQUEST_BYTES = 128 * 1024 * 1024;
@@ -27,7 +27,8 @@ async function encodeRequest(exchange, request, signal) {
 	);
 	if (metadata.byteLength > MAX_METADATA_BYTES)
 		throw new Error('request headers exceed their byte limit');
-	const parts = [exchange.prefix, exchange.seal(1, metadata)];
+	signal?.throwIfAborted();
+	const parts = [exchange.prefix, await exchange.seal(1, metadata)];
 	let size = 0;
 	if (request.body) {
 		const reader = abortableReader(request.body, signal);
@@ -43,7 +44,8 @@ async function encodeRequest(exchange, request, signal) {
 				}
 				size += value.byteLength;
 				for (let offset = 0; offset < value.byteLength; offset += MAX_RECORD_PAYLOAD) {
-					parts.push(exchange.seal(2, value.subarray(offset, offset + MAX_RECORD_PAYLOAD)));
+					signal?.throwIfAborted();
+					parts.push(await exchange.seal(2, value.subarray(offset, offset + MAX_RECORD_PAYLOAD)));
 				}
 			}
 		} catch (error) {
@@ -53,7 +55,8 @@ async function encodeRequest(exchange, request, signal) {
 			reader.release();
 		}
 	}
-	parts.push(exchange.seal(3, EMPTY));
+	signal?.throwIfAborted();
+	parts.push(await exchange.seal(3, EMPTY));
 	// A Blob works in browsers without streaming-upload support. Its contents are
 	// only ciphertext; do not concatenate or base64-encode the complete request.
 	return new Blob(parts, { type: SESSION_CONTENT_TYPE });
@@ -108,8 +111,14 @@ export async function sendSessionRequest({
 	let reader;
 	let released = false;
 	let abortResponse;
+	let exchangeClosed = false;
 	let receipt;
 	let completion;
+	const closeExchange = () => {
+		if (exchangeClosed) return;
+		exchangeClosed = true;
+		exchange.free();
+	};
 	const cleanup = () => {
 		if (released) return;
 		released = true;
@@ -117,7 +126,7 @@ export async function sendSessionRequest({
 		reader?.release();
 		completion?.free();
 		completion = undefined;
-		exchange.free();
+		closeExchange();
 		release();
 	};
 	const failure = (error) => {
@@ -130,7 +139,13 @@ export async function sendSessionRequest({
 	};
 	try {
 		signal?.throwIfAborted();
+		abortResponse = () => {
+			closeExchange();
+			void (reader?.cancel(signal.reason) ?? Promise.resolve()).then(cleanup);
+		};
+		signal?.addEventListener('abort', abortResponse, { once: true });
 		const body = await encodeRequest(exchange, request, signal);
+		signal?.throwIfAborted();
 		if (request.headers.get('Stogas-Metadata') === 'v1') receipt = exchange.response_receipt();
 		// Create before decoding: a Wasm push callback cannot re-enter its exchange.
 		completion = exchange.response_completion();
@@ -148,6 +163,10 @@ export async function sendSessionRequest({
 			},
 			signal
 		});
+		if (signal?.aborted) {
+			await outer.body?.cancel().catch(() => {});
+			signal.throwIfAborted();
+		}
 		if (
 			outer.status !== 200 ||
 			outer.headers.get('content-type') !== SESSION_CONTENT_TYPE ||
@@ -157,10 +176,6 @@ export async function sendSessionRequest({
 			throw new Error('origin did not return an encrypted response');
 		}
 		reader = abortableReader(outer.body, signal);
-		abortResponse = () => {
-			void reader.cancel(signal.reason).then(cleanup);
-		};
-		signal?.addEventListener('abort', abortResponse, { once: true });
 		if (signal?.aborted) abortResponse();
 		let metadata;
 		let pending = [];
@@ -169,6 +184,8 @@ export async function sendSessionRequest({
 		let finished = false;
 		let sse = false;
 		const emit = (kind, content) => {
+			signal?.throwIfAborted();
+			if (exchangeClosed) throw new Error('encrypted request is closed');
 			if (kind === 1) {
 				if (metadata) throw new Error('duplicate encrypted response metadata');
 				metadata = responseMetadata(content);
@@ -183,6 +200,7 @@ export async function sendSessionRequest({
 			}
 		};
 		const advance = async () => {
+			signal?.throwIfAborted();
 			if (inputOffset === input.byteLength) {
 				const next = await reader.read();
 				if (next.done) {
@@ -201,7 +219,9 @@ export async function sendSessionRequest({
 			}
 			// Limit copied plaintext per pull even when Fetch delivers a large chunk.
 			const end = Math.min(inputOffset + 65_536, input.byteLength);
-			exchange.push(input.subarray(inputOffset, end), emit);
+			await exchange.push(input.subarray(inputOffset, end), emit);
+			signal?.throwIfAborted();
+			if (exchangeClosed) throw new Error('encrypted request is closed');
 			inputOffset = end;
 		};
 		while (!metadata && !finished) await advance();
@@ -232,6 +252,7 @@ export async function sendSessionRequest({
 						}
 					},
 					async cancel(reason) {
+						closeExchange();
 						await reader.cancel(reason);
 						cleanup();
 					}

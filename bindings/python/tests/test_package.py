@@ -4,7 +4,7 @@ import unittest
 import json
 from pathlib import Path
 
-from stogas_verifier import (
+from stogas import (
     EvidenceSnapshot,
     EvidenceVerifier,
     Transport,

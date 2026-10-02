@@ -1,5 +1,5 @@
 use super::*;
-use crate::channel::{Direction, Kind, record::Records};
+use crate::channel::{Kind, ServerSession};
 use serde::Deserialize;
 use std::cell::Cell;
 
@@ -13,11 +13,12 @@ struct Fixture {
     response: String,
     #[serde(rename = "root_hex")]
     root: String,
+    initial_private_hex: String,
 }
 
 fn fixture() -> Fixture {
     serde_json::from_str(include_str!(
-        "../../../../../tests/fixtures/channel-setup-v1.json"
+        "../../../../../tests/fixtures/channel-setup-v3.json"
     ))
     .unwrap()
 }
@@ -30,12 +31,13 @@ fn pending(vector: &Fixture) -> PendingSetup {
         ),
         hello: hex::decode(&vector.hello).unwrap(),
         environment: Environment::Production,
+        chunk_size: ChunkSize::FULL,
     }
 }
 
 #[cfg(feature = "staging")]
 #[test]
-fn real_hardware_setup_binds_the_exchange_and_still_requires_the_client_secret() {
+fn retired_e2ee_profile_is_rejected_even_with_genuine_hardware_evidence() {
     use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
     let fixture: serde_json::Value = serde_json::from_str(include_str!(
         "../../../../../tests/fixtures/hardware-session-v1.json"
@@ -50,19 +52,23 @@ fn real_hardware_setup_binds_the_exchange_and_still_requires_the_client_secret()
     let snapshot = verifier
         .refresh(&serde_json::to_vec(&fixture["bundle"]).unwrap(), now)
         .unwrap();
-    // The live qualification erased its client secret. A different recipient
-    // secret must not establish a session even with genuine, fully valid evidence.
+    // The immutable v1 capture has genuine hardware evidence, but cannot
+    // authorize the v3 key schedule. Native certificate verification is unchanged.
     let mut pending = PendingSetup {
         private_key: Some(<XWing as hpke::Kem>::PrivateKey::from_bytes(&[7; 32]).unwrap()),
         hello: URL_SAFE_NO_PAD
             .decode(fixture["e2ee"]["hello"].as_str().unwrap())
             .unwrap(),
         environment: Environment::Staging,
+        chunk_size: ChunkSize::FULL,
     };
     let response = URL_SAFE_NO_PAD
         .decode(fixture["e2ee"]["response"].as_str().unwrap())
         .unwrap();
-    let session = pending.check_evidence(&response, &snapshot, now).unwrap();
+    assert!(matches!(
+        pending.check_evidence(&response, &snapshot, now),
+        Err(SetupError::Protocol(Error::Record))
+    ));
     let certificate = URL_SAFE_NO_PAD
         .decode(fixture["certificate"].as_str().unwrap())
         .unwrap();
@@ -73,18 +79,12 @@ fn real_hardware_setup_binds_the_exchange_and_still_requires_the_client_secret()
     let native = snapshot
         .verify_native_certificate(&certificate, challenge, now)
         .unwrap();
-    assert_eq!(
-        session.boot().document_sha256(),
-        native.boot().document_sha256()
+    assert!(!native.boot().hardware().node_id().is_empty());
+    assert!(
+        pending
+            .complete_verified(&response, &snapshot, now)
+            .is_err()
     );
-    assert_eq!(
-        session.boot().hardware().node_id(),
-        native.boot().hardware().node_id()
-    );
-    assert!(matches!(
-        pending.complete_verified(&response, &snapshot, now),
-        Err(SetupError::Protocol(Error::Authentication))
-    ));
 }
 
 #[test]
@@ -117,16 +117,24 @@ fn go_setup_matches_rust_exporter_and_session_keys() {
     assert_eq!(session.idle_seconds(), 600);
     let root: [u8; 32] = hex::decode(vector.root).unwrap().try_into().unwrap();
     let mut request = session.request().unwrap();
-    let mut expected_prefix = b"STGS\x01\x03".to_vec();
+    let mut expected_prefix = b"STGS\x03\x03".to_vec();
     expected_prefix.extend_from_slice(&id);
     expected_prefix.extend_from_slice(&0_u64.to_be_bytes());
     assert_eq!(request.prefix().as_slice(), expected_prefix);
-    let mut server = Records::new(&root, &id, request.number(), Direction::Request).unwrap();
+    let initial = crate::channel::ratchet::InitialKey::from_bytes(Zeroizing::new(
+        hex::decode(vector.initial_private_hex)
+            .unwrap()
+            .try_into()
+            .unwrap(),
+    ));
+    let mut server = ServerSession::new(Zeroizing::new(root), id, ChunkSize::FULL, initial);
     let mut encoded = request.seal(Kind::Metadata, b"credentials").unwrap();
-    assert_eq!(server.open(&mut encoded).unwrap().1, b"credentials");
-    let mut server = Records::new(&root, &id, request.number(), Direction::Response).unwrap();
-    let mut encoded = server.seal(Kind::Metadata, b"status=200").unwrap();
-    assert_eq!(request.open(&mut encoded).unwrap().1, b"status=200");
+    let (_, mut response, metadata) = server
+        .accept_start(request.number(), &mut encoded, 0)
+        .unwrap();
+    assert_eq!(metadata, b"credentials");
+    let mut encoded = response.seal(Kind::Metadata, b"status=200").unwrap();
+    assert_eq!(request.open(&mut encoded, 0).unwrap().1, b"status=200");
 }
 
 #[test]
@@ -134,7 +142,10 @@ fn setup_checks_binding_possession_and_policy_before_session_release() {
     let vector = fixture();
     let response = hex::decode(&vector.response).unwrap();
     // Each server field that affects the exchange is authenticated by the quote.
-    for index in [0, 4, 5, 6, 37, 38, 41, 42, SERVER_PREFIX_BYTES - 1] {
+    for index in [0, 4, 5, 6, 37, 38, 41, 42]
+        .into_iter()
+        .chain(SERVER_PREFIX_BYTES - 32..SERVER_PREFIX_BYTES)
+    {
         let mut changed = response.clone();
         changed[index] ^= 1;
         let calls = Cell::new(0);

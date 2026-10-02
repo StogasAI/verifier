@@ -578,7 +578,7 @@ async fn graceful_pool_close_completes_the_tls_shutdown() {
                 .map_err(|e| Error::Connect(Box::new(e)))?;
             Ok((
                 ObserveShutdown {
-                    io: tls,
+                    io: crate::native_tls::TrafficStream::new(tls),
                     completed: clean_shutdown,
                 },
                 (),

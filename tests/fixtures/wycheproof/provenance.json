@@ -1,0 +1,12 @@
+{
+  "source": "https://github.com/C2SP/wycheproof",
+  "revision": "3fa63dd0344abb611f1fb1d77e119938603ea230",
+  "license": "Apache-2.0",
+  "files": {
+    "mlkem_768_encaps_test.json": "9d4381f94c40853bba430245b94968b7390d9175aacd9f1ae4e250a71c78b713",
+    "mlkem_768_keygen_seed_test.json": "fde5abe284396f4cb3c4610b90d680f0b57782e94c3365c97aee59e24881ebe4",
+    "mlkem_768_test.json": "c59c067ae794c343df575dd90f6f7458f51881b11a22d6e9d8677c8d9ee21e90",
+    "x25519_test.json": "35c3f5231cf25cc640b524d403461deee9e49441d5d915a3a25b2c8ff5adbe7d"
+  },
+  "scope": "Complete ML-KEM-768 seed generation, encapsulation and decapsulation suites, plus raw X25519. Expanded private-key import is not exposed by this protocol."
+}

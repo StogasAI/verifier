@@ -13,7 +13,7 @@ license-file.workspace = true
 repository.workspace = true
 
 [[bin]]
-name = "stogas-verify"
+name = "stogas"
 path = "src/main.rs"
 
 [lib]
@@ -24,6 +24,8 @@ path = "src/lib.rs"
 staging = ["stogas-verifier/staging"]
 
 [dependencies]
+aws-lc-rs = "1.17.1"
+zeroize.workspace = true
 anyhow = "1.0.99"
 axum = "0.8.4"
 base64.workspace = true
@@ -35,7 +37,7 @@ http-body-util = "0.1.4"
 hyper = { version = "1.10.1", features = ["client", "http2"] }
 hyper-util = { version = "0.1.20", features = ["tokio"] }
 rand = "0.9.2"
-reqwest = { version = "0.12.23", default-features = false, features = ["http2", "json", "rustls-tls-webpki-roots-no-provider", "stream"] }
+reqwest = { version = "0.12.23", default-features = false, features = ["brotli", "gzip", "http2", "json", "rustls-tls-webpki-roots-no-provider", "stream"] }
 rustls = { version = "0.23.45", default-features = false, features = ["aws_lc_rs", "std", "tls12"] }
 serde_json.workspace = true
 sha2.workspace = true
@@ -48,8 +50,9 @@ webpki-roots = "1.0.2"
 x509-parser = { version = "0.18.0", default-features = false }
 
 [dev-dependencies]
-aws-lc-rs = "1.17.1"
+brotli = "8"
 ed25519-dalek.workspace = true
+flate2 = "1"
 h2 = "0.4.15"
 hpke = { version = "=0.14.0", default-features = false, features = ["alloc", "getrandom", "aes", "x25519", "mlkem"] }
 rcgen = "0.14.4"

@@ -31,7 +31,7 @@ pub use history::MAX_ARCHIVE_BYTES;
 #[cfg(feature = "snp")]
 pub use session::VerifiedSession;
 #[cfg(feature = "snp")]
-pub use snp::VerifiedSnpReport;
+pub use snp::{SnpHardwareFacts, VerifiedSnpReport};
 
 /// The replacement body of `evidence/latest.json`. Boot records travel with session evidence.
 #[derive(Clone, Debug, Deserialize, Serialize)]

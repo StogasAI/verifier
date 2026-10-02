@@ -1,0 +1,43 @@
+{
+  "source": "Independent Python cryptography HKDF implementation of Triple Ratchet initialization and combination.",
+  "root_hex": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+  "classical_root_hex": "ee116934841852ea0cbf8479d2324bb8d7e1280a6885668eafbb1bc19eaf2bb1",
+  "quantum_root_hex": "3f15565e51c6870de80ce4e21618642ac43e8cdc24a704fd6c720beb5423e31d",
+  "cases": [
+    {
+      "classical_hex": "0000000000000000000000000000000000000000000000000000000000000000",
+      "quantum_hex": "0000000000000000000000000000000000000000000000000000000000000000",
+      "combined_hex": "daf73a396257252fccadeed5d3b718992df6c89ff9ccbc30db8ea2ec7b5db3f4"
+    },
+    {
+      "classical_hex": "0000000000000000000000000000000000000000000000000000000000000000",
+      "quantum_hex": "0101010101010101010101010101010101010101010101010101010101010101",
+      "combined_hex": "8ec8b83b438eb1b17957558d8b511c0c804e148aedf8092b2df7b6d3b6acff86"
+    },
+    {
+      "classical_hex": "0101010101010101010101010101010101010101010101010101010101010101",
+      "quantum_hex": "0000000000000000000000000000000000000000000000000000000000000000",
+      "combined_hex": "5407e6d1c21ba86e77ec855334a04973367c0881113b0ae00d42763c7765a36d"
+    },
+    {
+      "classical_hex": "0101010101010101010101010101010101010101010101010101010101010101",
+      "quantum_hex": "0101010101010101010101010101010101010101010101010101010101010101",
+      "combined_hex": "0fb9f61631a139a18a4f8b192935beb48b02825cc31cb4acfd005ba422a22eba"
+    },
+    {
+      "classical_hex": "0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f",
+      "quantum_hex": "cfcfcfcfcfcfcfcfcfcfcfcfcfcfcfcfcfcfcfcfcfcfcfcfcfcfcfcfcfcfcfcf",
+      "combined_hex": "0f00100a1c9f9d5dc9f8a3227279e115977fdfdf9fe2e35a0ac60d0f6c3951e7"
+    },
+    {
+      "classical_hex": "cfcfcfcfcfcfcfcfcfcfcfcfcfcfcfcfcfcfcfcfcfcfcfcfcfcfcfcfcfcfcfcf",
+      "quantum_hex": "0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f",
+      "combined_hex": "45b68c45bc53a455afc60852e2b353cc525eab3b12841f91109c6d78c744a6c2"
+    },
+    {
+      "classical_hex": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+      "quantum_hex": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+      "combined_hex": "c020b46e0f19667cca30d62fc8f277ed8726f6b810a64beb778723c5f5189581"
+    }
+  ]
+}

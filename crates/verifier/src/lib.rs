@@ -540,6 +540,7 @@ fn verified_hardware_policy(
         .flat_map(|policy| policy.chip_ids.iter().cloned())
         .collect::<Vec<_>>();
     chip_ids.sort_unstable();
+    chip_ids.dedup();
     VerifiedHardwarePolicy {
         chip_ids,
         policy_count: policy.policies.len(),
@@ -559,8 +560,7 @@ fn validate_hardware_policy(policy: &HardwarePolicy) -> Result<String, Error> {
             "unsupported or invalid hardware policy".into(),
         ));
     }
-    let mut chip_ids = BTreeSet::new();
-    let mut previous_group_first: Option<&str> = None;
+    let mut previous_group: Option<String> = None;
     for profile in &policy.policies {
         if profile.chip_ids.is_empty() || profile.chip_ids.len() > MAX_NODES {
             return Err(Error::InvalidBundle(
@@ -571,7 +571,6 @@ fn validate_hardware_policy(policy: &HardwarePolicy) -> Result<String, Error> {
         for chip_id in &profile.chip_ids {
             if !is_lower_hex(chip_id, 64)
                 || previous_chip.is_some_and(|previous| previous >= chip_id.as_str())
-                || !chip_ids.insert(chip_id.as_str())
             {
                 return Err(Error::InvalidBundle(
                     "hardware policy has an invalid, unsorted, or duplicate chip id".into(),
@@ -579,13 +578,19 @@ fn validate_hardware_policy(policy: &HardwarePolicy) -> Result<String, Error> {
             }
             previous_chip = Some(chip_id);
         }
-        let group_first = profile.chip_ids[0].as_str();
-        if previous_group_first.is_some_and(|previous| previous >= group_first) {
+        let group = canonical_json(
+            &serde_json::to_value(profile)
+                .map_err(|error| Error::InvalidBundle(format!("hardware policy: {error}")))?,
+        )?;
+        if previous_group
+            .as_ref()
+            .is_some_and(|previous| previous >= &group)
+        {
             return Err(Error::InvalidBundle(
-                "hardware policy groups are not canonically ordered".into(),
+                "hardware policy groups are duplicated or not canonically ordered".into(),
             ));
         }
-        previous_group_first = Some(group_first);
+        previous_group = Some(group);
         let built_in = amd_product_from_cpuid(profile.cpuid_family, profile.cpuid_model)
             .ok_or_else(|| {
                 Error::InvalidBundle("hardware policy has an unsupported CPUID".into())
@@ -625,20 +630,29 @@ fn validate_hardware_policy(policy: &HardwarePolicy) -> Result<String, Error> {
     canonical_json(&value)
 }
 #[cfg(any(feature = "snp", test))]
-fn compatible_hardware<'a>(
-    policy: &'a HardwarePolicy,
+fn appraise_hardware(
+    policy: &HardwarePolicy,
     chip_id: &str,
-) -> Result<&'a AmdSevSnpPolicy, Error> {
-    policy
-        .policies
-        .iter()
-        .find(|policy| {
-            policy
-                .chip_ids
-                .iter()
-                .any(|candidate| candidate.eq_ignore_ascii_case(chip_id))
-        })
-        .ok_or_else(|| Error::Node("chip id is absent from the signed hardware policy".into()))
+    appraise: impl Fn(&AmdSevSnpPolicy) -> Result<(), Error>,
+) -> Result<(), Error> {
+    // A chip may have several approved configurations during a transition. Each
+    // must pass as a whole; never combine fields from separate configurations.
+    let mut first_error = None;
+    for profile in policy.policies.iter().filter(|policy| {
+        policy
+            .chip_ids
+            .iter()
+            .any(|candidate| candidate.eq_ignore_ascii_case(chip_id))
+    }) {
+        match appraise(profile) {
+            Ok(()) => return Ok(()),
+            Err(error) => {
+                first_error.get_or_insert(error);
+            }
+        }
+    }
+    Err(first_error
+        .unwrap_or_else(|| Error::Node("chip id is absent from the signed hardware policy".into())))
 }
 
 fn parse_u64_hex(value: &str, label: &str) -> Result<u64, Error> {
@@ -1357,7 +1371,7 @@ fn check_raw_report_bindings(
     manifest: &GatewayReleaseManifest,
     launch: &LaunchValues,
     report: &[u8],
-    hardware_policy: Option<&AmdSevSnpPolicy>,
+    hardware_policy: Option<&HardwarePolicy>,
 ) -> Result<(), Error> {
     fn bytes<const N: usize>(value: &str, label: &str) -> Result<[u8; N], Error> {
         let decoded = hex::decode(value).map_err(|_| Error::Node(format!("invalid {label}")))?;
@@ -1448,13 +1462,9 @@ fn check_raw_report_bindings(
         }
     }
     if let Some(hardware_policy) = hardware_policy {
-        appraise_snp_report(
-            report,
-            report_version,
-            report_product,
-            hardware_policy,
-            node.node_id,
-        )?;
+        appraise_hardware(hardware_policy, node.chip_id, |profile| {
+            appraise_snp_report(report, report_product, profile, node.node_id)
+        })?;
     }
     Ok(())
 }
@@ -1514,104 +1524,17 @@ fn validate_raw_snp_report_encoding(
 #[cfg(feature = "snp")]
 fn appraise_snp_report(
     report: &[u8],
-    report_version: u32,
     product: Option<&AmdProductProfile>,
     profile: &AmdSevSnpPolicy,
     node_id: &str,
 ) -> Result<(), Error> {
-    if report_version != 5 {
-        return Err(Error::Node(format!(
-            "{node_id} SNP report version is below hardware policy"
-        )));
-    }
-    let family = report[0x188];
-    let model = report[0x189];
-    let stepping = report[0x18a];
-    if profile.cpuid_family != family
-        || profile.cpuid_model != model
-        || profile.cpuid_stepping != stepping
-    {
-        return Err(Error::Node(format!(
-            "{node_id} CPUID differs from hardware policy"
-        )));
-    }
     let policy_product = amd_product_from_cpuid(profile.cpuid_family, profile.cpuid_model);
     if policy_product != product {
         return Err(Error::Node(format!(
             "{node_id} SNP processor identity differs from hardware policy"
         )));
     }
-
-    let current = family19h_tcb(&report[0x38..0x40]);
-    let reported = family19h_tcb(&report[0x180..0x188]);
-    let committed = family19h_tcb(&report[0x1e0..0x1e8]);
-    let launch = family19h_tcb(&report[0x1f0..0x1f8]);
-    for (label, actual) in [
-        ("current", current),
-        ("reported", reported),
-        ("committed", committed),
-        ("launch", launch),
-    ] {
-        if !tcb_at_least(actual, profile.minimum_tcb) {
-            return Err(Error::Node(format!(
-                "{node_id} SNP {label} TCB is below hardware policy"
-            )));
-        }
-    }
-    if !tcb_at_least(committed, reported) || !tcb_at_least(current, committed) {
-        return Err(Error::Node(format!(
-            "{node_id} SNP TCB fields have an invalid downgrade order"
-        )));
-    }
-
-    let current_version = (report[0x1ea], report[0x1e9], report[0x1e8]);
-    let committed_version = (report[0x1ee], report[0x1ed], report[0x1ec]);
-    if committed_version > current_version {
-        return Err(Error::Node(format!(
-            "{node_id} SNP committed firmware version exceeds current version"
-        )));
-    }
-
-    let platform_info = u64::from_le_bytes(report[0x40..0x48].try_into().unwrap_or_default());
-    let required_platform = parse_u64_hex(
-        &profile.required_platform_info_mask,
-        "required platform-info mask",
-    )?;
-    let forbidden_platform = parse_u64_hex(
-        &profile.forbidden_platform_info_mask,
-        "forbidden platform-info mask",
-    )?;
-    if platform_info & required_platform != required_platform
-        || platform_info & forbidden_platform != 0
-    {
-        return Err(Error::Node(format!(
-            "{node_id} SNP platform information is below hardware policy"
-        )));
-    }
-
-    let launch_mitigations =
-        u64::from_le_bytes(report[0x1f8..0x200].try_into().unwrap_or_default());
-    let current_mitigations =
-        u64::from_le_bytes(report[0x200..0x208].try_into().unwrap_or_default());
-    let required_launch = parse_u64_hex(
-        &profile.required_launch_mitigation_mask,
-        "required launch mitigation mask",
-    )?;
-    let required_current = parse_u64_hex(
-        &profile.required_current_mitigation_mask,
-        "required current mitigation mask",
-    )?;
-    if launch_mitigations & required_launch != required_launch {
-        return Err(Error::Node(format!(
-            "{node_id} SNP launch mitigations are below hardware policy"
-        )));
-    }
-    if current_mitigations & required_current != required_current {
-        return Err(Error::Node(format!(
-            "{node_id} SNP current mitigations are below hardware policy"
-        )));
-    }
-    Ok(())
+    evidence::SnpHardwareFacts::from_report(report).appraise(profile, node_id)
 }
 
 #[cfg(feature = "snp")]
@@ -2015,11 +1938,105 @@ mod tests {
                 .unwrap();
         validate_hardware_policy(&policy).unwrap();
         let chip_id = &policy.policies[0].chip_ids[0];
-        assert_eq!(
-            compatible_hardware(&policy, chip_id).unwrap().chip_ids,
-            vec![chip_id.clone()]
+        appraise_hardware(&policy, chip_id, |profile| {
+            assert_eq!(profile.chip_ids, vec![chip_id.clone()]);
+            Ok(())
+        })
+        .unwrap();
+        assert!(appraise_hardware(&policy, &"00".repeat(64), |_| Ok(())).is_err());
+    }
+
+    #[test]
+    fn hardware_policy_alternatives_are_unique_canonical_and_individually_valid() {
+        let mut policy: HardwarePolicy =
+            serde_json::from_str(include_str!("../tests/fixtures/milan-hardware-policy.json"))
+                .unwrap();
+        let mut alternative = policy.policies[0].clone();
+        alternative.forbidden_platform_info_mask = "0x0000000000000001".into();
+        policy.policies.push(alternative);
+        let canonical = validate_hardware_policy(&policy).unwrap();
+        let summary = verified_hardware_policy(
+            &policy,
+            &canonical,
+            HardwarePolicySource::StogasBundle,
+            None,
+            None,
         );
-        assert!(compatible_hardware(&policy, &"00".repeat(64)).is_err());
+        assert_eq!(summary.chip_ids, policy.policies[0].chip_ids);
+        assert_eq!(summary.policy_count, 2);
+
+        let mut invalid = policy.clone();
+        invalid.policies.reverse();
+        assert!(validate_hardware_policy(&invalid).is_err());
+        invalid = policy.clone();
+        invalid.policies[1] = invalid.policies[0].clone();
+        assert!(validate_hardware_policy(&invalid).is_err());
+        invalid = policy.clone();
+        let repeated_chip = invalid.policies[0].chip_ids[0].clone();
+        invalid.policies[1].chip_ids.push(repeated_chip);
+        assert!(validate_hardware_policy(&invalid).is_err());
+        invalid = policy.clone();
+        invalid.policies[1].required_platform_info_mask = "0x0000000000000025".into();
+        assert!(validate_hardware_policy(&invalid).is_err());
+        invalid = policy;
+        invalid.policies[1].cpuid_family = 0;
+        assert!(validate_hardware_policy(&invalid).is_err());
+    }
+
+    #[cfg(feature = "snp")]
+    #[test]
+    fn hardware_transitions_match_one_complete_configuration() {
+        let (report, profile, product) = appraisable_milan_report();
+        let chip = profile.chip_ids[0].clone();
+        let mut smt_on = profile.clone();
+        smt_on.required_platform_info_mask = "0x0000000000000025".into();
+        smt_on.minimum_tcb.microcode = 223;
+        let mut smt_off = profile;
+        smt_off.forbidden_platform_info_mask = "0x0000000000000001".into();
+        let transition = HardwarePolicy {
+            policies: vec![smt_on.clone(), smt_off.clone()],
+            schema: "stogas.hardware-policies.v1".into(),
+        };
+        let only_on = HardwarePolicy {
+            policies: vec![smt_on],
+            ..transition.clone()
+        };
+        let only_off = HardwarePolicy {
+            policies: vec![smt_off],
+            ..transition.clone()
+        };
+        for (policy, platform, microcode, allowed) in [
+            (&transition, 0x25_u64, 223, true),
+            (&transition, 0x24, 222, true), // The first configuration fails, the second passes.
+            (&transition, 0x25, 222, false), // Cannot borrow the SMT-off TCB minimum.
+            (&transition, 0x24, 221, false),
+            (&only_off, 0x25, 223, false),
+            (&only_off, 0x24, 222, true),
+            (&only_on, 0x24, 223, false),
+            (&only_on, 0x25, 223, true),
+        ] {
+            validate_hardware_policy(policy).unwrap();
+            let mut quote = report.clone();
+            quote[0x40..0x48].copy_from_slice(&platform.to_le_bytes());
+            for offset in [0x3f, 0x187, 0x1e7, 0x1f7] {
+                quote[offset] = microcode;
+            }
+            let raw = appraise_hardware(policy, &chip, |rule| {
+                appraise_snp_report(&quote, Some(product), rule, "node")
+            });
+            let facts = evidence::SnpHardwareFacts::from_report(&quote);
+            let retained = appraise_hardware(policy, &chip, |rule| facts.appraise(rule, "node"));
+            assert_eq!(
+                raw.is_ok(),
+                allowed,
+                "platform={platform:#x} microcode={microcode}"
+            );
+            assert_eq!(
+                retained.is_ok(),
+                allowed,
+                "retained platform={platform:#x} microcode={microcode}"
+            );
+        }
     }
 
     #[test]
@@ -2054,7 +2071,7 @@ mod tests {
     #[test]
     fn report_v5_appraisal_enforces_every_dynamic_amd_security_field() {
         let (report, policy, product) = appraisable_milan_report();
-        appraise_snp_report(&report, 5, Some(product), &policy, "node").unwrap();
+        appraise_snp_report(&report, Some(product), &policy, "node").unwrap();
 
         for (label, offset, value) in [
             ("current TCB", 0x3e, 28_u8),
@@ -2064,7 +2081,7 @@ mod tests {
         ] {
             let mut invalid = report.clone();
             invalid[offset] = value;
-            let error = appraise_snp_report(&invalid, 5, Some(product), &policy, "node")
+            let error = appraise_snp_report(&invalid, Some(product), &policy, "node")
                 .unwrap_err()
                 .to_string();
             assert!(error.contains("below hardware policy"), "{label}: {error}");
@@ -2073,7 +2090,7 @@ mod tests {
         for (label, offset) in [("launch", 0x1f8), ("current", 0x200)] {
             let mut invalid = report.clone();
             invalid[offset..offset + 8].copy_from_slice(&0x12_u64.to_le_bytes());
-            let error = appraise_snp_report(&invalid, 5, Some(product), &policy, "node")
+            let error = appraise_snp_report(&invalid, Some(product), &policy, "node")
                 .unwrap_err()
                 .to_string();
             assert!(error.contains(&format!("{label} mitigations")), "{error}");
@@ -2082,7 +2099,7 @@ mod tests {
         let mut missing_alias_check = report.clone();
         missing_alias_check[0x40..0x48].copy_from_slice(&0_u64.to_le_bytes());
         assert!(
-            appraise_snp_report(&missing_alias_check, 5, Some(product), &policy, "node")
+            appraise_snp_report(&missing_alias_check, Some(product), &policy, "node")
                 .unwrap_err()
                 .to_string()
                 .contains("platform information")
@@ -2090,10 +2107,12 @@ mod tests {
 
         let mut smt_enabled = report.clone();
         smt_enabled[0x40..0x48].copy_from_slice(&0x25_u64.to_le_bytes());
-        appraise_snp_report(&smt_enabled, 5, Some(product), &policy, "node").unwrap();
+        appraise_snp_report(&smt_enabled, Some(product), &policy, "node").unwrap();
 
+        let mut old_report = report;
+        old_report[0..4].copy_from_slice(&4_u32.to_le_bytes());
         assert!(
-            appraise_snp_report(&report, 4, Some(product), &policy, "node")
+            appraise_snp_report(&old_report, Some(product), &policy, "node")
                 .unwrap_err()
                 .to_string()
                 .contains("report version")
@@ -2112,7 +2131,7 @@ mod tests {
         };
         report[0x187] = 3;
         report[0x1e7] = 2;
-        let error = appraise_snp_report(&report, 5, Some(product), &policy, "node")
+        let error = appraise_snp_report(&report, Some(product), &policy, "node")
             .unwrap_err()
             .to_string();
         assert!(error.contains("invalid downgrade order"));
@@ -2120,7 +2139,7 @@ mod tests {
         let (mut report, policy, product) = appraisable_milan_report();
         report[0x1e8..0x1eb].copy_from_slice(&[1, 0, 1]);
         report[0x1ec..0x1ef].copy_from_slice(&[2, 0, 1]);
-        let error = appraise_snp_report(&report, 5, Some(product), &policy, "node")
+        let error = appraise_snp_report(&report, Some(product), &policy, "node")
             .unwrap_err()
             .to_string();
         assert!(error.contains("committed firmware version exceeds current"));

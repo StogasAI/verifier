@@ -8,8 +8,8 @@ defmodule StogasTransport do
   @impl true
   def init(options) do
     Process.flag(:trap_exit, true)
-    executable = Keyword.get(options, :executable) || System.find_executable("stogas-verify")
-    if is_nil(executable), do: raise("Install stogas-verify or provide its executable path")
+    executable = Keyword.get(options, :executable) || System.find_executable("stogas")
+    if is_nil(executable), do: raise("Install stogas or provide its executable path")
 
     args =
       ["serve", "--listen", "127.0.0.1:0", "--exit-on-stdin-close"] ++

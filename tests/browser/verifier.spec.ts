@@ -233,7 +233,7 @@ test('encrypted setup cannot release a browser session without its own verified 
 		}
 	}, fixture);
 	expect(result).toEqual({
-		helloLength: 1255,
+		helloLength: 1257,
 		fresh: true,
 		retainedHello: true,
 		noPrematureSeal: true,

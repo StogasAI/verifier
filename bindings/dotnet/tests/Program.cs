@@ -1,4 +1,4 @@
-using Stogas.Verifier;
+using Stogas;
 
 foreach (var options in new[] {
     new TransportOptions { Security = "unsupported" },

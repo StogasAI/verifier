@@ -157,7 +157,10 @@ fn request_metadata(request: &Request<Bytes>) -> Result<Vec<u8>, Error> {
     if request.uri().query().is_some()
         || request.body().len() > MAX_REQUEST_BYTES
         || !((request.method() == "POST"
-            && matches!(path, "/v1/chat/completions" | "/v1/responses"))
+            && matches!(
+                path,
+                "/v1/chat/completions" | "/v1/responses" | "/v1/policies/validate"
+            ))
             || (request.method() == "DELETE" && path == "/v1/session" && request.body().is_empty()))
     {
         return Err(Error::Request);
@@ -280,7 +283,7 @@ impl Incoming {
         self.decoder
             .as_mut()
             .ok_or(Error::Metadata)?
-            .push(&bytes, |kind, bytes| {
+            .push(&bytes, elapsed_ms(), |kind, bytes| {
                 if let Some(acknowledged) = self.acknowledged.take() {
                     acknowledged.notify_waiters();
                 }
@@ -387,3 +390,14 @@ fn response_metadata(bytes: &[u8]) -> Result<(StatusCode, HeaderMap), Error> {
 
 #[cfg(test)]
 pub(crate) mod tests;
+
+pub(super) fn elapsed_ms() -> u64 {
+    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    u64::try_from(
+        START
+            .get_or_init(std::time::Instant::now)
+            .elapsed()
+            .as_millis(),
+    )
+    .unwrap_or(u64::MAX)
+}

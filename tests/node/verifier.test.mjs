@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
-import * as publicAPI from '@stogas/verifier';
-import { EvidenceVerifier, StogasTransport } from '@stogas/verifier';
+import * as publicAPI from 'stogas';
+import { EvidenceVerifier, StogasTransport } from 'stogas';
 
 for (const retired of [
 	'Verifier',

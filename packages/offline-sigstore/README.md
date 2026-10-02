@@ -4,7 +4,7 @@ Small, networkless WebAssembly verifier for the standard GitHub/Sigstore v0.3 DS
 profile supported by Stogas. It verifies embedded Fulcio, SCT, Rekor, RFC 3161, subject, identity,
 and GitHub Actions provenance material without fetching TUF or calling Sigstore services.
 
-Use `@stogas/verifier` to verify the complete Stogas confidential-gateway evidence and transport.
+Use `stogas` to verify the complete Stogas confidential-gateway evidence and transport.
 
 ```js
 import { verify_github_attestation } from '@stogas/offline-sigstore';

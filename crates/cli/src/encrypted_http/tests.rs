@@ -1,5 +1,4 @@
 use super::*;
-use aws_lc_rs::{aead, hkdf};
 use axum::{Router, body::to_bytes, routing::post};
 use hpke::{
     Deserializable as _, OpModeS, Serializable as _, aead::ExportOnlyAead, kdf::HkdfSha256,
@@ -11,27 +10,31 @@ use stogas_verifier::{
     approvals::Environment,
     channel::{ClientSession, setup::PendingSetup},
 };
+use zeroize::Zeroizing;
 
 // This HTTP test peer creates synthetic hardware bytes solely for transport tests.
 // Managed setup uses complete_verified; its genuine-SNP tests reject this evidence.
 pub fn session() -> (ClientSession, [u8; 32], [u8; 32]) {
     let mut pending = PendingSetup::new(Environment::Production).unwrap();
     let hello = pending.hello();
-    let recipient = <XWing as hpke::Kem>::PublicKey::from_bytes(&hello[39..]).unwrap();
-    let info = [b"stogas.e2ee.setup.v1\0".as_slice(), &Sha256::digest(hello)].concat();
+    let recipient = <XWing as hpke::Kem>::PublicKey::from_bytes(&hello[41..]).unwrap();
+    let info = [b"stogas.e2ee.setup.v3\0".as_slice(), &Sha256::digest(hello)].concat();
     let (enc, sender) =
         setup_sender::<ExportOnlyAead, HkdfSha256, XWing>(&OpModeS::Base, &recipient, &info)
             .unwrap();
     let id = [22; 32];
-    let mut response = b"STGS\x01\x02".to_vec();
+    let mut response = b"STGS\x03\x02".to_vec();
     response.extend_from_slice(&id);
     response.extend_from_slice(&600_u32.to_be_bytes());
     response.extend_from_slice(&enc.to_bytes());
+    response.extend_from_slice(
+        &channel::ratchet::InitialKey::from_bytes(Zeroizing::new([3; 32])).public_key(),
+    );
     let boot = br#"{"synthetic":"HTTP transport test"}"#;
     let boot_digest = Sha256::digest(boot);
     let transcript = Sha256::digest(
         [
-            b"stogas.e2ee.transcript.v1\0".as_slice(),
+            b"stogas.e2ee.transcript.v3\0".as_slice(),
             hello,
             &response,
             &boot_digest,
@@ -64,14 +67,14 @@ pub fn session() -> (ClientSession, [u8; 32], [u8; 32]) {
     let mut confirmation = [0; 32];
     sender
         .export(
-            &[b"stogas.e2ee.confirmation.v1\0".as_slice(), &transcript].concat(),
+            &[b"stogas.e2ee.confirmation.v3\0".as_slice(), &transcript].concat(),
             &mut confirmation,
         )
         .unwrap();
     let mut root = [0; 32];
     sender
         .export(
-            &[b"stogas.e2ee.root.v1\0".as_slice(), &transcript].concat(),
+            &[b"stogas.e2ee.root.v3\0".as_slice(), &transcript].concat(),
             &mut root,
         )
         .unwrap();
@@ -81,65 +84,46 @@ pub fn session() -> (ClientSession, [u8; 32], [u8; 32]) {
     (pending.complete(&response, |_| Ok(())).unwrap(), root, id)
 }
 
+// These tests exercise HTTP carriage against the real server implementation.
+// Independent primitive and wire interoperability lives in the core/Go suites.
 pub struct Records {
-    key: aead::LessSafeKey,
-    nonce: [u8; 12],
-    sequence: u64,
+    session: channel::ServerSession,
+    reader: Option<channel::ServerReader>,
+    writer: Option<channel::ServerWriter>,
 }
 impl Records {
-    pub(crate) fn new(root: &[u8; 32], id: &[u8; 32], number: u64, direction: u8) -> Self {
-        struct Size;
-        impl hkdf::KeyType for Size {
-            fn len(&self) -> usize {
-                44
-            }
-        }
-        let info = [
-            b"stogas.e2ee.record.v1\0".as_slice(),
-            id,
-            &number.to_be_bytes(),
-            &[direction],
-        ]
-        .concat();
-        let mut material = [0; 44];
-        hkdf::Prk::new_less_safe(hkdf::HKDF_SHA256, root)
-            .expand(&[&info], Size)
-            .unwrap()
-            .fill(&mut material)
-            .unwrap();
+    pub(crate) fn new(root: &[u8; 32], id: &[u8; 32]) -> Self {
         Self {
-            key: aead::LessSafeKey::new(
-                aead::UnboundKey::new(&aead::AES_256_GCM, &material[..32]).unwrap(),
+            session: channel::ServerSession::new(
+                Zeroizing::new(*root),
+                *id,
+                channel::ratchet::ChunkSize::FULL,
+                channel::ratchet::InitialKey::from_bytes(Zeroizing::new([3; 32])),
             ),
-            nonce: material[32..].try_into().unwrap(),
-            sequence: 0,
+            reader: None,
+            writer: None,
         }
-    }
-    fn nonce(&mut self) -> aead::Nonce {
-        let mut nonce = self.nonce;
-        for (target, source) in nonce[4..].iter_mut().zip(self.sequence.to_be_bytes()) {
-            *target ^= source;
-        }
-        self.sequence += 1;
-        aead::Nonce::assume_unique_for_key(nonce)
     }
     pub(crate) fn seal(&mut self, kind: Kind, content: &[u8]) -> Vec<u8> {
-        let prefix = u32::try_from(content.len() + 21).unwrap().to_be_bytes();
-        let mut body = [vec![kind as u8], content.to_vec()].concat();
-        let nonce = self.nonce();
-        self.key
-            .seal_in_place_append_tag(nonce, aead::Aad::from(prefix), &mut body)
-            .unwrap();
-        [prefix.to_vec(), body].concat()
+        self.writer.as_mut().unwrap().seal(kind, content).unwrap()
     }
     pub(crate) fn open(&mut self, record: &[u8]) -> (Kind, Vec<u8>) {
-        let mut body = record[4..].to_vec();
-        let nonce = self.nonce();
-        let plain = self
-            .key
-            .open_in_place(nonce, aead::Aad::from(&record[..4]), &mut body)
-            .unwrap();
-        (Kind::try_from(plain[0]).unwrap(), plain[1..].to_vec())
+        let mut encoded = record.to_vec();
+        if let Some(reader) = self.reader.as_mut() {
+            let (kind, plain) = reader.open(&mut encoded).unwrap();
+            (kind, plain.to_vec())
+        } else {
+            let (reader, writer, plain) = self.session.accept_start(0, &mut encoded, 0).unwrap();
+            self.reader = Some(reader);
+            self.writer = Some(writer);
+            (Kind::Metadata, plain.to_vec())
+        }
+    }
+    fn from_request(root: &[u8; 32], id: &[u8; 32], wire: &[u8]) -> Self {
+        let mut records = Self::new(root, id);
+        let size = channel::record_size(&wire[46..50]).unwrap();
+        records.open(&wire[46..46 + size]);
+        records
     }
 }
 
@@ -197,10 +181,10 @@ async fn binary_upload_streams_bounded_records_and_authenticates_fragmented_resp
                 assert_eq!(request.headers()["stogas-node-id"], "owner");
                 assert!(!request.headers().contains_key("authorization"));
                 let wire = to_bytes(request.into_body(), 1024 * 1024).await.unwrap();
-                assert_eq!(&wire[..6], b"STGS\x01\x03");
+                assert_eq!(&wire[..6], b"STGS\x03\x03");
                 assert_eq!(&wire[6..38], &id);
                 assert_eq!(&wire[38..46], &0_u64.to_be_bytes());
-                let mut records = Records::new(&root, &id, 0, 1);
+                let mut records = Records::new(&root, &id);
                 let mut input = &wire[46..];
                 let mut data = Vec::new();
                 let mut kinds = Vec::new();
@@ -233,7 +217,6 @@ async fn binary_upload_streams_bounded_records_and_authenticates_fragmented_resp
                         Kind::Finished
                     ]
                 );
-                let mut records = Records::new(&root, &id, 0, 2);
                 let wire = [
                     records.seal(Kind::Keepalive, &[]),
                     records.seal(
@@ -286,7 +269,8 @@ async fn failures_never_return_successful_eof_or_repeat_submission() {
         "tag",
         "metadata",
         "empty-body",
-        "outer-status",
+        "outer-429",
+        "outer-503",
         "outer-type",
         "stall",
     ] {
@@ -299,8 +283,8 @@ async fn failures_never_return_successful_eof_or_repeat_submission() {
                 let observed = Arc::clone(&observed);
                 async move {
                     observed.fetch_add(1, Ordering::SeqCst);
-                    to_bytes(request.into_body(), 65536).await.unwrap();
-                    let mut records = Records::new(&root, &id, 0, 2);
+                    let incoming = to_bytes(request.into_body(), 65536).await.unwrap();
+                    let mut records = Records::from_request(&root, &id, &incoming);
                     let metadata: &[u8] = match case {
                         "metadata" => br#"{"status":200,"headers":{"set-cookie":"unsafe"}}"#,
                         "empty-body" => br#"{"status":204,"headers":{}}"#,
@@ -327,7 +311,11 @@ async fn failures_never_return_successful_eof_or_repeat_submission() {
                         Body::from(wire)
                     };
                     Response::builder()
-                        .status(if case == "outer-status" { 503 } else { 200 })
+                        .status(match case {
+                            "outer-429" => 429,
+                            "outer-503" => 503,
+                            _ => 200,
+                        })
                         .header(
                             header::CONTENT_TYPE,
                             if case == "outer-type" {
@@ -350,7 +338,7 @@ async fn failures_never_return_successful_eof_or_repeat_submission() {
         } else {
             deadline()
         };
-        if let Ok(response) = send(
+        let result = send(
             &http(),
             server.endpoint.clone(),
             "owner",
@@ -359,8 +347,10 @@ async fn failures_never_return_successful_eof_or_repeat_submission() {
             limit,
             None,
         )
-        .await
-        {
+        .await;
+        if matches!(case, "outer-429" | "outer-503") {
+            assert!(matches!(result, Err(Error::Response)), "case {case}");
+        } else if let Ok(response) = result {
             assert!(
                 to_bytes(response.into_body(), 1024).await.is_err(),
                 "case {case}"
@@ -504,7 +494,7 @@ async fn open_source_client_compatibility_proxy() {
         "/v1/session",
         post(move |request: Request<Body>| async move {
             let wire = to_bytes(request.into_body(), 65536).await.unwrap();
-            let mut request_records = Records::new(&root, &id, 0, 1);
+            let mut request_records = Records::new(&root, &id);
             let size = channel::record_size(&wire[46..50]).unwrap();
             let (kind, metadata) = request_records.open(&wire[46..46 + size]);
             assert_eq!(kind, Kind::Metadata);
@@ -512,7 +502,7 @@ async fn open_source_client_compatibility_proxy() {
             assert_eq!(metadata["path"], "/v1/chat/completions");
             assert_eq!(metadata["headers"]["authorization"], "Bearer fixture");
             assert!(metadata["headers"].get("host").is_none());
-            let mut records = Records::new(&root, &id, 0, 2);
+            let mut records = request_records;
             Response::builder()
                 .header(header::CONTENT_TYPE, CONTENT_TYPE)
                 .body(Body::from(
@@ -563,8 +553,8 @@ async fn sse_terminal_waits_for_authenticated_completion_without_receipt_opt_in(
             post(move |request: Request<Body>| {
                 let gate = Arc::clone(&gate);
                 async move {
-                    to_bytes(request.into_body(), 4096).await.unwrap();
-                    let mut records = Records::new(&root, &id, 0, 2);
+                    let incoming = to_bytes(request.into_body(), 4096).await.unwrap();
+                    let mut records = Records::from_request(&root, &id, &incoming);
                     let initial = [
                         records.seal(
                             Kind::Metadata,

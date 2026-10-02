@@ -8,7 +8,7 @@ use stogas_verifier::{
     receipt,
 };
 
-pyo3::create_exception!(stogas_verifier, VerificationError, PyValueError);
+pyo3::create_exception!(stogas, VerificationError, PyValueError);
 
 #[pyclass(name = "EvidenceVerifier")]
 struct EvidenceVerifier {

@@ -194,7 +194,7 @@ pub fn verify(
             .timestamp_verification_data
             .rfc3161_timestamps,
         &signature,
-        &root,
+        root,
         now_unix_ms.div_euclid(1000),
     )?;
     let validation_time = timestamp_time.unwrap_or(integrated_time);
@@ -206,8 +206,8 @@ pub fn verify(
         return Err("Fulcio certificate was not valid at the authenticated signing time".into());
     }
 
-    let issuer_spki = verify_certificate_chain(&certificate.der, validation_time, &root)?;
-    sct::verify(&certificate.der, &issuer_spki, validation_time, &root)?;
+    let issuer_spki = verify_certificate_chain(&certificate.der, validation_time, root)?;
+    sct::verify(&certificate.der, &issuer_spki, validation_time, root)?;
     let verified_integrated_time = tlog::verify(
         entry,
         &bundle.dsse_envelope,
@@ -215,7 +215,7 @@ pub fn verify(
         certificate.not_before,
         certificate.not_after,
         now_seconds,
-        &root,
+        root,
     )?;
     verify_dsse_signature(&bundle.dsse_envelope, &certificate.spki)?;
     Ok(verified_integrated_time)
@@ -253,7 +253,7 @@ pub fn verify_keyed_dsse(
         &bundle.dsse_envelope,
         public_key_spki,
         now_unix_ms.div_euclid(1000),
-        &root,
+        root,
     )?;
     verify_keyed_dsse_signature(&bundle.dsse_envelope, public_key_spki)?;
     Ok(integrated_time)

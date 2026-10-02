@@ -3,7 +3,7 @@
 The package uses the Rust verifier through JNA. It includes native libraries for 64-bit Linux, macOS and Windows. Java 17 or later is required. Kotlin, Scala and Clojure can use the same package.
 
 ```java
-import ai.stogas.verifier.Transport;
+import ai.stogas.Transport;
 import java.net.http.HttpClient;
 
 try (var transport = new Transport()) {

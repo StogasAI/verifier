@@ -15,17 +15,54 @@ fn certificate_renewal_matches_independent_vector_and_rejects_replay_outside_its
     let node = request["node_id"].as_str().unwrap();
     let now = request["issued_at_ms"].as_i64().unwrap();
     let bytes = serde_json::to_vec(request).unwrap();
+    assert!(verify_boot_request(&bytes, node, &key, now, BootRequestPurpose::Complete).is_err());
     for delta in [-300_000, 0, 300_000] {
-        verify_certificate_renewal(&bytes, node, &key, now + delta).unwrap();
+        verify_boot_request(
+            &bytes,
+            node,
+            &key,
+            now + delta,
+            BootRequestPurpose::Certificate,
+        )
+        .unwrap();
     }
     for delta in [-300_001, 300_001] {
-        assert!(verify_certificate_renewal(&bytes, node, &key, now + delta).is_err());
+        assert!(
+            verify_boot_request(
+                &bytes,
+                node,
+                &key,
+                now + delta,
+                BootRequestPurpose::Certificate
+            )
+            .is_err()
+        );
     }
-    assert!(verify_certificate_renewal(&bytes, "another-node", &key, now).is_err());
-    assert!(verify_certificate_renewal(&bytes, node, &[0; 32], now).is_err());
+    assert!(
+        verify_boot_request(
+            &bytes,
+            "another-node",
+            &key,
+            now,
+            BootRequestPurpose::Certificate
+        )
+        .is_err()
+    );
+    assert!(
+        verify_boot_request(&bytes, node, &[0; 32], now, BootRequestPurpose::Certificate).is_err()
+    );
     let mut another_key = key.clone();
     another_key[0] ^= 1;
-    assert!(verify_certificate_renewal(&bytes, node, &another_key, now).is_err());
+    assert!(
+        verify_boot_request(
+            &bytes,
+            node,
+            &another_key,
+            now,
+            BootRequestPurpose::Certificate
+        )
+        .is_err()
+    );
     for (field, value) in [
         ("node_id", json!("other")),
         ("issued_at_ms", json!(now + 1)),
@@ -35,11 +72,26 @@ fn certificate_renewal_matches_independent_vector_and_rejects_replay_outside_its
         let mut changed = request.clone();
         changed[field] = value;
         assert!(
-            verify_certificate_renewal(&serde_json::to_vec(&changed).unwrap(), node, &key, now)
-                .is_err()
+            verify_boot_request(
+                &serde_json::to_vec(&changed).unwrap(),
+                node,
+                &key,
+                now,
+                BootRequestPurpose::Certificate
+            )
+            .is_err()
         );
     }
-    assert!(verify_certificate_renewal(&vec![b' '; 5 * 1024 + 1], node, &key, now).is_err());
+    assert!(
+        verify_boot_request(
+            &vec![b' '; 5 * 1024 + 1],
+            node,
+            &key,
+            now,
+            BootRequestPurpose::Certificate
+        )
+        .is_err()
+    );
 }
 
 #[test]

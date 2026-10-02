@@ -1,5 +1,5 @@
 (ns example
-  (:import [ai.stogas.verifier Transport]
+  (:import [ai.stogas Transport]
            [com.openai.client.okhttp OpenAIOkHttpClient]
            [com.openai.models.chat.completions ChatCompletionCreateParams]
            [com.openai.core.http HttpClient HttpRequestBody]

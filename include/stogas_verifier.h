@@ -11,6 +11,34 @@ extern "C" {
 typedef struct StogasTransport StogasTransport;
 typedef struct StogasEvidence StogasEvidence;
 typedef struct StogasEvidenceSnapshot StogasEvidenceSnapshot;
+typedef struct StogasChannelSession StogasChannelSession;
+typedef struct StogasChannelReader StogasChannelReader;
+typedef struct StogasChannelWriter StogasChannelWriter;
+typedef struct { uint8_t *data; size_t len; } StogasChannelBuffer;
+
+/* Binary server channel. Root and id are exactly 32 bytes from authenticated
+ * setup. ratchet_bytes is even, from 32 through 1152. now_ms is a caller-owned
+ * monotonic elapsed clock. Session calls require exclusive access; each accepted
+ * reader/writer has an independent owner. Free once after calls finish.
+ * Status: 0 success, 1 record, 2 authentication, 3 limit, 4 closed,
+ * 5 truncated, 6 pending, 7 crypto, 255 panic (discard the owner).
+ * Open/accept decrypt in place and return a borrowed plaintext offset/length.
+ * Seal returns owned ciphertext; free it with stogas_channel_buffer_free.
+ * Buffers are bounded to 65536 bytes; outputs must not alias inputs or each other.
+ */
+/* Key outputs are 32 disjoint bytes. Bind the public key into setup and erase the
+ * private output after session construction or abandonment. */
+uint32_t stogas_channel_key_generate(uint8_t *private_key, uint8_t *public_key);
+uint32_t stogas_channel_session_new(const uint8_t *root, const uint8_t *id, const uint8_t *initial_private, uint16_t ratchet_bytes, StogasChannelSession **output);
+uint32_t stogas_channel_accept(StogasChannelSession *session, uint64_t number, uint8_t *data, size_t len, uint64_t now_ms, StogasChannelReader **reader, StogasChannelWriter **writer, size_t *offset, size_t *plaintext_len);
+uint32_t stogas_channel_session_expire(StogasChannelSession *session, uint64_t now_ms);
+uint32_t stogas_channel_open(StogasChannelReader *reader, uint8_t *data, size_t len, uint8_t *kind, size_t *offset, size_t *plaintext_len);
+uint32_t stogas_channel_complete(StogasChannelReader *reader);
+uint32_t stogas_channel_seal(StogasChannelWriter *writer, uint8_t kind, const uint8_t *data, size_t len, StogasChannelBuffer *output);
+void stogas_channel_buffer_free(StogasChannelBuffer buffer);
+void stogas_channel_session_free(StogasChannelSession *handle);
+void stogas_channel_reader_free(StogasChannelReader *handle);
+void stogas_channel_writer_free(StogasChannelWriter *handle);
 
 /* Offline evidence. Configuration: {"environment":"staging"|"prod", "root"?:
  * {"key_id":"...", "public_key":"..."}}. Omit root for the compiled Stogas authority.
