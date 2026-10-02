@@ -333,11 +333,7 @@ async fn failures_never_return_successful_eof_or_repeat_submission() {
         let request = Request::post("/v1/responses")
             .body(Bytes::from_static(b"{}"))
             .unwrap();
-        let limit = if case == "stall" {
-            Instant::now() + Duration::from_millis(100)
-        } else {
-            deadline()
-        };
+        let limit = deadline();
         let result = send(
             &http(),
             server.endpoint.clone(),
@@ -348,7 +344,14 @@ async fn failures_never_return_successful_eof_or_repeat_submission() {
             None,
         )
         .await;
-        if matches!(case, "outer-429" | "outer-503") {
+        if case == "stall" {
+            let response = result.expect("stalled body must return metadata before the deadline");
+            // Start the deadline check only after TCP submission and metadata arrive.
+            tokio::time::pause();
+            tokio::time::advance(limit - Instant::now() + Duration::from_millis(1)).await;
+            assert!(to_bytes(response.into_body(), 1024).await.is_err());
+            tokio::time::resume();
+        } else if matches!(case, "outer-429" | "outer-503") {
             assert!(matches!(result, Err(Error::Response)), "case {case}");
         } else if let Ok(response) = result {
             assert!(

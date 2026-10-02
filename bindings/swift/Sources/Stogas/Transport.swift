@@ -49,8 +49,7 @@ public final class Transport: @unchecked Sendable {
         do {
             let value: Started = try nativeResult(response)
             guard let pointer, let url = URL(string: value.baseURL) else { throw VerificationError.invalidResponse }
-            self.ratchetBytes = ratchetBytes
-        self.baseURL = url
+            self.baseURL = url
             self.handle = pointer
         } catch {
             if let pointer { stogas_transport_free(pointer) }
