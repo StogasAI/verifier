@@ -393,15 +393,18 @@ fn metadata_rejects_transport_overrides_and_unsupported_paths_before_submission(
 
 // External client serializers use this test-only HTTP bridge. Production clients
 // always call complete_verified; this fixture pins synthetic boot bytes instead.
-async fn client_fixture_proxy(session: ClientSession, endpoint: Url, node_id: String) -> Server {
-    let session = Arc::new(std::sync::Mutex::new(session));
+async fn client_fixture_proxy<F, Fut>(acquire: F, endpoint: Url, node_id: String) -> Server
+where
+    F: Fn() -> Fut + Clone + Send + Sync + 'static,
+    Fut: std::future::Future<Output = channel::ClientRequest> + Send,
+{
     let http = http();
     let prefix = format!("/{}", hex::encode(rand::random::<[u8; 32]>()));
     let route = format!("{prefix}/{{*path}}");
     let app = Router::new().route(
         &route,
         axum::routing::any(move |request: Request<Body>| {
-            let session = Arc::clone(&session);
+            let acquire = acquire.clone();
             let endpoint = endpoint.clone();
             let node_id = node_id.clone();
             let http = http.clone();
@@ -419,7 +422,7 @@ async fn client_fixture_proxy(session: ClientSession, endpoint: Url, node_id: St
                     parts.headers.remove(name);
                 }
                 let bytes = to_bytes(body, MAX_REQUEST_BYTES).await.unwrap();
-                let exchange = session.lock().unwrap().request().unwrap();
+                let exchange = acquire().await;
                 send(
                     &http,
                     endpoint,
@@ -441,6 +444,32 @@ async fn client_fixture_proxy(session: ClientSession, endpoint: Url, node_id: St
     server
 }
 
+async fn client_fixture_request(endpoint: Url, fixture: Value) -> channel::ClientRequest {
+    let mut pending = PendingSetup::new(Environment::Production).unwrap();
+    let response = http()
+        .post(endpoint.clone())
+        .header(header::CONTENT_TYPE, CONTENT_TYPE)
+        .body(pending.hello().to_vec())
+        .timeout(Duration::from_secs(10))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let response = response.bytes().await.unwrap();
+    assert!(response.len() <= stogas_verifier::channel::setup::MAX_SERVER_SETUP_BYTES);
+    let mut session = pending
+        .complete(&response, |evidence| {
+            assert_eq!(
+                hex::encode(Sha256::digest(evidence.boot_document)),
+                fixture["document_sha256"]
+            );
+            assert_eq!(evidence.boot_inclusion, b"{}");
+            Ok(())
+        })
+        .unwrap();
+    session.request().unwrap()
+}
+
 #[tokio::test]
 async fn open_source_client_compatibility_proxy() {
     use base64::Engine as _;
@@ -456,29 +485,13 @@ async fn open_source_client_compatibility_proxy() {
             .unwrap();
         let node_id =
             stogas_verifier::attestation::snp_node_id(report[0x140..0x160].try_into().unwrap());
-        let mut pending = PendingSetup::new(Environment::Production).unwrap();
-        let response = http()
-            .post(endpoint.clone())
-            .header(header::CONTENT_TYPE, CONTENT_TYPE)
-            .body(pending.hello().to_vec())
-            .timeout(Duration::from_secs(10))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
-        let response = response.bytes().await.unwrap();
-        assert!(response.len() <= stogas_verifier::channel::setup::MAX_SERVER_SETUP_BYTES);
-        let session = pending
-            .complete(&response, |evidence| {
-                assert_eq!(
-                    hex::encode(Sha256::digest(evidence.boot_document)),
-                    fixture["document_sha256"]
-                );
-                assert_eq!(evidence.boot_inclusion, b"{}");
-                Ok(())
-            })
-            .unwrap();
-        let proxy = client_fixture_proxy(session, endpoint, node_id).await;
+        // Serializer conformance does not own session reuse. Acquire for each request
+        // so an idle test bridge cannot retain a server session between long suites.
+        let acquire = {
+            let endpoint = endpoint.clone();
+            move || client_fixture_request(endpoint.clone(), fixture.clone())
+        };
+        let proxy = client_fixture_proxy(acquire, endpoint, node_id).await;
         println!("STOGAS_E2EE_TEST_BASE_URL={}", proxy.endpoint);
         tokio::task::spawn_blocking(|| {
             use std::io::Read as _;
@@ -523,7 +536,13 @@ async fn open_source_client_compatibility_proxy() {
         }),
     ))
     .await;
-    let proxy = client_fixture_proxy(session, peer.endpoint.clone(), "owner".into()).await;
+    let session = Arc::new(std::sync::Mutex::new(session));
+    let proxy = client_fixture_proxy(
+        move || std::future::ready(session.lock().unwrap().request().unwrap()),
+        peer.endpoint.clone(),
+        "owner".into(),
+    )
+    .await;
     let response = http()
         .post(format!("{}/chat/completions", proxy.endpoint))
         .header(header::AUTHORIZATION, "Bearer fixture")
