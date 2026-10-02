@@ -1,12 +1,12 @@
 {
   "root": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8",
   "organizationId": "test-organization",
-  "plaintext": "{\"stogasRedaction\":{\"literals\":[{\"text\":\"CUSTOMER_PRIVATE_VALUE\"}]}}",
+  "plaintext": "{\"stogasRedaction\":{\"literals\":[{\"values\":[\"CUSTOMER_PRIVATE_VALUE\"]}]}}",
   "envelope": {
     "version": 1,
     "keyId": "3a1121028ba40964d5f10b47662650a021d736bd671f4083b5066d9bd51c9ef0",
     "salt": "vG9ZWSqU35QFy9UPN35k8z7O7aAW0j2aVE5MN-vfFa8",
     "nonce": "GgZEVH-PfVkSZvCO",
-    "blob": "z3q_HPTQe8OrHz3wLOgNsX9HGCSUvrGw6FLe0XLeVRmgigHwEKm8lbWRmk6rFeEgqnyL5z0hdGFBrkxfsiG7WU-aiyyuQQlvmEDEJ8Em9SjET7Uk"
+    "blob": "z3q_HPTQe8OrHz3wLOgNsX9HGCSUvrGw6FLe0XLeVRmgigP0BKj73LXolD-8D_8xt26e5ysnZ3xSsE5boSK_N2eC1Az9HrS98hGpBzINMRRZ_QxXThyBUQ"
   }
 }
