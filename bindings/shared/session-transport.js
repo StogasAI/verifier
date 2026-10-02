@@ -23,7 +23,16 @@ export class SessionTransport {
 	#closed = false;
 	#shutdown = new AbortController();
 
-	constructor({ Setup, evidence, environment, endpoint, fetch, maxSessions = 1, ratchetBytes, onMetadata }) {
+	constructor({
+		Setup,
+		evidence,
+		environment,
+		endpoint,
+		fetch,
+		maxSessions = 1,
+		ratchetBytes,
+		onMetadata
+	}) {
 		if (!Number.isSafeInteger(maxSessions) || maxSessions <= 0)
 			throw new RangeError('maxSessions must be a positive safe integer');
 

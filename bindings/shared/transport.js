@@ -3,7 +3,14 @@ import { SessionTransport } from './session-transport.js';
 import { TransportError } from './http.js';
 
 const PATHS = new Set(['/v1/chat/completions', '/v1/responses', '/v1/policies/validate']);
-const OPTIONS = new Set(['environment', 'baseURL', 'maxConnections', 'ratchetBytes', 'fetch', 'onMetadata']);
+const OPTIONS = new Set([
+	'environment',
+	'baseURL',
+	'maxConnections',
+	'ratchetBytes',
+	'fetch',
+	'onMetadata'
+]);
 
 function baseURL(value) {
 	let url;
@@ -60,7 +67,13 @@ export function createTransportClass({
 			if (!Number.isSafeInteger(maximum) || maximum < 1)
 				throw new RangeError('maxConnections must be a positive safe integer');
 			const ratchetBytes = options.ratchetBytes;
-			if (ratchetBytes !== undefined && (!Number.isInteger(ratchetBytes) || ratchetBytes < 32 || ratchetBytes > 1152 || ratchetBytes % 2 !== 0))
+			if (
+				ratchetBytes !== undefined &&
+				(!Number.isInteger(ratchetBytes) ||
+					ratchetBytes < 32 ||
+					ratchetBytes > 1152 ||
+					ratchetBytes % 2 !== 0)
+			)
 				throw new RangeError('ratchetBytes must be even, from 32 through 1152');
 			const fetch = options.fetch ?? ((input, init) => globalThis.fetch(input, init));
 			if (

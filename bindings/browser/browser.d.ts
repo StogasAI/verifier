@@ -41,7 +41,11 @@ export declare class StogasTransport {
 	close(): Promise<void>;
 }
 
-export { EvidenceVerifier, EvidenceSnapshot, inspect_snp_report } from '../../pkg/browser/stogas_verifier.js';
+export {
+	EvidenceVerifier,
+	EvidenceSnapshot,
+	inspect_snp_report
+} from '../../pkg/browser/stogas_verifier.js';
 
 export {
 	EncryptedSetup,
