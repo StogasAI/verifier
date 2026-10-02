@@ -1,8 +1,6 @@
-name: Continuous fuzzing
+name: Fuzz Campaign
 
 on:
-  schedule:
-    - cron: '17 4 * * *'
   workflow_dispatch:
 
 permissions:
